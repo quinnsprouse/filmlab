@@ -1,0 +1,4 @@
+{
+  // Vite+ pack: Oxc reads the lint and fmt config in vite.config.ts (https://viteplus.dev/guide/ide-integration).
+  "recommendations": ["VoidZero.vite-plus-extension-pack", "bradlc.vscode-tailwindcss"]
+}

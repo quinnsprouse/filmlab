@@ -1,0 +1,16 @@
+[package]
+name = "lightcraft-pipeline"
+version = "0.8.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "LightCraft's develop pipeline (vendored at f34c7a8) with Filmlab's film-stage hook"
+
+[dependencies]
+lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-color = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-develop = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-raw = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-inpaint = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+rayon = "1"
+serde = { version = "1", features = ["derive", "rc"] }

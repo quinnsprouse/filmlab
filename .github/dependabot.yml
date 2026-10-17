@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # One PR for all minor/patch bumps; majors still get individual PRs
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          - vite-plus
+          - "@oxlint/plugins"
+      vite-plus-toolchain:
+        patterns:
+          - vite-plus
+          - "@oxlint/plugins"
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci

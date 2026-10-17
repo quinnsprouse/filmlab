@@ -1,0 +1,332 @@
+@import "tailwindcss" source("../");
+@import "tw-animate-css";
+@import "@fontsource/open-runde/latin-400.css";
+@import "@fontsource/open-runde/latin-500.css";
+@import "@fontsource/open-runde/latin-700.css";
+@import "@fontsource-variable/geist-mono/index.css";
+@import "dialkit/styles.css";
+
+@custom-variant dark {
+  &:where(.dark, .dark *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not(.light), :root:not(.light) *) {
+      @slot;
+    }
+  }
+}
+
+/* Filmlab theme: the Untitled token names with the projection-booth dark palette. Neutrals stay
+   colourless so the photo is the only colour on screen; lamp amber (color-1) marks the current frame
+   and the one primary action. */
+:root,
+.light,
+.dark {
+  --color-none: transparent;
+  --color-1: #f5a524;
+  --color-1-transparent: #f5a52433;
+  --color-2: #b3b3b3;
+  --color-2-transparent: #b3b3b333;
+  --color-3: #6b6b6b;
+  --color-3-transparent: #6b6b6b33;
+  --color-4: #2b2b2b;
+  --color-4-transparent: #2b2b2b33;
+  --neutral-1: #0e0e0e;
+  --neutral-1-transparent: #0e0e0e33;
+  --neutral-2: #161616;
+  --neutral-2-transparent: #16161633;
+  --neutral-3: #212121;
+  --neutral-3-transparent: #21212133;
+  --neutral-4: #2b2b2b;
+  --neutral-4-transparent: #2b2b2b33;
+  --neutral-5: #3a3a3a;
+  --neutral-5-transparent: #3a3a3a33;
+  --neutral-6: #6b6b6b;
+  --neutral-6-transparent: #6b6b6b33;
+  --neutral-7: #8f8f8f;
+  --neutral-7-transparent: #8f8f8f33;
+  --neutral-8: #b3b3b3;
+  --neutral-8-transparent: #b3b3b333;
+  --neutral-9: #e5e5e5;
+  --neutral-9-transparent: #e5e5e533;
+  --neutral-10: #f2f2f2;
+  --neutral-10-transparent: #f2f2f233;
+  --success: #76ef6b;
+  --success-transparent: #76ef6b33;
+  --warning: #ffa344;
+  --warning-transparent: #ffa34433;
+  --error: #ff5263;
+  --error-transparent: #ff526333;
+
+  --space-zero: 0px;
+  --space-xxs: 4px;
+  --space-xs: 8px;
+  --space-s: 12px;
+  --space-m: 16px;
+  --space-l: 24px;
+  --space-xl: 32px;
+  --space-xxl: 48px;
+
+  --size-xxs: 11px;
+  --line-xxs: 14px;
+  --letter-spacing-xxs: var(--tracking-xl);
+  --size-xs: 12px;
+  --line-xs: 16px;
+  --letter-spacing-xs: var(--tracking-l);
+  --size-s: 13px;
+  --line-s: 18px;
+  --letter-spacing-s: var(--tracking-l);
+  --size-m: 15px;
+  --line-m: 20px;
+  --letter-spacing-m: var(--tracking-m);
+  --size-l: 20px;
+  --line-l: 26px;
+  --letter-spacing-l: var(--tracking-s);
+  --size-xl: 36px;
+  --line-xl: 40px;
+  --letter-spacing-xl: var(--tracking-s);
+  --size-xxl: 48px;
+  --line-xxl: 52px;
+  --letter-spacing-xxl: var(--tracking-xs);
+
+  --weight-ui-regular: 400;
+  --weight-ui-medium: 500;
+  --weight-ui-heavy: 700;
+  --weight-brand-regular: 400;
+  --weight-brand-medium: 500;
+  --weight-brand-heavy: 700;
+  --weight-editorial-regular: 400;
+  --weight-editorial-medium: 500;
+  --weight-editorial-heavy: 700;
+  --weight-data-regular: 400;
+  --weight-data-medium: 500;
+  --weight-data-heavy: 700;
+
+  --border-none: 0px;
+  --border-s: 1px;
+  --border-m: 1px;
+  --border-l: 2px;
+  --border-default-color: rgb(255 255 255 / 0.1);
+  --border-shadow-none: 0 0 0 0 transparent;
+  --border-shadow-s: 0 0 0 var(--border-s) var(--border-default-color);
+  --border-shadow-m: 0 0 0 var(--border-m) var(--border-default-color);
+  --border-shadow-l: 0 0 0 var(--border-l) var(--border-default-color);
+  --focus-ring-outline: 2px solid color-mix(in srgb, #ffffff 50%, transparent);
+  --icon-stroke-width: 2;
+
+  --motion-duration: 150ms;
+  --motion-easing: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --motion-large-duration: 300ms;
+  --motion-large-easing: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-popup-scale: 0.96;
+  --motion-press-distance: 1px;
+
+  --cte-canvas: var(--neutral-1);
+  --cte-surface: var(--neutral-2);
+  --cte-surface-muted: var(--neutral-3);
+  --cte-text: var(--neutral-10);
+  --cte-text-muted: var(--neutral-7);
+  --cte-border: var(--border-default-color);
+  --cte-accent: var(--color-1);
+  --cte-accent-text: var(--neutral-2);
+  --cte-danger: var(--error);
+  --cte-focus: var(--color-1);
+
+  --background: var(--neutral-1);
+  --foreground: var(--neutral-10);
+  --card: var(--neutral-2);
+  --card-foreground: var(--neutral-10);
+  --popover: var(--neutral-1);
+  --popover-foreground: var(--neutral-10);
+  --primary: var(--color-1);
+  --primary-foreground: var(--neutral-1);
+  --canvas: var(--neutral-1);
+  --chrome: var(--neutral-2);
+  --panel: var(--neutral-3);
+  --control: rgb(255 255 255 / 0.05);
+  --control-hover: rgb(255 255 255 / 0.1);
+  --control-active: rgb(255 255 255 / 0.11);
+  --border-strong: rgb(255 255 255 / 0.15);
+  --outline-image: oklch(1 0 0 / 0.1);
+  --text-secondary: rgb(255 255 255 / 0.7);
+  --text-tertiary: rgb(255 255 255 / 0.55);
+  --secondary: var(--neutral-3);
+  --secondary-foreground: var(--neutral-10);
+  --muted: var(--neutral-3);
+  --muted-foreground: var(--neutral-7);
+  --accent: var(--neutral-3);
+  --accent-foreground: var(--neutral-10);
+  --destructive: var(--error);
+  --border: var(--border-default-color);
+  --input: var(--neutral-4);
+  --ring: var(--color-1);
+}
+
+:root {
+  color-scheme: dark;
+}
+
+.light {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+@theme static {
+  --color-*: initial;
+  --text-*: initial;
+  --leading-*: initial;
+  --tracking-*: initial;
+  --font-*: initial;
+  --font-weight-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+  --inset-shadow-*: initial;
+  --drop-shadow-*: initial;
+  --text-shadow-*: initial;
+
+  --font-ui: "Open Runde", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-brand: "Open Runde", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-editorial: "Open Runde", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-data: "Geist Mono Variable", monospace;
+  --default-font-family: var(--font-ui);
+  --default-mono-font-family: var(--font-data);
+
+  --tracking-xs: -0.02em;
+  --tracking-s: -0.01em;
+  --tracking-m: 0em;
+  --tracking-l: 0.01em;
+  --tracking-xl: 0.02em;
+
+  --radius-zero: 0px;
+  --radius-xs: 4px;
+  --radius-s: 6px;
+  --radius-m: 8px;
+  --radius-l: 14px;
+  --radius-xl: 26px;
+  --radius-full: 9999px;
+
+  --shadow-s: 0px 1px 2px 0px #00000000;
+  --shadow-m: 0px 8px 24px 0px #00000000;
+  --shadow-l: 0px 12px 30px 0px #00000000;
+}
+
+@theme inline {
+  --text-xxs: var(--size-xxs);
+  --text-xxs--line-height: var(--line-xxs);
+  --text-xxs--letter-spacing: var(--letter-spacing-xxs);
+  --text-xs: var(--size-xs);
+  --text-xs--line-height: var(--line-xs);
+  --text-xs--letter-spacing: var(--letter-spacing-xs);
+  --text-s: var(--size-s);
+  --text-s--line-height: var(--line-s);
+  --text-s--letter-spacing: var(--letter-spacing-s);
+  --text-m: var(--size-m);
+  --text-m--line-height: var(--line-m);
+  --text-m--letter-spacing: var(--letter-spacing-m);
+  --text-l: var(--size-l);
+  --text-l--line-height: var(--line-l);
+  --text-l--letter-spacing: var(--letter-spacing-l);
+  --text-xl: var(--size-xl);
+  --text-xl--line-height: var(--line-xl);
+  --text-xl--letter-spacing: var(--letter-spacing-xl);
+  --text-xxl: var(--size-xxl);
+  --text-xxl--line-height: var(--line-xxl);
+  --text-xxl--letter-spacing: var(--letter-spacing-xxl);
+
+  --font-weight-regular: var(--weight-ui-regular);
+  --font-weight-medium: var(--weight-ui-medium);
+  --font-weight-heavy: var(--weight-ui-heavy);
+
+  --spacing-zero: var(--space-zero);
+  --spacing-xxs: var(--space-xxs);
+  --spacing-xs: var(--space-xs);
+  --spacing-s: var(--space-s);
+  --spacing-m: var(--space-m);
+  --spacing-l: var(--space-l);
+  --spacing-xl: var(--space-xl);
+  --spacing-xxl: var(--space-xxl);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-transparent: var(--color-1-transparent);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-transparent: var(--error-transparent);
+  --color-destructive-foreground: var(--neutral-1);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-neutral-3-transparent: var(--neutral-3-transparent);
+  --color-neutral-4: var(--neutral-4);
+  --color-neutral-4-transparent: var(--neutral-4-transparent);
+  --color-neutral-6: var(--neutral-6);
+  --color-canvas: var(--canvas);
+  --color-chrome: var(--chrome);
+  --color-panel: var(--panel);
+  --color-control: var(--control);
+  --color-control-hover: var(--control-hover);
+  --color-control-active: var(--control-active);
+  --color-border-strong: var(--border-strong);
+  --color-outline-image: var(--outline-image);
+  --color-secondary-text: var(--text-secondary);
+  --color-tertiary-text: var(--text-tertiary);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    text-wrap: pretty;
+  }
+  body {
+    @apply bg-background font-ui text-m font-regular text-foreground;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible {
+    outline: var(--focus-ring-outline);
+    outline-offset: 2px;
+  }
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("../../node_modules/@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+
+:root .dialkit-root {
+  font-family: var(--font-ui);
+}
+
+@utility divider-t {
+  box-shadow: inset 0 var(--border-s) 0 0 var(--border-default-color);
+}
+
+@utility divider-b {
+  box-shadow: inset 0 calc(var(--border-s) * -1) 0 0 var(--border-default-color);
+}
+
+[data-slot="icon"] * {
+  stroke-width: var(--icon-stroke-width);
+}
