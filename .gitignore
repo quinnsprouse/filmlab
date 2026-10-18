@@ -47,6 +47,9 @@ playwright-report
 /engine/pkg-mt/
 /engine/target-mt/
 
+# Native macOS app build output (cargo build in native/)
+/native/target/
+
 # Disposable agent and local experiments
 /.scratch/
 /tmp/

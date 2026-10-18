@@ -1,0 +1,42 @@
+[package]
+name = "filmlab"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+filmlab-engine = { path = "../engine" }
+gpui-kit = "=0.7.3"
+block2 = "0.6"
+bytemuck = "1"
+futures = "0.3"
+image = { version = "0.25.1", default-features = false }
+libc = "0.2"
+mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+objc2 = "0.6"
+objc2-app-kit = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-quartz-core = "0.3.2"
+pollster = "0.4"
+rayon = "1"
+raw-window-handle = "0.6"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "30.0.1"
+
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 16
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[patch."https://github.com/storytold/lightcraft"]
+lightcraft-pipeline = { path = "../engine/vendor/lightcraft-pipeline" }

@@ -1,0 +1,4 @@
+# why: every Apple silicon Mac is at least an M1, so the build can use its full instruction set (NEON, FP16,
+# dot product, crypto); Rust never contracts float ops, so pixels stay identical to the generic build
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]

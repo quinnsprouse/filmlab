@@ -1,0 +1,133 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use filmlab_engine::core::{self, Engine};
+use serde_json::{Value, json};
+
+use crate::film::render_film;
+use crate::library::{self, Library, PhotoRecord};
+
+const KEY: &str = "export";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Jpeg,
+    Png,
+    Tiff,
+}
+
+pub const FORMATS: [Format; 3] = [Format::Jpeg, Format::Png, Format::Tiff];
+
+impl Format {
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Jpeg => "JPEG",
+            Format::Png => "PNG",
+            Format::Tiff => "TIFF",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpeg",
+            Format::Png => "png",
+            Format::Tiff => "tiff",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpg",
+            Format::Png => "png",
+            Format::Tiff => "tif",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Choices {
+    pub format: Format,
+    pub long_edge: Option<u32>,
+    pub quality: u32,
+}
+
+impl Default for Choices {
+    fn default() -> Self {
+        Choices { format: Format::Jpeg, long_edge: None, quality: 90 }
+    }
+}
+
+impl Choices {
+    fn options(&self) -> String {
+        let mut options = json!({"format": self.format.key(), "quality": self.quality});
+        if let Some(edge) = self.long_edge {
+            options["resize"] = json!({"mode": "longEdge", "value": edge});
+        }
+        options.to_string()
+    }
+}
+
+#[derive(Clone)]
+pub struct Job {
+    pub name: String,
+    stem: String,
+    path: PathBuf,
+    facts: String,
+    state: String,
+    film: String,
+}
+
+pub fn job_of(record: &PhotoRecord) -> Result<Job, String> {
+    let (Some(probed), Some(state)) = (&record.probed, &record.state) else {
+        return Err("The photo hasn't finished loading. Wait a moment and try again.".into());
+    };
+    let film = render_film(state.film().as_ref()).map_or(Value::Null, |f| f.to_value());
+    Ok(Job {
+        name: record.file.name.clone(),
+        stem: record.file.stem.clone(),
+        path: record.file.path.clone(),
+        facts: probed.facts.to_string(),
+        state: serde_json::to_string(state).map_err(|e| e.to_string())?,
+        film: film.to_string(),
+    })
+}
+
+pub fn jobs_for(library: &Library, ids: &[String]) -> Vec<(String, Result<Job, String>)> {
+    ids.iter().map(|id| (id.clone(), library.record(id).ok_or_else(|| "The photo is no longer in the folder.".to_string()).and_then(job_of))).collect()
+}
+
+// why: the web app overwrites; the native app keeps earlier exports by numbering the new file instead
+fn create_unique(folder: &Path, stem: &str, extension: &str) -> Result<(PathBuf, std::fs::File), String> {
+    std::fs::create_dir_all(folder).map_err(|e| format!("Couldn't create {}: {e}", folder.display()))?;
+    for n in 1..1000 {
+        let name = if n == 1 { format!("{stem}.{extension}") } else { format!("{stem} {n}.{extension}") };
+        let path = folder.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Couldn't write {}: {e}", path.display())),
+        }
+    }
+    Err("Too many exports of this photo already exist.".into())
+}
+
+pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices) -> Result<PathBuf, String> {
+    let options = choices.options();
+    let plan: Value = serde_json::from_str(&core::export_plan(&job.facts, &job.state, &options)?).map_err(|e| e.to_string())?;
+    let max_edge = plan["maxEdge"].as_u64().unwrap_or(0) as usize;
+    let bytes = std::fs::read(&job.path).map_err(|e| format!("Couldn't read the photo: {e}"))?;
+    let film = serde_json::from_str::<Value>(&job.film).ok().and_then(|v| crate::film::FilmSettings::of(&v));
+    library::ensure_luts(engine, film.as_ref())?;
+    engine.load(KEY, &job.facts, &bytes, max_edge)?;
+    let encoded = engine.export(KEY, &job.facts, &job.state, &options, &job.film);
+    engine.release(KEY);
+    let encoded = encoded?;
+    let folder = job.path.parent().unwrap_or(Path::new(".")).join("Exports");
+    let (path, mut file) = create_unique(&folder, &job.stem, choices.format.extension())?;
+    if let Err(e) = file.write_all(&encoded) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("Couldn't write {}: {e}", path.display()));
+    }
+    Ok(path)
+}
