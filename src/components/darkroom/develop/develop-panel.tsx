@@ -6,6 +6,7 @@ import { develop, editSettings } from "@/lib/develop/session";
 import { controlValues } from "@/lib/engine/engine";
 import type { DevelopSettings, Facts } from "@/lib/engine/types";
 
+import { DustRows } from "./dust-rows";
 import { FilmStockRows, GrainRows, HalationRows } from "./film-rows";
 import { ControlSlider, Segmented, PanelRoot } from "./panel-controls";
 import { GradingRows, MixerRows, WhiteBalanceRows } from "./panel-rows";
@@ -64,6 +65,8 @@ function RowView({ row, facts, settings, values }: RowProps) {
       return <HalationRows />;
     case "grain":
       return <GrainRows />;
+    case "dust":
+      return <DustRows />;
     case "mixer":
       return <MixerRows values={values} bw={settings.treatment === "bw"} />;
     case "grading":
@@ -118,6 +121,7 @@ function keyOf(row: Row): string {
     case "filmStock":
     case "halation":
     case "grain":
+    case "dust":
       return row.kind;
   }
 }

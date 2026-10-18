@@ -1,10 +1,10 @@
 import type {
+  BitmapFrame,
   ExportOptions,
   Facts,
   FilmSettings,
   PhotoState,
   Probed,
-  RenderedFrame,
   View,
 } from "./types";
 
@@ -51,7 +51,7 @@ export interface WorkerReplies {
   index: Indexed;
   lut: null;
   load: null;
-  render: RenderedFrame;
+  render: BitmapFrame;
   thumbnail: Blob;
   export: Uint8Array<ArrayBuffer>;
   release: null;

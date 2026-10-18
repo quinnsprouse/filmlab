@@ -1,4 +1,5 @@
 import type { WorkerReplies, WorkerReply, WorkerRequest } from "./protocol";
+import { parsed, withKeys } from "./shapes";
 import type { PhotoState, Probed, RenderedFrame } from "./types";
 
 interface FrameLike {
@@ -25,6 +26,16 @@ export interface Bindings {
 
 type Engine = EngineLike;
 
+const isProbed = withKeys<Probed>("facts", "defaults");
+const isPhotoState = withKeys<PhotoState>("settings");
+
+function unshared(view: Uint8Array | Uint32Array): ArrayBuffer {
+  if (view.buffer instanceof ArrayBuffer) {
+    return view.buffer;
+  }
+  throw new Error("The photo engine returned pixels in shared memory.");
+}
+
 function frameOf(e: Engine, key: string, settings: string, view: string): RenderedFrame {
   const frame = e.render(key, settings, view);
   const rgba = frame.takeRgba();
@@ -32,8 +43,8 @@ function frameOf(e: Engine, key: string, settings: string, view: string): Render
   const result = {
     width: frame.width,
     height: frame.height,
-    rgba: new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, rgba.byteLength),
-    histogram: new Uint32Array(histogram.buffer as ArrayBuffer, histogram.byteOffset, histogram.length),
+    rgba: new Uint8ClampedArray(unshared(rgba), rgba.byteOffset, rgba.byteLength),
+    histogram: new Uint32Array(unshared(histogram), histogram.byteOffset, histogram.length),
   };
   frame.free();
   return result;
@@ -54,11 +65,11 @@ const scratchKey = "scratch";
 function withScratch<T>(
   e: Engine,
   request: { facts: unknown; bytes: Uint8Array<ArrayBuffer>; maxEdge: number },
-  use: () => T,
+  work: () => T,
 ): T {
   e.load(scratchKey, JSON.stringify(request.facts), request.bytes, request.maxEdge);
   try {
-    return use();
+    return work();
   } finally {
     e.release(scratchKey);
   }
@@ -67,7 +78,7 @@ function withScratch<T>(
 function stateOf(bindings: Bindings, probed: Probed, sidecar: string | null): PhotoState {
   const xmp = sidecar ?? probed.embeddedXmp;
   if (xmp) {
-    return JSON.parse(bindings.readSidecar(JSON.stringify(probed.facts), xmp));
+    return parsed(bindings.readSidecar(JSON.stringify(probed.facts), xmp), isPhotoState);
   }
   return { settings: probed.defaults, rating: 0, flag: "none", label: null };
 }
@@ -79,9 +90,9 @@ async function run(
 ): Promise<[WorkerReplies[WorkerRequest["kind"]], Transferable[]]> {
   switch (request.kind) {
     case "probe":
-      return [JSON.parse(bindings.probe(request.name, request.bytes)), []];
+      return [parsed(bindings.probe(request.name, request.bytes), isProbed), []];
     case "index": {
-      const probed: Probed = JSON.parse(bindings.probe(request.name, request.bytes));
+      const probed = parsed(bindings.probe(request.name, request.bytes), isProbed);
       const state = stateOf(bindings, probed, request.sidecar);
       const view = state.film ? { ...request.view, film: state.film } : request.view;
       const frame = withScratch(e, { ...request, facts: probed.facts }, () =>
@@ -99,7 +110,12 @@ async function run(
       return [null, []];
     case "render": {
       const frame = frameOf(e, request.key, request.settings, JSON.stringify(request.view));
-      return [frame, [frame.rgba.buffer, frame.histogram.buffer]];
+      const bitmap = await createImageBitmap(new ImageData(frame.rgba, frame.width, frame.height), {
+        colorSpaceConversion: "none",
+        premultiplyAlpha: "none",
+      });
+      const { width, height, histogram } = frame;
+      return [{ width, height, bitmap, histogram }, [bitmap, histogram.buffer]];
     }
     case "thumbnail": {
       const frame = withScratch(e, request, () =>
@@ -117,7 +133,7 @@ async function run(
           JSON.stringify(request.film),
         ),
       );
-      const owned = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+      const owned = new Uint8Array(unshared(bytes), bytes.byteOffset, bytes.byteLength);
       return [owned, [owned.buffer]];
     }
     case "release":

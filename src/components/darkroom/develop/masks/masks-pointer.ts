@@ -152,7 +152,7 @@ export function useMaskPointer(inputs: PointerInputs) {
       delta: offset(current.start, at),
       proportional: event.altKey,
     });
-    updateShape(current.grip.maskId, current.grip.component, shape, true);
+    updateShape(current.grip.maskId, current.grip.component, shape);
   };
 
   const hover = (at: Pt) => {

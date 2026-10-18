@@ -1,12 +1,14 @@
 import type {
+  BitmapFrame,
   DevelopSettings,
   Facts,
   FilmSettings,
   OverlayRequest,
   PhotoState,
-  DisplayFrame,
 } from "@/lib/engine/types";
 import { createStore } from "@/lib/store";
+
+import type { Region } from "./camera";
 
 interface HistoryStep {
   label: string;
@@ -21,9 +23,13 @@ export type Compare = "after" | "before";
 export type Tool = "edit" | "crop" | "heal" | "masks";
 
 export interface Zoom {
-  level: "fit" | 1;
+  level: "fit" | number;
   cx: number;
   cy: number;
+}
+
+export interface DisplayFrame extends BitmapFrame {
+  region: Region;
 }
 
 export interface DevelopState {
@@ -36,6 +42,7 @@ export interface DevelopState {
   history: HistoryStep[];
   cursor: number;
   frame: DisplayFrame | undefined;
+  detail: DisplayFrame | undefined;
   status: "idle" | "loading" | "ready" | "failed";
   error: string | undefined;
   compare: Compare;
@@ -55,6 +62,7 @@ export const emptyDevelop: DevelopState = {
   history: [],
   cursor: 0,
   frame: undefined,
+  detail: undefined,
   status: "idle",
   error: undefined,
   compare: "after",

@@ -1,9 +1,6 @@
-import type { Pt, Shape } from "./masks-model";
+import type { FrameSize } from "@/lib/engine/types";
 
-export interface FrameSize {
-  width: number;
-  height: number;
-}
+import type { Pt, Shape } from "./masks-model";
 
 export type RadialShape = Extract<Shape, { kind: "radial" }>;
 export type LinearShape = Extract<Shape, { kind: "linear" }>;

@@ -203,7 +203,7 @@ export default defineConfig({
       "GUI.md",
       "gui/",
       ".agents/skills/graphical-*/",
-      "engine/",
+      "/engine/",
     ],
   },
 
@@ -471,7 +471,7 @@ export default defineConfig({
         },
       },
     ],
-    ignorePatterns: ["dist", ".output", "routeTree.gen.ts", "engine/"],
+    ignorePatterns: ["dist", ".output", "routeTree.gen.ts", "/engine/"],
   },
 
   plugins: [

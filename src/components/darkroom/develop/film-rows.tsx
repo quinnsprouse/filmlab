@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { useStore } from "@/hooks/use-store";
 import { develop, editFilm } from "@/lib/develop/session";
 import type { FilmSettings } from "@/lib/engine/types";
-import { filmIsOn, gauges, noFilm, type Gauge } from "@/lib/film/film";
+import { filmIsOn, gaugeNames, gauges, noFilm, normalizeFilm, type Gauge } from "@/lib/film/film";
 import { connectFilmFolder, stocks, type Stock, type StockKind } from "@/lib/film/stocks";
 
 import { Segmented } from "./panel-controls";
@@ -22,25 +22,33 @@ interface PlainSliderProps {
   max: number;
   step: number;
   fallback: number;
-  onChange: (value: number, draft: boolean) => void;
+  onChange: (value: number) => void;
 }
 
-function PlainSlider({ label, value, min, max, step, fallback, onChange }: PlainSliderProps) {
+export function PlainSlider({
+  label,
+  value,
+  min,
+  max,
+  step,
+  fallback,
+  onChange,
+}: PlainSliderProps) {
   return (
-    <div onDoubleClick={() => onChange(fallback, false)}>
+    <div onDoubleClick={() => onChange(fallback)}>
       <Slider
         label={label}
         value={Math.min(max, Math.max(min, value))}
         min={min}
         max={max}
         step={step}
-        onChange={(next) => onChange(next, true)}
+        onChange={onChange}
       />
     </div>
   );
 }
 
-function useFilm(): FilmSettings {
+export function useFilm(): FilmSettings {
   return useStore(develop, (state) => state.film) ?? noFilm;
 }
 
@@ -123,10 +131,10 @@ export function FilmStockRows() {
   );
 }
 
-function NeedsStock() {
+export function NeedsStock() {
   return (
     <p className="px-xxs py-xs text-xs text-pretty text-tertiary-text">
-      Choose a negative and a print to add halation and grain.
+      Choose a negative and a print to add halation, grain and dust.
     </p>
   );
 }
@@ -136,12 +144,11 @@ export function HalationRows() {
   if (!filmIsOn(film)) {
     return <NeedsStock />;
   }
-  const set = (patch: Partial<FilmSettings["halation"]>, label: string, draft: boolean) =>
+  const set = (patch: Partial<FilmSettings["halation"]>, label: string) =>
     editFilm(
       { ...film, halation: { ...film.halation, ...patch } },
       label,
       `film.halation.${label}`,
-      draft,
     );
   const { amount, radius, threshold } = film.halation;
   return (
@@ -153,7 +160,7 @@ export function HalationRows() {
         max={100}
         step={1}
         fallback={Math.round(noFilm.halation.amount * 100)}
-        onChange={(v, draft) => set({ amount: v / 100 }, `Halation ${v}`, draft)}
+        onChange={(v) => set({ amount: v / 100 }, `Halation ${v}`)}
       />
       <PlainSlider
         label="Radius"
@@ -162,7 +169,7 @@ export function HalationRows() {
         max={20}
         step={0.1}
         fallback={noFilm.halation.radius}
-        onChange={(v, draft) => set({ radius: v }, `Halation radius ${v.toFixed(1)}`, draft)}
+        onChange={(v) => set({ radius: v }, `Halation radius ${v.toFixed(1)}`)}
       />
       <PlainSlider
         label="Threshold"
@@ -171,32 +178,39 @@ export function HalationRows() {
         max={2}
         step={0.01}
         fallback={noFilm.halation.threshold}
-        onChange={(v, draft) => set({ threshold: v }, `Halation threshold ${v.toFixed(2)}`, draft)}
+        onChange={(v) => set({ threshold: v }, `Halation threshold ${v.toFixed(2)}`)}
       />
     </>
   );
 }
 
-const grainScale = 0.06;
+function close(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1e-4;
+}
 
 function gaugeOf(film: FilmSettings): Gauge | "custom" {
-  const names: Gauge[] = ["16", "35", "65", "120"];
-  const match = names.find(
-    (gauge) =>
-      Math.abs(gauges[gauge].amount - film.grain.amount) < 1e-4 &&
-      Math.abs(gauges[gauge].size - film.grain.size) < 1e-4,
-  );
+  const match = gaugeNames.find((name) => {
+    const { grain, blur } = gauges[name];
+    return (
+      close(grain.amount, film.grain.amount) &&
+      close(grain.size, film.grain.size) &&
+      close(grain.softness, film.grain.softness) &&
+      close(grain.defocus, film.grain.defocus) &&
+      close(blur, film.blur)
+    );
+  });
   return match ?? "custom";
 }
 
 export function GrainRows() {
-  const film = useFilm();
+  const film = normalizeFilm(useFilm());
   if (!filmIsOn(film)) {
     return <NeedsStock />;
   }
-  const set = (patch: Partial<FilmSettings["grain"]>, label: string, key: string, draft: boolean) =>
-    editFilm({ ...film, grain: { ...film.grain, ...patch } }, label, `film.grain.${key}`, draft);
-  const { amount, size, color } = film.grain;
+  const set = (patch: Partial<FilmSettings["grain"]>, label: string, key: string) =>
+    editFilm({ ...film, grain: { ...film.grain, ...patch } }, label, `film.grain.${key}`);
+  const fallback = noFilm.grain;
+  const { amount, size, softness, defocus } = film.grain;
   return (
     <>
       <Segmented
@@ -204,44 +218,56 @@ export function GrainRows() {
         value={gaugeOf(film)}
         onChange={(gauge) => {
           if (gauge !== "custom") {
-            set({ ...gauges[gauge] }, `Grain ${gauge} mm`, "gauge", false);
+            const { grain, blur } = gauges[gauge];
+            editFilm({ ...film, grain: { ...grain }, blur }, `Gauge ${gauge} mm`, "film.gauge");
           }
         }}
-        options={[
-          { value: "16", label: "16" },
-          { value: "35", label: "35" },
-          { value: "65", label: "65" },
-          { value: "120", label: "120" },
-        ]}
+        options={gaugeNames.map((name) => ({ value: name, label: name }))}
       />
       <PlainSlider
         label="Amount"
-        value={Math.round((amount / grainScale) * 100)}
+        value={Math.round(amount * 1000) / 10}
         min={0}
         max={100}
-        step={1}
-        fallback={Math.round((noFilm.grain.amount / grainScale) * 100)}
-        onChange={(v, draft) =>
-          set({ amount: (v / 100) * grainScale }, `Grain ${v}`, "amount", draft)
-        }
+        step={0.5}
+        fallback={fallback.amount * 100}
+        onChange={(v) => set({ amount: v / 100 }, `Grain ${v}`, "amount")}
       />
       <PlainSlider
         label="Size"
         value={size}
-        min={0.5}
+        min={0}
         max={4}
         step={0.1}
-        fallback={noFilm.grain.size}
-        onChange={(v, draft) => set({ size: v }, `Grain size ${v.toFixed(1)}`, "size", draft)}
+        fallback={fallback.size}
+        onChange={(v) => set({ size: v }, `Grain size ${v.toFixed(1)}`, "size")}
       />
       <PlainSlider
-        label="Color"
-        value={Math.round(color * 100)}
+        label="Softness"
+        value={Math.round(softness * 100)}
         min={0}
         max={100}
         step={1}
-        fallback={0}
-        onChange={(v, draft) => set({ color: v / 100 }, `Grain color ${v}`, "color", draft)}
+        fallback={fallback.softness * 100}
+        onChange={(v) => set({ softness: v / 100 }, `Grain softness ${v}`, "softness")}
+      />
+      <PlainSlider
+        label="Defocus"
+        value={Math.round((1 - defocus) * 100)}
+        min={0}
+        max={50}
+        step={1}
+        fallback={(1 - fallback.defocus) * 100}
+        onChange={(v) => set({ defocus: 1 - v / 100 }, `Image defocus ${v}`, "defocus")}
+      />
+      <PlainSlider
+        label="Film blur"
+        value={Math.round(film.blur * 1000) / 10}
+        min={0}
+        max={20}
+        step={0.5}
+        fallback={noFilm.blur * 100}
+        onChange={(v) => editFilm({ ...film, blur: v / 100 }, `Film blur ${v}`, "film.blur")}
       />
     </>
   );

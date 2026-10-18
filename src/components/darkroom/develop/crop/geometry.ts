@@ -1,5 +1,5 @@
 import { mapPoints } from "@/lib/engine/engine";
-import type { DevelopSettings, Facts } from "@/lib/engine/types";
+import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
 
 export type Vec = [number, number];
 
@@ -57,11 +57,6 @@ export function readCrop(settings: DevelopSettings): CropState {
     flipH: crop.flip_h === true,
     flipV: crop.flip_v === true,
   };
-}
-
-export interface FrameSize {
-  width: number;
-  height: number;
 }
 
 export interface FrameMap {

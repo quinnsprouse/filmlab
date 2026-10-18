@@ -1,12 +1,12 @@
 import { mapPoints } from "@/lib/engine/engine";
-import type { DevelopSettings, Facts, RenderedFrame } from "@/lib/engine/types";
+import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
 
 import type { Spot, Vec } from "./spots";
 
 export interface Mapping {
   facts: Facts;
   settings: DevelopSettings;
-  frame: RenderedFrame;
+  frame: FrameSize;
 }
 
 function ratio(): number {
@@ -39,7 +39,7 @@ function imageToCss(mapping: Mapping, points: Vec[]): Vec[] {
   return map(mapping, points, false).map((p) => ({ x: p.x / ratio(), y: p.y / ratio() }));
 }
 
-export function radiusOf(frame: RenderedFrame, size: number): number {
+export function radiusOf(frame: FrameSize, size: number): number {
   return (size * Math.max(frame.width, frame.height)) / ratio();
 }
 

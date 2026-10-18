@@ -16,6 +16,7 @@ lightcraft-engine = { git = "https://github.com/storytold/lightcraft", rev = "f3
 lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
 lightcraft-meta = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
 lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+rayon = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 wasm-bindgen = "=0.2.129"

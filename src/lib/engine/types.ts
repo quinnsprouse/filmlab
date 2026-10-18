@@ -35,7 +35,9 @@ export interface FilmSettings {
   print: string | null;
   utility: string | null;
   halation: { amount: number; radius: number; threshold: number };
-  grain: { amount: number; size: number; color: number };
+  grain: { amount: number; size: number; softness: number; defocus: number };
+  blur: number;
+  dust: { on: boolean; size: number; softness: number };
 }
 
 export interface PhotoState {
@@ -56,7 +58,6 @@ export type OverlayRequest =
 export interface View {
   maxW: number;
   maxH: number;
-  draft?: boolean;
   applyCrop?: boolean;
   stages?: string;
   window?: [number, number, number, number];
@@ -71,10 +72,14 @@ export interface RenderedFrame {
   histogram: Uint32Array<ArrayBuffer>;
 }
 
-export interface DisplayFrame extends RenderedFrame {
-  pixelWidth: number;
-  pixelHeight: number;
-  window?: { x: number; y: number; fullWidth: number; fullHeight: number };
+export interface FrameSize {
+  width: number;
+  height: number;
+}
+
+export interface BitmapFrame extends FrameSize {
+  bitmap: ImageBitmap;
+  histogram: Uint32Array<ArrayBuffer>;
 }
 
 export interface ControlSpec {
@@ -90,7 +95,10 @@ export interface ControlSpec {
 
 export type ExportFormat = "jpeg" | "png" | "tiff";
 
-export const exportFormats: Record<ExportFormat, { extension: string; mime: string; label: string }> = {
+export const exportFormats: Record<
+  ExportFormat,
+  { extension: string; mime: string; label: string }
+> = {
   jpeg: { extension: "jpg", mime: "image/jpeg", label: "JPEG" },
   png: { extension: "png", mime: "image/png", label: "PNG" },
   tiff: { extension: "tif", mime: "image/tiff", label: "TIFF" },

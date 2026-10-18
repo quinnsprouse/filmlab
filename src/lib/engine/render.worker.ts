@@ -2,16 +2,12 @@ import { Engine, initSync, probe, readSidecar } from "@engine/engine.js";
 
 import type { WorkerMessage, WorkerReply } from "./protocol";
 import { runJob } from "./worker-jobs";
+import { workerScope } from "./worker-scope";
 
-type Scope = {
-  onmessage: ((event: MessageEvent<WorkerMessage>) => void) | null;
-  postMessage(message: WorkerReply, transfer?: Transferable[]): void;
-};
-
-const scope = self as unknown as Scope;
+const scope = workerScope<WorkerMessage, WorkerReply>();
 let engine: Engine | undefined;
 
-scope.onmessage = (event) => {
+scope.addEventListener("message", (event) => {
   const message = event.data;
   if (message.kind === "init") {
     if (message.module) {
@@ -22,10 +18,17 @@ scope.onmessage = (event) => {
   }
   const current = engine;
   if (!current) {
-    scope.postMessage({ id: message.id, ok: false, error: "The render worker started before its engine." });
+    scope.postMessage(
+      {
+        id: message.id,
+        ok: false,
+        error: "The render worker started before its engine.",
+      },
+      [],
+    );
     return;
   }
   void runJob(current, { probe, readSidecar }, message.id, message.request).then(
     ([reply, transfer]) => scope.postMessage(reply, transfer),
   );
-};
+});

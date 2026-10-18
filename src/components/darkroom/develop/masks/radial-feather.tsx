@@ -11,24 +11,20 @@ export function RadialControls({ mask }: { mask: Mask }) {
   }
   return (
     <>
-      <div onDoubleClick={() => updateShape(mask.id, found, { ...shape, feather: 50 }, false)}>
+      <div onDoubleClick={() => updateShape(mask.id, found, { ...shape, feather: 50 })}>
         <Slider
           label="Feather"
           value={shape.feather}
           min={0}
           max={100}
           step={1}
-          onChange={(feather) =>
-            updateShape(mask.id, found, { ...shape, feather }, true, "Mask feather")
-          }
+          onChange={(feather) => updateShape(mask.id, found, { ...shape, feather }, "Mask feather")}
         />
       </div>
       <Toggle
         label="Invert area"
         checked={shape.invert}
-        onChange={(invert) =>
-          updateShape(mask.id, found, { ...shape, invert }, false, "Invert area")
-        }
+        onChange={(invert) => updateShape(mask.id, found, { ...shape, invert }, "Invert area")}
       />
     </>
   );

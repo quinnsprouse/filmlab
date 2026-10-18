@@ -1,12 +1,41 @@
 import type { WorkerMessage, WorkerReplies, WorkerReply, WorkerRequest } from "./protocol";
+import { isNull, withKeys, type Shape } from "./shapes";
+import type { BitmapFrame, Probed } from "./types";
 
 type Kind = WorkerRequest["kind"];
+
+const replies: { [K in Kind]: Shape<WorkerReplies[K]> } = {
+  probe: withKeys<Probed>("facts", "defaults"),
+  index: withKeys<WorkerReplies["index"]>("probed", "state", "thumbnail"),
+  lut: isNull,
+  load: isNull,
+  render: withKeys<BitmapFrame>("width", "height", "bitmap", "histogram"),
+  thumbnail: (value): value is Blob => value instanceof Blob,
+  export: (value): value is Uint8Array<ArrayBuffer> =>
+    value instanceof Uint8Array && value.buffer instanceof ArrayBuffer,
+  release: isNull,
+};
+
+function settle<K extends Kind>(
+  kind: K,
+  resolve: (value: WorkerReplies[K]) => void,
+  reject: (error: Error) => void,
+): (value: unknown) => void {
+  const accepts = replies[kind];
+  return (value) => {
+    if (accepts(value)) {
+      resolve(value);
+    } else {
+      reject(new Error(`The render worker sent an unexpected ${kind} reply.`));
+    }
+  };
+}
 
 interface Job {
   id: number;
   request: WorkerRequest;
   transfer: Transferable[];
-  resolve: (value: never) => void;
+  resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   signal: AbortSignal | undefined;
 }
@@ -26,8 +55,12 @@ class Lane {
 
   constructor(worker: Worker, init: WorkerMessage) {
     this.worker = worker;
-    this.worker.onmessage = (event: MessageEvent<WorkerReply>) => this.finish(event.data);
-    this.worker.onerror = (event) => this.fail(new Error(event.message || "The render worker stopped."));
+    this.worker.addEventListener("message", (event: MessageEvent<WorkerReply>) =>
+      this.finish(event.data),
+    );
+    this.worker.addEventListener("error", (event) =>
+      this.fail(new Error(event.message || "The render worker stopped.")),
+    );
     this.post(init);
   }
 
@@ -71,7 +104,7 @@ class Lane {
     }
     this.running = undefined;
     if (reply.ok) {
-      job.resolve(reply.value as never);
+      job.resolve(reply.value);
     } else {
       job.reject(new Error(reply.error));
     }
@@ -115,14 +148,16 @@ export class RenderPool {
         id: this.nextId++,
         request,
         transfer: options.transfer ?? [],
-        resolve: resolve as (value: never) => void,
+        resolve: settle(request.kind, resolve, reject),
         reject,
         signal: options.signal,
       });
     });
   }
 
-  broadcast<K extends Kind>(request: Extract<WorkerRequest, { kind: K }>): Promise<WorkerReplies[K][]> {
+  broadcast<K extends Kind>(
+    request: Extract<WorkerRequest, { kind: K }>,
+  ): Promise<WorkerReplies[K][]> {
     return Promise.all(
       [this.loupe, ...this.background].map(
         (lane) =>
@@ -131,7 +166,7 @@ export class RenderPool {
               id: this.nextId++,
               request,
               transfer: [],
-              resolve: resolve as (value: never) => void,
+              resolve: settle(request.kind, resolve, reject),
               reject,
               signal: undefined,
             });

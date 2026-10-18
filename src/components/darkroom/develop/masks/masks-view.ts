@@ -1,7 +1,6 @@
 import { mapPoints } from "@/lib/engine/engine";
-import type { DevelopSettings, Facts, RenderedFrame } from "@/lib/engine/types";
+import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
 
-import type { FrameSize } from "./masks-geometry";
 import type { Pt } from "./masks-model";
 
 export interface ViewSpace {
@@ -14,7 +13,7 @@ export interface ViewSpace {
 export function viewSpace(
   facts: Facts,
   settings: DevelopSettings,
-  frame: RenderedFrame,
+  frame: FrameSize,
   scale: number,
 ): ViewSpace {
   const map = (points: Pt[], toImage: boolean): Pt[] =>

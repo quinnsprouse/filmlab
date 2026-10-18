@@ -31,7 +31,7 @@ function RangeBar({ maskId, index, shape }: { maskId: number; index: number; sha
       handle === "lo"
         ? { ...shape, lo: Math.min(value, shape.hi - minGap) }
         : { ...shape, hi: Math.max(value, shape.lo + minGap) };
-    updateShape(maskId, index, next, true, "Luminance range");
+    updateShape(maskId, index, next, "Luminance range");
   };
   return (
     <fieldset
@@ -86,7 +86,7 @@ function LuminanceControls({
       <RangeBar maskId={maskId} index={index} shape={shape} />
       <div
         onDoubleClick={() =>
-          updateShape(maskId, index, { ...shape, loFeather: 0.1, hiFeather: 0.1 }, false)
+          updateShape(maskId, index, { ...shape, loFeather: 0.1, hiFeather: 0.1 })
         }
       >
         <Slider
@@ -97,7 +97,7 @@ function LuminanceControls({
           step={1}
           onChange={(value) => {
             const feather = (value / 100) * maxFeather;
-            updateShape(maskId, index, { ...shape, loFeather: feather, hiFeather: feather }, true);
+            updateShape(maskId, index, { ...shape, loFeather: feather, hiFeather: feather });
           }}
         />
       </div>
@@ -155,14 +155,14 @@ function ColorControls({
       <p className="text-xs text-tertiary-text">
         Click the photo to pick. Shift-click adds up to 5.
       </p>
-      <div onDoubleClick={() => updateShape(maskId, index, { ...shape, refine: 50 }, false)}>
+      <div onDoubleClick={() => updateShape(maskId, index, { ...shape, refine: 50 })}>
         <Slider
           label="Refine"
           value={shape.refine}
           min={0}
           max={100}
           step={1}
-          onChange={(value) => updateShape(maskId, index, { ...shape, refine: value }, true)}
+          onChange={(value) => updateShape(maskId, index, { ...shape, refine: value })}
         />
       </div>
     </div>

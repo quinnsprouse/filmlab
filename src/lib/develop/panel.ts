@@ -9,6 +9,7 @@ export type Row =
   | { kind: "filmStock" }
   | { kind: "halation" }
   | { kind: "grain" }
+  | { kind: "dust" }
   | { kind: "group"; title: string; rows: Row[] };
 
 export interface Section {
@@ -24,6 +25,7 @@ export const sections: Section[] = [
   { id: "film", title: "Film", open: true, rows: [{ kind: "filmStock" }] },
   { id: "halation", title: "Halation", open: false, rows: [{ kind: "halation" }] },
   { id: "grain", title: "Grain", open: false, rows: [{ kind: "grain" }] },
+  { id: "dust", title: "Dust", open: false, rows: [{ kind: "dust" }] },
   {
     id: "light",
     title: "Light",

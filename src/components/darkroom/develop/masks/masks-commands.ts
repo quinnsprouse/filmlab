@@ -48,7 +48,7 @@ export function addMask(kind: CreateKind): void {
     const result = editCommand(
       "mask.add",
       { kind },
-      { label: `Add ${kindLabels[kind].toLowerCase()}`, key: "mask.add", draft: false },
+      { label: `Add ${kindLabels[kind].toLowerCase()}`, key: "mask.add" },
     );
     selectMask(activeMaskOf(result));
     if (kind === "colorRange") {
@@ -63,7 +63,7 @@ export function addComponent(maskId: number, op: MaskOp, kind: CreateKind): void
       editCommand(
         "mask.addComponent",
         { id: maskId, op, kind },
-        { label: `${op} ${kindLabels[kind].toLowerCase()}`, key: "mask.component", draft: false },
+        { label: `${op} ${kindLabels[kind].toLowerCase()}`, key: "mask.component" },
       );
     }
     selectMask(maskId);
@@ -78,29 +78,17 @@ export function addComponent(maskId: number, op: MaskOp, kind: CreateKind): void
 
 export function deleteMask(id: number): void {
   attempt(() => {
-    const result = editCommand(
-      "mask.delete",
-      { id },
-      { label: "Delete mask", key: "mask.delete", draft: false },
-    );
+    const result = editCommand("mask.delete", { id }, { label: "Delete mask", key: "mask.delete" });
     selectMask(activeMaskOf(result));
   });
 }
 
 export function toggleVisible(id: number): void {
-  attempt(() =>
-    editCommand(
-      "mask.visible",
-      { id },
-      { label: "Toggle mask", key: "mask.visible", draft: false },
-    ),
-  );
+  attempt(() => editCommand("mask.visible", { id }, { label: "Toggle mask", key: "mask.visible" }));
 }
 
 export function invertMask(id: number): void {
-  attempt(() =>
-    editCommand("mask.invert", { id }, { label: "Invert mask", key: "mask.invert", draft: false }),
-  );
+  attempt(() => editCommand("mask.invert", { id }, { label: "Invert mask", key: "mask.invert" }));
 }
 
 export function renameMask(id: number, name: string): void {
@@ -110,7 +98,7 @@ export function renameMask(id: number, name: string): void {
       editCommand(
         "mask.rename",
         { id, name: trimmed },
-        { label: "Rename mask", key: "mask.rename", draft: false },
+        { label: "Rename mask", key: "mask.rename" },
       ),
     );
   }
@@ -121,7 +109,7 @@ export function duplicateMask(id: number): void {
     const result = editCommand(
       "mask.duplicate",
       { id },
-      { label: "Duplicate mask", key: "mask.duplicate", draft: false },
+      { label: "Duplicate mask", key: "mask.duplicate" },
     );
     selectMask(activeMaskOf(result));
   });
@@ -139,7 +127,7 @@ export function editComponent(
     const result = editCommand(
       "mask.component",
       { id, component, action, ...(op ? { op } : {}) },
-      { label: `${action} component`, key: "mask.component", draft: false },
+      { label: `${action} component`, key: "mask.component" },
     );
     if (action === "delete") {
       selectMask(activeMaskOf(result));
@@ -152,7 +140,7 @@ export function setAdjust(id: number, field: string, value: number, label: strin
     editCommand(
       "mask.adjust",
       { id, values: { [field]: value } },
-      { label, key: `mask.adjust:${id}:${field}`, draft: true },
+      { label, key: `mask.adjust:${id}:${field}` },
     ),
   );
 }
@@ -162,7 +150,7 @@ export function setRefine(id: number, value: number): void {
     editCommand(
       "mask.refine",
       { id, value },
-      { label: `Refine edges ${Math.round(value)}`, key: `mask.refine:${id}`, draft: true },
+      { label: `Refine edges ${Math.round(value)}`, key: `mask.refine:${id}` },
     ),
   );
 }
@@ -171,14 +159,13 @@ export function updateShape(
   id: number,
   component: number,
   shape: Shape,
-  draft: boolean,
   label = "Edit mask",
 ): void {
   attempt(() =>
     editCommand(
       "mask.update",
       { id, component, shape: shapeParams(shape) },
-      { label, key: `mask.shape:${id}:${component}`, draft },
+      { label, key: `mask.shape:${id}:${component}` },
     ),
   );
 }
@@ -207,7 +194,7 @@ export function paintStroke({ maskId, points, pressure, erase, connect }: Stroke
         connect,
         ...(pressure.length > 0 ? { pressure } : {}),
       },
-      { label: erase ? "Erase brush stroke" : "Brush stroke", key: "mask.brush", draft: false },
+      { label: erase ? "Erase brush stroke" : "Brush stroke", key: "mask.brush" },
     );
     const created = activeMaskOf(result);
     patchMasks({
@@ -223,7 +210,7 @@ export function sampleColor(maskId: number, at: Pt, add: boolean): void {
     editCommand(
       "mask.sampleColor",
       { id: maskId, x: at.x, y: at.y, add },
-      { label: "Pick color", key: `mask.${maskId}.sample`, draft: false },
+      { label: "Pick color", key: `mask.${maskId}.sample` },
     ),
   );
 }

@@ -1,13 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use serde::Deserialize;
 
+pub fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct CubeLut {
-    size: usize,
-    min: [f32; 3],
-    max: [f32; 3],
-    data: Vec<[f32; 3]>,
+    pub(crate) id: u64,
+    pub(crate) size: usize,
+    pub(crate) min: [f32; 3],
+    pub(crate) max: [f32; 3],
+    pub(crate) unit: bool,
+    pub(crate) data: Vec<[f32; 3]>,
 }
 
 impl CubeLut {
@@ -37,11 +45,7 @@ impl CubeLut {
         if size < 2 || data.len() != size * size * size {
             return Err(format!("expected {} entries for size {size}, found {}", size * size * size, data.len()));
         }
-        Ok(CubeLut { size, min, max, data })
-    }
-
-    fn at(&self, r: usize, g: usize, b: usize) -> [f32; 3] {
-        self.data[r + self.size * (g + self.size * b)]
+        Ok(CubeLut { id: next_id(), size, min, max, unit: min == [0.0; 3] && max == [1.0; 3], data })
     }
 
     pub fn apply(&self, c: [f32; 3]) -> [f32; 3] {
@@ -49,18 +53,23 @@ impl CubeLut {
         let mut base = [0usize; 3];
         let mut frac = [0f32; 3];
         for i in 0..3 {
-            let t = ((c[i] - self.min[i]) / (self.max[i] - self.min[i])).clamp(0.0, 1.0) * n;
+            // why: (c - 0) / (1 - 0) is c bit for bit, so the unit domain skips the division
+            let u = if self.unit { c[i] } else { (c[i] - self.min[i]) / (self.max[i] - self.min[i]) };
+            let t = u.clamp(0.0, 1.0) * n;
             let lo = (t.floor() as usize).min(self.size - 2);
             base[i] = lo;
             frac[i] = t - lo as f32;
         }
         let [r, g, b] = base;
         let [fr, fg, fb] = frac;
+        let (gs, bs) = (self.size, self.size * self.size);
+        let at = r + gs * g + bs * b;
+        let d = &self.data[at..=at + bs + gs + 1];
         let lerp = |a: [f32; 3], z: [f32; 3], t: f32| [a[0] + (z[0] - a[0]) * t, a[1] + (z[1] - a[1]) * t, a[2] + (z[2] - a[2]) * t];
-        let c00 = lerp(self.at(r, g, b), self.at(r + 1, g, b), fr);
-        let c10 = lerp(self.at(r, g + 1, b), self.at(r + 1, g + 1, b), fr);
-        let c01 = lerp(self.at(r, g, b + 1), self.at(r + 1, g, b + 1), fr);
-        let c11 = lerp(self.at(r, g + 1, b + 1), self.at(r + 1, g + 1, b + 1), fr);
+        let c00 = lerp(d[0], d[1], fr);
+        let c10 = lerp(d[gs], d[gs + 1], fr);
+        let c01 = lerp(d[bs], d[bs + 1], fr);
+        let c11 = lerp(d[bs + gs], d[bs + gs + 1], fr);
         lerp(lerp(c00, c10, fg), lerp(c01, c11, fg), fb)
     }
 }
@@ -127,7 +136,43 @@ fn apply(m: &[[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
     [0, 1, 2].map(|i| m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2])
 }
 
-fn logc3(x: f32) -> f32 {
+const LOG2_STEPS: usize = 4096;
+const EXP2_STEPS: usize = 4096;
+
+pub(crate) fn log2_table() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| (0..=LOG2_STEPS).map(|i| (1.0 + i as f64 / LOG2_STEPS as f64).log2() as f32).collect())
+}
+
+pub(crate) fn exp2_table() -> &'static [f32] {
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| (0..=EXP2_STEPS).map(|i| (i as f64 / EXP2_STEPS as f64).exp2() as f32).collect())
+}
+
+pub(crate) fn fast_log2(x: f32, table: &[f32]) -> f32 {
+    let bits = x.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000) - 1.0;
+    let t = mantissa * LOG2_STEPS as f32;
+    let i = (t as usize).min(LOG2_STEPS - 1);
+    exponent as f32 + table[i] + (table[i + 1] - table[i]) * (t - i as f32)
+}
+
+fn fast_log10(x: f32, table: &[f32]) -> f32 {
+    fast_log2(x, table) * std::f32::consts::LOG10_2
+}
+
+// why: libm's exp2/log2 can't be reproduced on the GPU, so contrast uses tables both sides share
+pub(crate) fn fast_exp2(x: f32, table: &[f32]) -> f32 {
+    let x = x.clamp(-126.0, 126.0);
+    let whole = x.floor();
+    let t = (x - whole) * EXP2_STEPS as f32;
+    let i = (t as usize).min(EXP2_STEPS - 1);
+    let scale = f32::from_bits(((whole as i32 + 127) as u32) << 23);
+    (table[i] + (table[i + 1] - table[i]) * (t - i as f32)) * scale
+}
+
+fn logc3(x: f32, log2: &[f32]) -> f32 {
     const CUT: f32 = 0.010_591;
     const A: f32 = 5.555_556;
     const B: f32 = 0.052_272;
@@ -135,27 +180,59 @@ fn logc3(x: f32) -> f32 {
     const D: f32 = 0.385_537;
     const E: f32 = 5.367_655;
     const F: f32 = 0.092_809;
-    if x > CUT { C * (A * x + B).log10() + D } else { E * x + F }
+    if x > CUT { C * fast_log10(A * x + B, log2) + D } else { E * x + F }
 }
 
 fn srgb_to_linear(v: f32) -> f32 {
     if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase")]
-pub struct Halation {
-    pub amount: f32,
-    pub radius: f32,
-    pub threshold: f32,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct Grain {
+pub struct GrainRequest {
     pub amount: f32,
     pub size: f32,
-    pub color: f32,
+    pub softness: f32,
+    pub defocus: f32,
+}
+
+impl Default for GrainRequest {
+    fn default() -> Self {
+        GrainRequest { amount: 0.0995, size: 1.0, softness: 0.05, defocus: 1.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DustRequest {
+    pub on: bool,
+    pub size: f64,
+    pub softness: f64,
+}
+
+impl Default for DustRequest {
+    fn default() -> Self {
+        DustRequest { on: true, size: 1.758, softness: 0.245 }
+    }
+}
+
+// why: FilmVision's PowerGrades turn Film Look Creator's halation on at amount 0.5, hue 0.45, saturation 1,
+// highlights only; the radius follows the gauge (6 / 5 / 4 for 16 / 35 / 65 mm)
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HalationRequest {
+    pub on: bool,
+    pub amount: f32,
+    pub hue: f32,
+    pub sat: f32,
+    pub radius: f32,
+    pub highlights_only: bool,
+}
+
+impl Default for HalationRequest {
+    fn default() -> Self {
+        HalationRequest { on: true, amount: 0.5, hue: 0.45, sat: 1.0, radius: 4.0, highlights_only: true }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -164,14 +241,32 @@ pub struct FilmRequest {
     pub negative: Option<String>,
     pub print: Option<String>,
     pub utility: Option<String>,
-    pub halation: Halation,
-    pub grain: Grain,
+    pub texture: bool,
+    pub blur: f32,
+    pub grain: Option<GrainRequest>,
+    pub dust: DustRequest,
+    pub halation: HalationRequest,
     pub auto_scan: bool,
 }
 
 impl Default for FilmRequest {
     fn default() -> Self {
-        FilmRequest { negative: None, print: None, utility: None, halation: Halation::default(), grain: Grain::default(), auto_scan: true }
+        FilmRequest { negative: None, print: None, utility: None, texture: true, blur: 0.05, grain: Some(GrainRequest::default()), dust: DustRequest::default(), halation: HalationRequest::default(), auto_scan: true }
+    }
+}
+
+impl FilmRequest {
+    pub fn texture_params(&self, native: Size) -> Option<TextureParams> {
+        let grain = self.grain.map(|g| GrainParams { amount: g.amount, size: g.size, softness: g.softness, defocus: g.defocus, seed: 0 });
+        let d = self.dust;
+        let dust = d.on.then(|| DustParams { size: d.size, softness: d.softness, rows: DustParams::rows_of(native) });
+        let h = self.halation;
+        let halation = (h.on && h.amount > 0.0).then_some(HalationParams { amount: h.amount, hue: h.hue, sat: h.sat, radius: h.radius, highlights_only: h.highlights_only });
+        self.texture.then_some(TextureParams { film_blur: self.blur, grain, dust, halation })
+    }
+
+    pub fn texture_key(&self) -> String {
+        format!("{}{:?}{:?}{:?}{:?}", self.texture, self.blur, self.grain, self.dust, self.halation)
     }
 }
 
@@ -182,12 +277,12 @@ pub struct Light {
     pub blacks: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Scan {
-    lo: f32,
-    gain: f32,
-    black: f32,
+    pub(crate) table: Arc<Vec<f32>>,
 }
+
+const SCAN_STEPS: usize = 8192;
 
 const SCAN_WHITE: f32 = 0.92;
 const SCAN_BLACK: f32 = 0.03;
@@ -205,37 +300,39 @@ impl Scan {
     pub fn measure(lumas: &mut [f32], light: Light, auto: bool) -> Scan {
         let (white, black) = Scan::targets(light);
         let (lo, hi) = if auto && lumas.len() > 16 {
-            lumas.sort_by(f32::total_cmp);
-            let at = |q: f32| lumas[((lumas.len() - 1) as f32 * q) as usize];
+            let mut at = |q: f32| {
+                let k = ((lumas.len() - 1) as f32 * q) as usize;
+                *lumas.select_nth_unstable_by(k, f32::total_cmp).1
+            };
             (at(0.005), at(0.995))
         } else {
             (0.0, white - black)
         };
         let gain = ((white - black) / (hi - lo).max(1e-3)).min(SCAN_MAX_GAIN);
-        Scan { lo, gain, black }
+        let k = 1.0 - SCAN_SHOULDER;
+        let table = (0..=SCAN_STEPS)
+            .map(|i| {
+                let v = i as f32 / SCAN_STEPS as f32;
+                let out = black + (v - lo) * gain;
+                let out = if out > SCAN_SHOULDER { SCAN_SHOULDER + k * ((out - SCAN_SHOULDER) / k).tanh() } else { out };
+                srgb_to_linear(out.clamp(0.0, 1.0))
+            })
+            .collect();
+        Scan { table: Arc::new(table) }
     }
 
-    fn apply(&self, display: [f32; 3]) -> [f32; 3] {
-        let k = 1.0 - SCAN_SHOULDER;
+    fn linear(&self, display: [f32; 3]) -> [f32; 3] {
         display.map(|v| {
-            let out = self.black + (v - self.lo) * self.gain;
-            if out > SCAN_SHOULDER { SCAN_SHOULDER + k * ((out - SCAN_SHOULDER) / k).tanh() } else { out }.clamp(0.0, 1.0)
+            let t = v.clamp(0.0, 1.0) * SCAN_STEPS as f32;
+            let i = (t as usize).min(SCAN_STEPS - 1);
+            self.table[i] + (self.table[i + 1] - self.table[i]) * (t - i as f32)
         })
     }
 }
 
-pub fn contrast(scene: [f32; 3], amount: f32) -> [f32; 3] {
-    if amount == 0.0 {
-        return scene;
-    }
+pub fn contrast_slope(amount: f32) -> f32 {
     let c = amount / 100.0;
-    let slope = if c >= 0.0 { 1.0 + 0.55 * c } else { 1.0 + 0.4 * c };
-    let y = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
-    if y <= 1e-9 {
-        return scene;
-    }
-    let target = 0.18 * ((y / 0.18).log2() * slope).exp2();
-    scene.map(|v| v * target / y)
+    if c >= 0.0 { 1.0 + 0.55 * c } else { 1.0 + 0.4 * c }
 }
 
 #[derive(Default)]
@@ -243,10 +340,35 @@ pub struct LutLibrary {
     luts: HashMap<String, Arc<CubeLut>>,
 }
 
+// why: every engine (the loupe's and each thumbnail indexer's) loads the same stocks; they share one parsed
+// table, and so one copy on the GPU, while any of them holds it
+static PARSED: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, std::sync::Weak<CubeLut>>>> = std::sync::LazyLock::new(Default::default);
+
+fn shared_lut(text: &str) -> Result<Arc<CubeLut>, String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = hasher.finish();
+    let mut parsed = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(lut) = parsed.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(lut);
+    }
+    let lut = Arc::new(CubeLut::parse(text)?);
+    parsed.retain(|_, l| l.strong_count() > 0);
+    parsed.insert(key, Arc::downgrade(&lut));
+    Ok(lut)
+}
+
+impl Drop for CubeLut {
+    fn drop(&mut self) {
+        crate::gpu::forget_lut(self.id);
+    }
+}
+
 impl LutLibrary {
     pub fn insert(&mut self, id: &str, text: &str) -> Result<(), String> {
-        let lut = CubeLut::parse(text).map_err(|e| format!("{id}: {e}"))?;
-        self.luts.insert(id.to_string(), Arc::new(lut));
+        let lut = shared_lut(text).map_err(|e| format!("{id}: {e}"))?;
+        self.luts.insert(id.to_string(), lut);
         Ok(())
     }
 
@@ -263,11 +385,13 @@ impl LutLibrary {
 }
 
 pub struct FilmChain {
-    to_awg: [[f32; 3]; 3],
-    from_709: [[f32; 3]; 3],
-    utility: Option<Arc<CubeLut>>,
-    negative: Arc<CubeLut>,
-    print: Arc<CubeLut>,
+    pub(crate) to_awg: [[f32; 3]; 3],
+    pub(crate) from_709: [[f32; 3]; 3],
+    pub(crate) utility: Option<Arc<CubeLut>>,
+    pub(crate) negative: Arc<CubeLut>,
+    pub(crate) print: Arc<CubeLut>,
+    pub(crate) log2: &'static [f32],
+    pub(crate) exp2: &'static [f32],
 }
 
 impl FilmChain {
@@ -278,234 +402,235 @@ impl FilmChain {
         let rec2020 = rgb_to_xyz(REC2020, D65);
         let to_awg = mul(inverse(rgb_to_xyz(AWG3, D65)), rec2020);
         let from_709 = mul(inverse(rec2020), rgb_to_xyz(REC709, D65));
-        Ok(Some(FilmChain { to_awg: to_f32(to_awg), from_709: to_f32(from_709), utility: library.get(&request.utility)?, negative, print }))
+        Ok(Some(FilmChain { to_awg: to_f32(to_awg), from_709: to_f32(from_709), utility: library.get(&request.utility)?, negative, print, log2: log2_table(), exp2: exp2_table() }))
+    }
+
+    pub fn contrast(&self, scene: [f32; 3], amount: f32) -> [f32; 3] {
+        if amount == 0.0 {
+            return scene;
+        }
+        let slope = contrast_slope(amount);
+        let y = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
+        if y <= 1e-9 {
+            return scene;
+        }
+        let target = 0.18 * fast_exp2(fast_log2(y / 0.18, self.log2) * slope, self.exp2);
+        scene.map(|v| v * target / y)
     }
 
     pub fn log_of(&self, scene: [f32; 3]) -> [f32; 3] {
-        apply(&self.to_awg, scene).map(|v| logc3(v.max(0.0)).clamp(0.0, 1.0))
+        apply(&self.to_awg, scene).map(|v| logc3(v.max(0.0), self.log2).clamp(0.0, 1.0))
+    }
+
+    fn utility_of(&self, log: [f32; 3]) -> [f32; 3] {
+        match &self.utility {
+            Some(u) => u.apply(log),
+            None => log,
+        }
     }
 
     pub fn negative_of(&self, log: [f32; 3]) -> [f32; 3] {
-        let log = match &self.utility {
-            Some(u) => u.apply(log),
-            None => log,
-        };
-        self.negative.apply(log.map(|v| v.clamp(0.0, 1.0)))
+        self.negative.apply(self.utility_of(log).map(|v| v.clamp(0.0, 1.0)))
+    }
+
+    pub fn code_of(&self, scene: [f32; 3], contrast: f32) -> [f32; 3] {
+        self.utility_of(self.log_of(self.contrast(scene, contrast)))
+    }
+
+    pub fn display_of(&self, code: [f32; 3]) -> [f32; 3] {
+        self.print_display(self.negative.apply(code.map(|v| v.clamp(0.0, 1.0))))
+    }
+
+    pub fn display_luma(&self, code: [f32; 3]) -> f32 {
+        let d = self.display_of(code);
+        0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]
     }
 
     pub fn print_display(&self, negative: [f32; 3]) -> [f32; 3] {
         self.print.apply(negative.map(|v| v.clamp(0.0, 1.0)))
     }
 
-    pub fn linear_of(&self, display: [f32; 3]) -> [f32; 3] {
-        apply(&self.from_709, display.map(srgb_to_linear))
+
+    pub(crate) fn to_working(&self, linear_709: [f32; 3]) -> [f32; 3] {
+        apply(&self.from_709, linear_709)
     }
 
-    pub fn print_of(&self, negative: [f32; 3]) -> [f32; 3] {
-        self.linear_of(self.print_display(negative))
-    }
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use lightcraft_engine::pipeline::film_hook::ToneHook;
+use lightcraft_engine::pipeline::film_hook::{Pixel, ToneHook};
+use rayon::prelude::*;
+
+use crate::dust::DustParams;
+use crate::halation::HalationParams;
+use crate::grain::GrainParams;
+use crate::texture::{self, Plane, Region, Size, TextureParams};
 
 pub struct Capture {
-    stride: usize,
-    data: Vec<AtomicU32>,
+    region: Region,
+    data: Vec<[AtomicU32; 3]>,
+    frame: std::sync::OnceLock<[f32; 2]>,
 }
 
 impl Capture {
-    pub fn new(max_w: usize, max_h: usize) -> Capture {
-        let n = max_w.max(1) * max_h.max(1) * 3;
-        Capture { stride: max_w.max(1), data: (0..n).map(|_| AtomicU32::new(0)).collect() }
+    pub fn new(region: Region) -> Capture {
+        let data = (0..region.w * region.h).into_par_iter().map(|_| [0, 0, 0].map(AtomicU32::new)).collect();
+        Capture { region, data, frame: std::sync::OnceLock::new() }
     }
 
-    pub fn scene_samples(&self, w: usize, h: usize, count: usize) -> Vec<[f32; 3]> {
-        let step = ((w * h) / count.max(1)).max(1);
-        (0..w * h)
-            .step_by(step)
-            .map(|i| {
-                let at = ((i / w) * self.stride + i % w) * 3;
-                [0, 1, 2].map(|k| f32::from_bits(self.data[at + k].load(Ordering::Relaxed)))
-            })
-            .collect()
+    fn frame(&self) -> Size {
+        let frame = self.frame.get().copied().unwrap_or([self.region.w as f32, self.region.h as f32]);
+        Size { w: frame[0] as usize, h: frame[1] as usize }
     }
 
-    fn luma_plane(&self, w: usize, h: usize) -> Vec<f32> {
-        let mut out = vec![0.0; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let i = (y * self.stride + x) * 3;
-                let [r, g, b] = [0, 1, 2].map(|k| f32::from_bits(self.data[i + k].load(Ordering::Relaxed)));
-                out[y * w + x] = 0.2627 * r + 0.6780 * g + 0.0593 * b;
-            }
-        }
-        out
+    // why: a full-resolution capture is hundreds of MB; converting the atomics in place keeps it
+    // from being held twice
+    pub fn into_scene(self) -> Scene {
+        let frame = self.frame();
+        let rgb = self.data.into_iter().map(|c| c.map(|v| f32::from_bits(v.into_inner()))).collect();
+        Scene { id: next_id(), region: self.region, frame, rgb }
+    }
+
+    pub fn scene(&self) -> Scene {
+        let rgb = self.data.par_iter().map(|c| [0, 1, 2].map(|k| f32::from_bits(c[k].load(Ordering::Relaxed)))).collect();
+        Scene { id: next_id(), region: self.region, frame: self.frame(), rgb }
     }
 }
 
 impl ToneHook for Capture {
-    fn tone(&self, scene: [f32; 3], x: f32, y: f32) -> [f32; 3] {
-        let (x, y) = (x as usize, y as usize);
-        if x < self.stride {
-            let i = (y * self.stride + x) * 3;
-            if i + 2 < self.data.len() {
-                for (k, v) in scene.iter().enumerate() {
-                    self.data[i + k].store(v.to_bits(), Ordering::Relaxed);
-                }
+    fn tone(&self, scene: [f32; 3], at: Pixel) -> [f32; 3] {
+        self.frame.get_or_init(|| at.frame);
+        let (x, y) = (at.x as usize, at.y as usize);
+        let r = self.region;
+        if x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h {
+            for (cell, v) in self.data[(y - r.y) * r.w + x - r.x].iter().zip(scene) {
+                cell.store(v.to_bits(), Ordering::Relaxed);
             }
         }
-        scene.map(|v| v / (1.0 + v))
+        scene
+    }
+
+    fn capture_only(&self) -> bool {
+        true
     }
 }
 
-fn box_blur(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
-    if radius == 0 {
-        return src.to_vec();
+pub struct Scene {
+    pub(crate) id: u64,
+    pub(crate) region: Region,
+    pub(crate) frame: Size,
+    pub(crate) rgb: Vec<[f32; 3]>,
+}
+
+impl Drop for Scene {
+    fn drop(&mut self) {
+        crate::gpu::forget_scene(self.id);
     }
-    let mut tmp = vec![0.0; w * h];
-    let mut out = vec![0.0; w * h];
-    let norm = 1.0 / (2 * radius + 1) as f32;
-    for y in 0..h {
-        let row = &src[y * w..(y + 1) * w];
-        let mut acc: f32 = (0..=radius).map(|i| row[i.min(w - 1)]).sum::<f32>() + row[0] * radius as f32;
-        for x in 0..w {
-            tmp[y * w + x] = acc * norm;
-            acc += row[(x + radius + 1).min(w - 1)] - row[x.saturating_sub(radius)];
+}
+
+impl Scene {
+    pub fn frame(&self) -> Size {
+        self.frame
+    }
+
+    pub fn part(&self, region: Region) -> Scene {
+        let r = self.region;
+        let rgb = (region.y..region.y + region.h).flat_map(|y| &self.rgb[(y - r.y) * r.w + region.x - r.x..][..region.w]).copied().collect();
+        Scene { id: next_id(), region, frame: self.frame, rgb }
+    }
+}
+
+pub struct Textured {
+    pub(crate) id: u64,
+    pub(crate) region: Region,
+    pub(crate) rgb: Vec<[f32; 3]>,
+    pub(crate) gpu: bool,
+    pub(crate) lumas: Option<((u64, u64), Vec<f32>)>,
+}
+
+impl Drop for Textured {
+    fn drop(&mut self) {
+        if self.gpu {
+            crate::gpu::forget_texture(self.id);
         }
     }
-    for x in 0..w {
-        let at = |y: usize| tmp[y.min(h - 1) * w + x];
-        let mut acc: f32 = (0..=radius).map(at).sum::<f32>() + at(0) * radius as f32;
-        for y in 0..h {
-            out[y * w + x] = acc * norm;
-            acc += at(y + radius + 1) - at(y.saturating_sub(radius));
-        }
-    }
-    out
 }
 
-fn gaussian(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
-    let r = ((sigma * sigma * 12.0 / 3.0 + 1.0).sqrt() / 2.0).floor() as usize;
-    let mut out = src.to_vec();
-    for _ in 0..3 {
-        out = box_blur(&out, w, h, r);
-    }
-    out
-}
-
-pub struct Glow {
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
-    tint: [f32; 3],
-}
-
-impl Glow {
-    pub fn from_capture(capture: &Capture, w: usize, h: usize, halation: &Halation) -> Option<Glow> {
-        if halation.amount <= 0.0 || w < 2 || h < 2 {
-            return None;
-        }
-        let threshold = if halation.threshold > 0.0 { halation.threshold } else { 0.55 };
-        let excess: Vec<f32> = capture
-            .luma_plane(w, h)
-            .into_iter()
-            .map(|y| {
-                let e = (y - threshold).max(0.0);
-                e / (1.0 + e / 6.0)
-            })
-            .collect();
-        let long = w.max(h) as f32;
-        let radius = if halation.radius > 0.0 { halation.radius } else { 5.0 };
-        let core = gaussian(&excess, w, h, (radius * 0.0007 * long).max(0.5));
-        let wide = gaussian(&excess, w, h, (radius * 0.0028 * long).max(1.0));
-        let data = core.iter().zip(&wide).map(|(c, d)| halation.amount * (c + 0.35 * d)).collect();
-        Some(Glow { w, h, data, tint: [1.0, 0.22, 0.04] })
-    }
-
-    fn at(&self, x: f32, y: f32, frame: (usize, usize)) -> [f32; 3] {
-        let gx = ((x * self.w as f32 / frame.0.max(1) as f32) as usize).min(self.w - 1);
-        let gy = ((y * self.h as f32 / frame.1.max(1) as f32) as usize).min(self.h - 1);
-        let v = self.data.get(gy * self.w + gx).copied().unwrap_or(0.0);
-        self.tint.map(|t| t * v)
+impl Textured {
+    fn samples(&self, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
+        self.rgb.iter().step_by((self.rgb.len() / count.max(1)).max(1)).copied()
     }
 }
 
-fn hash(x: i64, y: i64, channel: u32) -> f32 {
-    let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ u64::from(channel).wrapping_mul(0x1656_67B1_9E37_79F9);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-    h ^= h >> 33;
-    let u = |s: u32| ((h >> s) & 0xFFFF) as f32 / 65535.0;
-    (u(0) + u(16) + u(32) + u(48) - 2.0) * 1.732
+fn crop(plane: &Plane<[f32; 3]>, out: Region) -> Vec<[f32; 3]> {
+    let r = plane.region;
+    (out.y..out.y + out.h).flat_map(|y| (out.x..out.x + out.w).map(move |x| plane.data[(y - r.y) * r.w + x - r.x])).collect()
 }
 
-pub struct GrainField {
-    amount: f32,
-    color: f32,
-    cell: f32,
-    visible: f32,
-}
-
-impl GrainField {
-    pub fn new(grain: &Grain, native_long: usize, out_long: usize) -> Option<GrainField> {
-        if grain.amount <= 0.0 {
-            return None;
-        }
-        let size = if grain.size > 0.0 { grain.size } else { 1.6 };
-        let native_cell = (size * native_long.max(1) as f32 / 6000.0).max(0.75);
-        let cell = native_cell * out_long.max(1) as f32 / native_long.max(1) as f32;
-        Some(GrainField { amount: grain.amount, color: grain.color.clamp(0.0, 1.0), cell: cell.max(1e-3), visible: cell.min(1.0) })
-    }
-
-    fn noise(&self, x: f32, y: f32, channel: u32) -> f32 {
-        let (gx, gy) = (x / self.cell, y / self.cell);
-        let (x0, y0) = (gx.floor(), gy.floor());
-        let (fx, fy) = (gx - x0, gy - y0);
-        let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
-        let (ix, iy) = (x0 as i64, y0 as i64);
-        let a = hash(ix, iy, channel) + (hash(ix + 1, iy, channel) - hash(ix, iy, channel)) * sx;
-        let b = hash(ix, iy + 1, channel) + (hash(ix + 1, iy + 1, channel) - hash(ix, iy + 1, channel)) * sx;
-        a + (b - a) * sy
-    }
-
-    fn apply(&self, negative: [f32; 3], x: f32, y: f32) -> [f32; 3] {
-        let luma = 0.2126 * negative[0] + 0.7152 * negative[1] + 0.0722 * negative[2];
-        let weight = (1.0 - 0.6 * ((luma - 0.45) / 0.45).clamp(0.0, 1.0)) * (0.6 + 0.4 * (luma / 0.3).clamp(0.0, 1.0));
-        let mono = self.noise(x + 0.5, y + 0.5, 0);
-        let k = self.amount * self.visible * weight;
-        let n = [1u32, 2, 3].map(|c| (1.0 - self.color) * mono + self.color * self.noise(x + 0.5, y + 0.5, c));
-        [negative[0] + k * n[0], negative[1] + k * n[1], negative[2] + k * n[2]]
-    }
-}
-
-pub struct FilmHook {
+pub struct Developer {
     pub chain: FilmChain,
-    pub glow: Option<Arc<Glow>>,
-    pub grain: Option<GrainField>,
     pub light: Light,
-    pub scan: Scan,
-    pub frame: (usize, usize),
+    pub texture: Option<TextureParams>,
 }
 
-impl ToneHook for FilmHook {
-    fn tone(&self, scene: [f32; 3], x: f32, y: f32) -> [f32; 3] {
-        let scene = match &self.glow {
-            Some(g) => {
-                let add = g.at(x, y, self.frame);
-                [scene[0] + add[0], scene[1] + add[1], scene[2] + add[2]]
+impl Developer {
+    pub fn textured(&self, scene: &Scene, out: Region) -> Textured {
+        if let Some((mut t, lumas)) = crate::gpu::textured(self, scene, out, true) {
+            t.lumas = lumas.map(|l| (self.stocks(), l));
+            return t;
+        }
+        self.textured_on_cpu(scene, out)
+    }
+
+    pub fn textured_on_cpu(&self, scene: &Scene, out: Region) -> Textured {
+        let code = Plane { region: scene.region, data: scene.rgb.par_iter().map(|c| self.chain.code_of(*c, self.light.contrast)).collect() };
+        let rgb = match &self.texture {
+            Some(p) => texture::texture(code, scene.frame, out, p),
+            None => crop(&code, out),
+        };
+        Textured { id: next_id(), region: out, rgb, gpu: false, lumas: None }
+    }
+
+    fn stocks(&self) -> (u64, u64) {
+        (self.chain.negative.id, self.chain.print.id)
+    }
+
+    pub fn scan(&self, textured: &Textured, auto: bool) -> Option<Scan> {
+        let mut lumas = match (&textured.lumas, textured.gpu) {
+            (Some((stocks, l)), true) if *stocks == self.stocks() => l.clone(),
+            (_, true) => crate::gpu::lumas(self, textured)?,
+            _ => {
+                let samples: Vec<[f32; 3]> = textured.samples(60_000).collect();
+                samples.par_iter().map(|c| self.chain.display_luma(*c)).collect()
             }
-            None => scene,
         };
-        let scene = contrast(scene, self.light.contrast);
-        let negative = self.chain.negative_of(self.chain.log_of(scene));
-        let negative = match &self.grain {
-            Some(g) => g.apply(negative, x, y),
-            None => negative,
-        };
-        self.chain.linear_of(self.scan.apply(self.chain.print_display(negative)))
+        Some(Scan::measure(&mut lumas, self.light, auto))
+    }
+
+    pub fn finish(&self, textured: &Textured, scan: &Scan) -> Option<Toned> {
+        if textured.gpu {
+            return crate::gpu::finish(self, textured, scan);
+        }
+        let rgb = textured.rgb.par_iter().map(|c| self.chain.to_working(scan.linear(self.chain.display_of(*c)))).collect();
+        Some(Toned { region: textured.region, rgb })
+    }
+}
+
+pub struct Toned {
+    pub(crate) region: Region,
+    pub(crate) rgb: Vec<[f32; 3]>,
+}
+
+impl ToneHook for Toned {
+    fn tone(&self, _: [f32; 3], at: Pixel) -> [f32; 3] {
+        let r = self.region;
+        let x = (at.x as usize).clamp(r.x, r.x + r.w - 1) - r.x;
+        let y = (at.y as usize).clamp(r.y, r.y + r.h - 1) - r.y;
+        self.rgb[y * r.w + x]
+    }
+
+    fn precomputed(&self) -> bool {
+        true
     }
 }

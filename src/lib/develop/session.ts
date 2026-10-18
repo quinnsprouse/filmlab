@@ -10,11 +10,11 @@ import type { DevelopSettings, FilmSettings, OverlayRequest } from "@/lib/engine
 import { bytesOf } from "@/lib/folder/folder";
 import { library, persistPhoto, photoRecord, refreshThumbnail } from "@/lib/library/library";
 
-import { requestRender } from "./render";
-import { ensureSource, keepSources, sourceKey } from "./sources";
+import { idleFor, requestRender } from "./render";
+import { ensureSource, keepSources, previewEdge, sourceKey } from "./sources";
 import { develop, emptyDevelop, type Compare, type Tool } from "./state";
 
-export { setViewport, setZoom } from "./render";
+export { setViewport, setZoom, viewer, type ZoomMotion } from "./render";
 export { develop } from "./state";
 export type { Compare, Tool } from "./state";
 
@@ -80,7 +80,7 @@ export async function openPhoto(id: string): Promise<void> {
       return;
     }
     develop.update((state) => ({ ...state, status: "ready" }));
-    requestRender(false);
+    requestRender();
     void bytesOf(record.file.source).then((pixels) => token === loadToken && attachPixels(pixels));
     schedulePreload(id, token);
   } catch (error) {
@@ -107,6 +107,18 @@ function neighbourKeys(id: string): string[] {
 }
 
 const preloadDelayMs = 1200;
+const fullPreloadIdleMs = 1500;
+
+function preloadFull(id: string, token: number): void {
+  if (token !== loadToken) {
+    return;
+  }
+  if (!idleFor(fullPreloadIdleMs)) {
+    setTimeout(() => preloadFull(id, token), fullPreloadIdleMs);
+    return;
+  }
+  void ensureSource(id, "full").catch(() => undefined);
+}
 
 function schedulePreload(id: string, token: number): void {
   setTimeout(() => {
@@ -116,18 +128,21 @@ function schedulePreload(id: string, token: number): void {
     for (const other of neighbours(id)) {
       void ensureSource(other, "preview").catch(() => undefined);
     }
+    const facts = photoRecord(id)?.probed?.facts;
+    if (facts && Math.max(facts.width, facts.height) > previewEdge) {
+      preloadFull(id, token);
+    }
   }, preloadDelayMs);
 }
 
 export interface Change {
   label: string;
   key: string;
-  draft: boolean;
 }
 
 function commit(
   settings: DevelopSettings,
-  { label, key, draft }: Change,
+  { label, key }: Change,
   film: FilmSettings | undefined = develop.get().film,
 ): void {
   const { facts } = develop.get();
@@ -143,7 +158,7 @@ function commit(
     const history = coalesce ? [...kept.slice(0, -1), step] : [...kept, step];
     return { ...state, settings, film, history, cursor: history.length - 1, compare: "after" };
   });
-  requestRender(draft);
+  requestRender();
   scheduleSave();
 }
 
@@ -162,23 +177,23 @@ export function editCommand(
 
 export function editControls(values: Record<string, number>, label: string): void {
   const key = Object.keys(values).toSorted().join(",");
-  editCommand("develop.set", { values }, { label, key, draft: true });
+  editCommand("develop.set", { values }, { label, key });
 }
 
 export function editWhiteBalanceMode(mode: WhiteBalanceMode, label: string): void {
-  editCommand("develop.wb", { mode }, { label, key: "wb.mode", draft: false });
+  editCommand("develop.wb", { mode }, { label, key: "wb.mode" });
 }
 
 export function editSettings(partial: DevelopSettings, label: string, key: string): void {
-  editCommand("develop.merge", { settings: partial, label }, { label, key, draft: false });
+  editCommand("develop.merge", { settings: partial, label }, { label, key });
 }
 
-export function editFilm(film: FilmSettings, label: string, key: string, draft = false): void {
+export function editFilm(film: FilmSettings, label: string, key: string): void {
   const { settings } = develop.get();
   if (!settings) {
     return;
   }
-  commit(settings, { label, key, draft }, film);
+  commit(settings, { label, key }, film);
 }
 
 export function applyProfileTo(
@@ -196,7 +211,7 @@ export function applyProfileTo(
     applied?.profileId === profileId && applied.step === cursor ? applied.before : settings;
   commit(
     applyProfile(before, partial, amount),
-    { label, key: `profile:${profileId}`, draft: true },
+    { label, key: `profile:${profileId}` },
     film ?? develop.get().film,
   );
   develop.update((state) => ({
@@ -213,10 +228,11 @@ export function goToStep(index: number): void {
   develop.update((state) => ({
     ...state,
     settings: step.settings,
+    film: step.film,
     cursor: index,
     compare: "after",
   }));
-  requestRender(false);
+  requestRender();
   scheduleSave();
 }
 
@@ -234,17 +250,17 @@ export function setTool(tool: Tool): void {
     tool,
     overlay: tool === "masks" ? state.overlay : undefined,
   }));
-  requestRender(false);
+  requestRender();
 }
 
 export function setOverlay(overlay: OverlayRequest | undefined): void {
   develop.update((state) => ({ ...state, overlay }));
-  requestRender(false);
+  requestRender();
 }
 
 export function setCompare(compare: Compare): void {
   develop.update((state) => ({ ...state, compare }));
-  requestRender(false);
+  requestRender();
 }
 
 export async function flushEdits(): Promise<void> {

@@ -399,15 +399,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let peak = fp.peak;
     let hdr = peak > 1.0;
     let film = crate::film_hook::current();
+    let capture_only = film.as_ref().is_some_and(|f| f.capture_only());
+    let precomputed = film.as_ref().is_some_and(|f| f.precomputed());
     let mut out = vec![T::default(); w * h];
     for_rows(&mut out, w, |y, row| {
         for (x, px) in row.iter_mut().enumerate() {
             let i = y * w + x;
-            let raw = p.img.data[i];
-            let mut c = if gain == 1.0 { raw } else { raw.map(|v| v * gain) };
-            let l_pre = p.log_l.data[i];
-            let l0 = l_pre + ev;
-
             // --- local (mask) contributions: alpha-weighted sums of the masks' terms
             let mut l = [0.0f32; MASK_SUMS];
             let mut tint_col: Option<([f32; 3], f32)> = None;
@@ -426,129 +423,143 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let [l_exp, l_temp, l_tint, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, l_dehaze, l_sat, l_hue, l_sharp, l_noise, l_moire, l_defringe] =
                 l;
 
-            // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
-            let mt = (l_moire + 0.5 * l_noise.max(0.0)).clamp(-1.0, 1.0);
-            if mt != 0.0
-                && let Some(cb) = &p.chroma_blur
-            {
-                let (y, ch0, cb) = (luminance_2020(c), crate::masks::chromaticity(raw), cb.data[i]);
-                c = std::array::from_fn(|k| ((ch0[k] + (cb[k] - ch0[k]) * mt) * y).max(0.0));
-            }
-            // --- local Defringe: desaturate purple / green fringes along edges
-            let df = l_defringe.clamp(0.0, 1.0);
-            if df > 0.0
-                && let Some(b) = &p.texture_blur
-            {
-                let k = df * defringe_weight(c, p.log_l.data[i] - b.data[i]);
-                if k > 0.0 {
-                    let y = luminance_2020(c);
-                    c = c.map(|v| v + (y - v) * k);
-                }
-            }
+            let at = crate::film_hook::Pixel { index: i, x: vx + x as f32, y: vy + y as f32, frame: [vw, vh] };
+            let mut d = match &film {
+                Some(film) if precomputed => film.tone([0.0; 3], at),
+                _ => {
+                    let raw = p.img.data[i];
+                    let mut c = if gain == 1.0 { raw } else { raw.map(|v| v * gain) };
+                    let l_pre = p.log_l.data[i];
+                    let l0 = l_pre + ev;
 
-            // --- dehaze (scene linear)
-            let dz = dehaze + l_dehaze;
-            if dz != 0.0
-                && let Some(dark) = &p.dark
-            {
-                let d = (dark.data[i] / air_pre).clamp(0.0, 1.0);
-                if dz > 0.0 {
-                    let t = (1.0 - 0.95 * dz.min(1.0) * d).max(0.12);
-                    c = c.map(|v| ((v - air * (1.0 - t)) / t).max(0.0));
-                } else {
-                    let k = (-dz).min(1.0) * 0.7 * (0.35 + 0.65 * d);
-                    c = c.map(|v| v + (air * 0.9 - v) * k);
-                }
-            }
+                    // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
+                    let mt = (l_moire + 0.5 * l_noise.max(0.0)).clamp(-1.0, 1.0);
+                    if mt != 0.0
+                        && let Some(cb) = &p.chroma_blur
+                    {
+                        let (y, ch0, cb) = (luminance_2020(c), crate::masks::chromaticity(raw), cb.data[i]);
+                        c = std::array::from_fn(|k| ((ch0[k] + (cb[k] - ch0[k]) * mt) * y).max(0.0));
+                    }
+                    // --- local Defringe: desaturate purple / green fringes along edges
+                    let df = l_defringe.clamp(0.0, 1.0);
+                    if df > 0.0
+                        && let Some(b) = &p.texture_blur
+                    {
+                        let k = df * defringe_weight(c, p.log_l.data[i] - b.data[i]);
+                        if k > 0.0 {
+                            let y = luminance_2020(c);
+                            c = c.map(|v| v + (y - v) * k);
+                        }
+                    }
 
-            // --- local exposure / temp / tint
-            if l_exp != 0.0 {
-                let g = l_exp.exp2();
-                c = c.map(|v| v * g);
-            }
-            if l_temp != 0.0 || l_tint != 0.0 {
-                let y0 = luminance_2020(c);
-                c = [c[0] * (1.0 + 0.3 * l_temp), c[1] * (1.0 - 0.22 * l_tint), c[2] * (1.0 - 0.3 * l_temp).max(0.0)];
-                let y1 = luminance_2020(c).max(1e-9);
-                c = c.map(|v| v * y0 / y1);
-            }
+                    // --- dehaze (scene linear)
+                    let dz = dehaze + l_dehaze;
+                    if dz != 0.0
+                        && let Some(dark) = &p.dark
+                    {
+                        let d = (dark.data[i] / air_pre).clamp(0.0, 1.0);
+                        if dz > 0.0 {
+                            let t = (1.0 - 0.95 * dz.min(1.0) * d).max(0.12);
+                            c = c.map(|v| ((v - air * (1.0 - t)) / t).max(0.0));
+                        } else {
+                            let k = (-dz).min(1.0) * 0.7 * (0.35 + 0.65 * d);
+                            c = c.map(|v| v + (air * 0.9 - v) * k);
+                        }
+                    }
 
-            // --- local tone in log luminance
-            let l1 = if dz != 0.0 || l_exp != 0.0 { log_lum(c) } else { l0 };
-            let shift = l1 - l0;
-            let base = p.base.data[i] + ev + shift;
-            let mut delta = 0.0f32;
-            let (hh, ss) = (hl + l_hl, sh + l_sh);
-            if hh != 0.0 || ss != 0.0 {
-                let ws = 1.0 - smooth(-4.8, 0.3, base);
-                let wh = smooth(-1.0, 2.8, base);
-                delta += ss * 1.7 * ws * ws.sqrt() + hh * 1.7 * wh;
-            }
-            if l_wh != 0.0 {
-                delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
-            }
-            if l_bl != 0.0 {
-                delta += l_bl * 0.8 * (1.0 - smooth(-6.0, -1.5, l1));
-            }
-            if l_con != 0.0 {
-                delta += l_con * 0.14 * l1.clamp(-6.0, 4.0);
-            }
-            let cl = clar + l_clar;
-            if cl != 0.0
-                && let Some(b) = &p.clarity_blur
-            {
-                let det = (l_pre - b.data[i]).clamp(-2.5, 2.5);
-                let mid = (-(base / 3.2).powi(2)).exp();
-                delta += cl * 0.85 * det * (0.35 + 0.65 * mid);
-            }
-            let tx = tex + l_tex;
-            let sp = l_sharp * 0.6 + sharpen;
-            if (tx != 0.0 || sp != 0.0)
-                && let Some(b) = &p.texture_blur
-            {
-                let det = l_pre - b.data[i];
-                let tame = 1.0 - 0.6 * smooth(0.4, 1.6, det.abs());
-                delta += tx * 1.1 * det.clamp(-1.0, 1.0) * tame;
-                if sp != 0.0 {
-                    let m = if sharpen_mask > 0.0 { smooth(sharpen_mask * 0.25, sharpen_mask * 0.25 + 0.15, det.abs()) } else { 1.0 };
-                    delta += sp * 1.3 * det.clamp(-0.8, 0.8) * m;
-                }
-            }
-            // local Noise: smooth (or, negative, boost) small-amplitude detail, keep edges
-            if l_noise != 0.0
-                && let Some(b) = &p.texture_blur
-            {
-                let det = l_pre - b.data[i];
-                delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
-            }
-            if delta != 0.0 {
-                let g = delta.exp2();
-                c = c.map(|v| v * g);
-            }
+                    // --- local exposure / temp / tint
+                    if l_exp != 0.0 {
+                        let g = l_exp.exp2();
+                        c = c.map(|v| v * g);
+                    }
+                    if l_temp != 0.0 || l_tint != 0.0 {
+                        let y0 = luminance_2020(c);
+                        c = [c[0] * (1.0 + 0.3 * l_temp), c[1] * (1.0 - 0.22 * l_tint), c[2] * (1.0 - 0.3 * l_temp).max(0.0)];
+                        let y1 = luminance_2020(c).max(1e-9);
+                        c = c.map(|v| v * y0 / y1);
+                    }
 
-            // --- calibration (scene linear, before the tone map)
-            if fp.calib.is_some() || fp.shadow_tint != 0.0 {
-                c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
-            }
+                    // --- local tone in log luminance
+                    let l1 = if dz != 0.0 || l_exp != 0.0 { log_lum(c) } else { l0 };
+                    let shift = l1 - l0;
+                    let base = p.base.data[i] + ev + shift;
+                    let mut delta = 0.0f32;
+                    let (hh, ss) = (hl + l_hl, sh + l_sh);
+                    if hh != 0.0 || ss != 0.0 {
+                        let ws = 1.0 - smooth(-4.8, 0.3, base);
+                        let wh = smooth(-1.0, 2.8, base);
+                        delta += ss * 1.7 * ws * ws.sqrt() + hh * 1.7 * wh;
+                    }
+                    if l_wh != 0.0 {
+                        delta += l_wh * 0.8 * smooth(0.5, 3.0, l1);
+                    }
+                    if l_bl != 0.0 {
+                        delta += l_bl * 0.8 * (1.0 - smooth(-6.0, -1.5, l1));
+                    }
+                    if l_con != 0.0 {
+                        delta += l_con * 0.14 * l1.clamp(-6.0, 4.0);
+                    }
+                    let cl = clar + l_clar;
+                    if cl != 0.0
+                        && let Some(b) = &p.clarity_blur
+                    {
+                        let det = (l_pre - b.data[i]).clamp(-2.5, 2.5);
+                        let mid = (-(base / 3.2).powi(2)).exp();
+                        delta += cl * 0.85 * det * (0.35 + 0.65 * mid);
+                    }
+                    let tx = tex + l_tex;
+                    let sp = l_sharp * 0.6 + sharpen;
+                    if (tx != 0.0 || sp != 0.0)
+                        && let Some(b) = &p.texture_blur
+                    {
+                        let det = l_pre - b.data[i];
+                        let tame = 1.0 - 0.6 * smooth(0.4, 1.6, det.abs());
+                        delta += tx * 1.1 * det.clamp(-1.0, 1.0) * tame;
+                        if sp != 0.0 {
+                            let m = if sharpen_mask > 0.0 { smooth(sharpen_mask * 0.25, sharpen_mask * 0.25 + 0.15, det.abs()) } else { 1.0 };
+                            delta += sp * 1.3 * det.clamp(-0.8, 0.8) * m;
+                        }
+                    }
+                    // local Noise: smooth (or, negative, boost) small-amplitude detail, keep edges
+                    if l_noise != 0.0
+                        && let Some(b) = &p.texture_blur
+                    {
+                        let det = l_pre - b.data[i];
+                        delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
+                    }
+                    if delta != 0.0 {
+                        let g = delta.exp2();
+                        c = c.map(|v| v * g);
+                    }
 
-            // --- tone map on luminance, highlight desaturation
-            let mut d = if let Some(film) = &film {
-                film.tone(c, vx + x as f32, vy + y as f32)
-            } else {
-                let yl = luminance_2020(c);
-                let o = tone.apply(yl);
-                let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
-                let k = tone.chroma_scale(o);
-                if k != 1.0 {
-                    d = d.map(|v| o + (v - o) * k);
+                    // --- calibration (scene linear, before the tone map)
+                    if fp.calib.is_some() || fp.shadow_tint != 0.0 {
+                        c = crate::colorops::calibrate(c, fp.calib.as_ref(), fp.shadow_tint);
+                    }
+
+                    // --- tone map on luminance, highlight desaturation
+                    if let Some(film) = &film {
+                        film.tone(c, at)
+                    } else {
+                        let yl = luminance_2020(c);
+                        let o = tone.apply(yl);
+                        let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
+                        let k = tone.chroma_scale(o);
+                        if k != 1.0 {
+                            d = d.map(|v| o + (v - o) * k);
+                        }
+                        let mx = d[0].max(d[1]).max(d[2]);
+                        if mx > peak {
+                            let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
+                            d = d.map(|v| v + (o - v) * t);
+                        }
+                        d
+                    }
                 }
-                let mx = d[0].max(d[1]).max(d[2]);
-                if mx > peak {
-                    let t = ((mx - peak) / (mx - o).max(1e-6)).clamp(0.0, 1.0);
-                    d = d.map(|v| v + (o - v) * t);
-                }
-                d
             };
+            if capture_only {
+                continue;
+            }
 
             // --- colour
             d = ops.apply(d, l_sat, l_hue);

@@ -1,6 +1,7 @@
 import * as wasm from "@engine/engine.js";
 import wasmUrl from "@engine/engine_bg.wasm?url";
 
+import { isNumberRecord, isPair, isPairList, isRecord, listOf, parsed, withKeys } from "./shapes";
 import type {
   ControlSpec,
   DevelopSettings,
@@ -27,11 +28,11 @@ export function bootEngine(): Promise<WebAssembly.Module> {
 const json = JSON.stringify;
 
 export function controlSpecs(): ControlSpec[] {
-  return JSON.parse(wasm.controls());
+  return parsed(wasm.controls(), listOf<ControlSpec>());
 }
 
 export function controlValues(settings: DevelopSettings): Record<string, number> {
-  return JSON.parse(wasm.controlValues(json(settings)));
+  return parsed(wasm.controlValues(json(settings)), isNumberRecord);
 }
 
 export interface WhiteBalanceView {
@@ -53,7 +54,10 @@ export type WhiteBalanceMode =
   | "custom";
 
 export function whiteBalance(facts: Facts, settings: DevelopSettings): WhiteBalanceView {
-  return JSON.parse(wasm.whiteBalance(json(facts), json(settings)));
+  return parsed(
+    wasm.whiteBalance(json(facts), json(settings)),
+    withKeys<WhiteBalanceView>("mode", "temp", "tint", "kelvin"),
+  );
 }
 
 export function applyProfile(
@@ -61,11 +65,11 @@ export function applyProfile(
   partial: DevelopSettings,
   amount: number,
 ): DevelopSettings {
-  return JSON.parse(wasm.applyProfile(json(settings), json(partial), amount));
+  return parsed(wasm.applyProfile(json(settings), json(partial), amount), isRecord);
 }
 
 export function extractProfile(settings: DevelopSettings, groups: string[]): DevelopSettings {
-  return JSON.parse(wasm.extractProfile(json(settings), json(groups)));
+  return parsed(wasm.extractProfile(json(settings), json(groups)), isRecord);
 }
 
 export interface MapRequest {
@@ -81,16 +85,16 @@ export function mapPoints(
   settings: DevelopSettings,
   request: MapRequest,
 ): [number, number][] {
-  return JSON.parse(wasm.mapPoints(json(facts), json(settings), json(request)));
+  return parsed(wasm.mapPoints(json(facts), json(settings), json(request)), isPairList);
 }
 
 export function filmOf(xmp: string): FilmSettings | undefined {
   const film = wasm.filmOf(xmp);
-  return film ? JSON.parse(film) : undefined;
+  return film ? parsed(film, withKeys<FilmSettings>("negative", "print")) : undefined;
 }
 
 export function nativeSize(facts: Facts, settings: DevelopSettings): [number, number] {
-  return JSON.parse(wasm.outputSize(json(facts), json(settings)));
+  return parsed(wasm.outputSize(json(facts), json(settings)), isPair);
 }
 
 export function writeSidecar(facts: Facts, state: PhotoState, existing: string | null): string {
@@ -98,7 +102,10 @@ export function writeSidecar(facts: Facts, state: PhotoState, existing: string |
 }
 
 export function exportPlan(facts: Facts, state: PhotoState, options: ExportOptions): ExportPlan {
-  return JSON.parse(wasm.exportPlan(json(facts), json(state), json(options)));
+  return parsed(
+    wasm.exportPlan(json(facts), json(state), json(options)),
+    withKeys<ExportPlan>("width", "height", "maxEdge"),
+  );
 }
 
 let commands: wasm.Commands | undefined;
@@ -125,6 +132,5 @@ export function runCommand(command: string, params: Record<string, unknown>): Co
   if (!commands) {
     throw new Error("Open a photo before editing it.");
   }
-  return JSON.parse(commands.run(command, json(params)));
+  return parsed(commands.run(command, json(params)), withKeys<CommandResult>("settings"));
 }
-

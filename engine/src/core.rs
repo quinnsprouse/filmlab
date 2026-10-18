@@ -12,7 +12,8 @@ use lightcraft_engine::pipeline::{self, MaskView, OutputDepth, OutputSpace, Over
 use lightcraft_engine::sidecar::{OWNED, OWNED_IF_STATED, merge_into, parse_sidecar, sidecar_packet};
 use serde::{Deserialize, Serialize};
 
-use crate::film::{Capture, FilmChain, FilmHook, FilmRequest, Glow, GrainField, Light, LutLibrary, Scan, contrast};
+use crate::film::{Capture, Developer, FilmChain, FilmRequest, Light, LutLibrary, Scan, Scene, Textured, Toned};
+use crate::texture::{self, Region, Size};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,8 +83,6 @@ pub fn film_of(packet: &str) -> Option<Value> {
 struct ViewRequest {
     max_w: usize,
     max_h: usize,
-    #[serde(default)]
-    draft: bool,
     #[serde(default = "yes")]
     apply_crop: bool,
     #[serde(default)]
@@ -159,7 +158,7 @@ impl ViewRequest {
         RenderRequest {
             max_w: self.max_w,
             max_h: self.max_h,
-            quality: if self.draft { Quality::Draft } else { Quality::Full },
+            quality: Quality::Full,
             apply_crop: self.apply_crop,
             overlay: self.overlay.map_or(Overlay::None, OverlayRequest::overlay),
             space: OutputSpace::Srgb,
@@ -412,10 +411,23 @@ pub fn map_points(facts: &str, settings: &str, request: &str) -> Fallible<String
     to_json(&mapped)
 }
 
+fn native_frame(width: u32, height: u32, s: &DevelopSettings) -> Size {
+    let (w, h) = pipeline::native_output_size(width.max(1) as usize, height.max(1) as usize, s);
+    Size { w: w.round().max(1.0) as usize, h: h.round().max(1.0) as usize }
+}
+
 pub fn native_size(facts: &str, settings: &str) -> Fallible<String> {
     let f: Facts = parse(facts)?;
     let d: DevelopSettings = parse(settings)?;
     let (w, h) = pipeline::native_output_size(f.width.max(1) as usize, f.height.max(1) as usize, &d);
+    to_json(&[w.round().max(1.0) as usize, h.round().max(1.0) as usize])
+}
+
+// why: in crop mode the loupe shows the uncropped frame, so its layout needs that frame's size
+pub fn frame_size(facts: &str, settings: &str, apply_crop: bool) -> Fallible<String> {
+    let f: Facts = parse(facts)?;
+    let d: DevelopSettings = parse(settings)?;
+    let (w, h) = Geometry::new(f.width.max(1) as usize, f.height.max(1) as usize, &d, apply_crop).native_size();
     to_json(&[w.round().max(1.0) as usize, h.round().max(1.0) as usize])
 }
 
@@ -452,12 +464,73 @@ impl Frame {
 struct Loaded {
     source: DecodedSource,
     header: SourceInfo,
+    width: u32,
+    height: u32,
 }
 
-#[derive(Clone)]
-struct FilmMeasure {
-    glow: Option<Arc<Glow>>,
-    scan: Scan,
+struct CachedScene {
+    key: u64,
+    scene: Arc<Scene>,
+    textured: Option<(String, Arc<Textured>)>,
+    scan: Option<(String, Scan)>,
+    toned: Option<(String, Arc<Toned>)>,
+}
+
+impl CachedScene {
+    fn new(key: u64, scene: Scene) -> CachedScene {
+        CachedScene { key, scene: Arc::new(scene), textured: None, scan: None, toned: None }
+    }
+
+    fn look(&self, key: u64) -> CachedScene {
+        CachedScene { key, scene: self.scene.clone(), textured: self.textured.clone(), scan: self.scan.clone(), toned: None }
+    }
+
+    fn textured(&mut self, dev: &Developer, key: &str, out: Region) -> Arc<Textured> {
+        if let Some((k, t)) = &self.textured
+            && *k == key
+        {
+            return t.clone();
+        }
+        let t = Arc::new(dev.textured(&self.scene, out));
+        self.textured = Some((key.to_string(), t.clone()));
+        t
+    }
+
+    fn on_cpu(&mut self, dev: &Developer, key: &str, out: Region) -> Arc<Textured> {
+        let t = Arc::new(dev.textured_on_cpu(&self.scene, out));
+        self.textured = Some((key.to_string(), t.clone()));
+        t
+    }
+
+    // why: a texture kept on the GPU can be dropped there (or the device lost), so each GPU step
+    // falls back to redoing the texture on the CPU
+    fn scan(&mut self, dev: &Developer, keys: (&str, &str), textured: Arc<Textured>, out: Region, auto: bool) -> (Scan, Arc<Textured>) {
+        if let Some((k, scan)) = &self.scan
+            && *k == keys.1
+        {
+            return (scan.clone(), textured);
+        }
+        let (scan, textured) = match dev.scan(&textured, auto) {
+            Some(scan) => (scan, textured),
+            None => {
+                let t = self.on_cpu(dev, keys.0, out);
+                (dev.scan(&t, auto).unwrap_or_else(|| Scan::measure(&mut [], dev.light, false)), t)
+            }
+        };
+        self.scan = Some((keys.1.to_string(), scan.clone()));
+        (scan, textured)
+    }
+}
+
+/// A photo decoded outside any engine, so a slow raw decode never holds an engine's lock.
+pub struct Decoded(Loaded);
+
+pub fn decode(facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<Decoded> {
+    let f: Facts = parse(facts)?;
+    let edge = if max_edge == 0 { usize::MAX } else { max_edge };
+    let (image, info) = lightcraft_engine::files::load_bytes(bytes, edge).map_err(fail)?;
+    let header = source_info(&photo_of(&f));
+    Ok(Decoded(Loaded { source: DecodedSource::new(Arc::new(image), Some(info)), header, width: f.width, height: f.height }))
 }
 
 #[derive(Default)]
@@ -465,53 +538,211 @@ pub struct Engine {
     sources: HashMap<String, Loaded>,
     stages: HashMap<String, Arc<StageCache>>,
     luts: LutLibrary,
-    measures: HashMap<String, FilmMeasure>,
+    scenes: HashMap<String, CachedScene>,
+    looks: HashMap<String, CachedScene>,
+}
+
+const DISPLAY_GROUPS: [&str; 9] = ["curve", "color", "mixer", "bw_mix", "point_colors", "grading", "vignette", "grain", "treatment"];
+
+fn look_key(source: &str, s: &DevelopSettings, req: &RenderRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut v = s.to_json();
+    if let Some(map) = v.as_object_mut() {
+        for group in DISPLAY_GROUPS {
+            map.remove(group);
+        }
+        if let Some(light) = map.get_mut("light").and_then(Value::as_object_mut) {
+            for k in ["contrast", "whites", "blacks"] {
+                light.remove(k);
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut h);
+    v.to_string().hash(&mut h);
+    (req.apply_crop, req.overlay.key()).hash(&mut h);
+    h.finish()
+}
+
+fn view_key(look: u64, req: &RenderRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (look, req.max_w, req.max_h, req.window.map(|w| (w.x, w.y, w.w, w.h))).hash(&mut h);
+    h.finish()
+}
+
+#[derive(Clone, Copy)]
+enum Lane {
+    View,
+    Look,
 }
 
 struct FilmJob<'a> {
     luts: &'a LutLibrary,
     film: Option<&'a FilmRequest>,
     light: Light,
-    native_long: usize,
-    reuse: Option<FilmMeasure>,
-    frame: (usize, usize),
+    view: Option<CachedScene>,
+    look: Option<CachedScene>,
+    look_key: u64,
+    native: Size,
+}
+
+struct FilmOutcome {
+    rendered: pipeline::Rendered,
+    keep: Option<Region>,
+    view: Option<CachedScene>,
+    look: Option<CachedScene>,
+}
+
+fn cropped(w: usize, h: usize, rgba: Vec<u8>, keep: Option<Region>) -> (usize, usize, Vec<u8>) {
+    match keep {
+        Some(k) if (k.w, k.h) != (w, h) => {
+            let rows = (k.y..k.y + k.h).flat_map(|y| &rgba[(y * w + k.x) * 4..(y * w + k.x + k.w) * 4]);
+            (k.w, k.h, rows.copied().collect())
+        }
+        _ => (w, h, rgba),
+    }
 }
 
 fn light_of(s: &DevelopSettings) -> Light {
     Light { contrast: s.light.contrast as f32, whites: s.light.whites as f32, blacks: s.light.blacks as f32 }
 }
 
+fn capture_scene(region: Region, render: impl Fn() -> pipeline::Rendered) -> Scene {
+    let capture = Arc::new(Capture::new(region));
+    pipeline::film_hook::with_tone_hook(capture.clone(), render);
+    match Arc::try_unwrap(capture) {
+        Ok(owned) => owned.into_scene(),
+        Err(shared) => shared.scene(),
+    }
+}
+
+// why: scan levels belong to the whole frame, so a zoomed window measures them on this small
+// render of it rather than on the part it shows; an export uses the same render so it matches
+const LOOK_EDGE: usize = 1024;
+const EXPORT_BAND: usize = 1024;
+
+fn textured_key(request: &FilmRequest, light: Light) -> String {
+    format!("{:?}{}{}", request.utility, request.texture_key(), light.contrast)
+}
+
+fn scan_key(request: &FilmRequest, light: Light) -> String {
+    format!("{}{:?}{:?}{}{light:?}", textured_key(request, light), request.negative, request.print, request.auto_scan)
+}
+
+fn whole_scan(
+    dev: &Developer,
+    request: &FilmRequest,
+    req: &RenderRequest,
+    size_of: impl Fn(&RenderRequest) -> (usize, usize),
+    render: impl Fn(&RenderRequest) -> pipeline::Rendered,
+    look: &mut Option<CachedScene>,
+    look_key: u64,
+) -> Scan {
+    let scan_key = scan_key(request, dev.light);
+    let whole = RenderRequest { max_w: LOOK_EDGE, max_h: LOOK_EDGE, window: None, ..*req };
+    let look = look.get_or_insert_with(|| {
+        let (lw, lh) = size_of(&whole);
+        let fresh = CachedScene::new(look_key, capture_scene(Region::whole(lw, lh), || render(&whole)));
+        crate::gpu::prefetch(&fresh.scene);
+        fresh
+    });
+    if let Some((_, scan)) = look.scan.as_ref().filter(|(k, _)| *k == scan_key) {
+        return scan.clone();
+    }
+    let region = look.scene.region;
+    let textured_key = textured_key(request, dev.light);
+    let textured = look.textured(dev, &textured_key, region);
+    look.scan(dev, (&textured_key, &scan_key), textured, region, request.auto_scan).0
+}
+
+fn film_export(
+    job: FilmJob<'_>,
+    req: &RenderRequest,
+    size_of: impl Fn(&RenderRequest) -> (usize, usize),
+    render: impl Fn(&RenderRequest) -> pipeline::Rendered,
+) -> Fallible<pipeline::Rendered> {
+    let Some(request) = job.film else { return Ok(render(req)) };
+    let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(render(req)) };
+    let dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let (fw, fh) = size_of(req);
+    let frame = Size { w: fw, h: fh };
+    let scan = whole_scan(&dev, request, req, &size_of, &render, &mut None, 0);
+    let margin = dev.texture.map_or(0, |p| texture::margin(frame, &p));
+    let whole = capture_scene(Region::whole(fw, fh), || render(req));
+    let mut rgb = vec![[0.0f32; 3]; fw * fh];
+    for y in (0..fh).step_by(EXPORT_BAND) {
+        let out = Region { x: 0, y, w: fw, h: EXPORT_BAND.min(fh - y) };
+        let scene = whole.part(out.grown(margin, frame));
+        let toned = match dev.finish(&dev.textured(&scene, out), &scan) {
+            Some(t) => t,
+            None => dev.finish(&dev.textured_on_cpu(&scene, out), &scan).ok_or("the film stage failed on the CPU")?,
+        };
+        rgb[y * fw..(y + out.h) * fw].copy_from_slice(&toned.rgb);
+    }
+    let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb });
+    Ok(pipeline::film_hook::with_tone_hook(toned, || render(req)))
+}
+
 fn film_render(
     job: FilmJob<'_>,
     req: &RenderRequest,
-    render: impl Fn() -> pipeline::Rendered,
-) -> Fallible<(pipeline::Rendered, Option<FilmMeasure>)> {
-    let Some(request) = job.film else { return Ok((render(), None)) };
-    let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok((render(), None)) };
-    if let Some(reuse) = job.reuse {
-        let frame = job.frame;
-        let grain = GrainField::new(&request.grain, job.native_long, frame.0.max(frame.1));
-        let hook = Arc::new(FilmHook { chain, glow: reuse.glow.clone(), grain, light: job.light, scan: reuse.scan, frame });
-        let rendered = pipeline::film_hook::with_tone_hook(hook, &render);
-        return Ok((rendered, Some(reuse)));
-    }
-    let capture = Arc::new(Capture::new(req.max_w, req.max_h));
-    let probe = pipeline::film_hook::with_tone_hook(capture.clone(), &render);
-    let (w, h) = (probe.image.width, probe.image.height);
-    let mut lumas: Vec<f32> = capture
-        .scene_samples(w, h, 60_000)
-        .into_iter()
-        .map(|c| {
-            let d = chain.print_display(chain.negative_of(chain.log_of(contrast(c, job.light.contrast))));
-            0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]
-        })
-        .collect();
-    let scan = Scan::measure(&mut lumas, job.light, request.auto_scan);
-    let glow = Glow::from_capture(&capture, w, h, &request.halation).map(Arc::new);
-    let grain = GrainField::new(&request.grain, job.native_long, w.max(h));
-    let measure = FilmMeasure { glow: glow.clone(), scan };
-    let hook = Arc::new(FilmHook { chain, glow, grain, light: job.light, scan, frame: (w, h) });
-    Ok((pipeline::film_hook::with_tone_hook(hook, render), Some(measure)))
+    size_of: impl Fn(&RenderRequest) -> (usize, usize),
+    render: impl Fn(&RenderRequest, Lane) -> pipeline::Rendered,
+) -> Fallible<FilmOutcome> {
+    let plain = |job: FilmJob<'_>| FilmOutcome { rendered: render(req, Lane::View), keep: None, view: job.view, look: job.look };
+    let Some(request) = job.film else { return Ok(plain(job)) };
+    let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(plain(job)) };
+    let dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let (fw, fh) = size_of(req);
+    let frame = Size { w: fw, h: fh };
+    let window = req.window.map(|w| w.clamped(fw, fh));
+    let out = window.map_or(Region::whole(fw, fh), |w| Region { x: w.x, y: w.y, w: w.w, h: w.h });
+    let key = view_key(job.look_key, req);
+    let margin = dev.texture.map_or(0, |p| texture::margin(frame, &p));
+    let region = if window.is_some() { out.grown(margin, frame) } else { out };
+    // why: the final pass renders the captured (grown) window too, so LightCraft's stage cache hits;
+    // the margin is cut off afterwards
+    let capture = RenderRequest { window: window.map(|_| PixelWindow { x: region.x, y: region.y, w: region.w, h: region.h }), ..*req };
+    let mut view = match job.view.filter(|c| c.key == key) {
+        Some(c) => c,
+        None => {
+            let fresh = CachedScene::new(key, capture_scene(region, || render(&capture, Lane::View)));
+            crate::gpu::prefetch(&fresh.scene);
+            fresh
+        }
+    };
+    let textured_key = textured_key(request, job.light);
+    let scan_key = scan_key(request, job.light);
+    let mut textured = view.textured(&dev, &textured_key, out);
+    let (scan, look) = if window.is_some() {
+        let mut look = job.look.filter(|c| c.key == job.look_key);
+        let scan = whole_scan(&dev, request, req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key);
+        (scan, look.ok_or("the whole-frame render is missing")?)
+    } else {
+        let (scan, kept) = view.scan(&dev, (&textured_key, &scan_key), textured.clone(), out, request.auto_scan);
+        textured = kept;
+        (scan, view.look(job.look_key))
+    };
+    let toned_key = format!("{scan_key}{:?}", request);
+    let toned = match view.toned.as_ref().filter(|(k, _)| *k == toned_key) {
+        Some((_, t)) => t.clone(),
+        None => {
+            let t = match dev.finish(&textured, &scan) {
+                Some(t) => t,
+                None => {
+                    let cpu = view.on_cpu(&dev, &textured_key, out);
+                    dev.finish(&cpu, &scan).ok_or("the film stage failed on the CPU")?
+                }
+            };
+            let t = Arc::new(t);
+            view.toned = Some((toned_key, t.clone()));
+            t
+        }
+    };
+    let rendered = pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View));
+    let keep = window.map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
+    Ok(FilmOutcome { rendered, keep, view: Some(view), look: Some(look) })
 }
 
 impl Engine {
@@ -520,22 +751,34 @@ impl Engine {
     }
 
     pub fn load(&mut self, key: &str, facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<()> {
-        let f: Facts = parse(facts)?;
-        let edge = if max_edge == 0 { usize::MAX } else { max_edge };
-        let (image, info) = lightcraft_engine::files::load_bytes(bytes, edge).map_err(fail)?;
-        let header = source_info(&photo_of(&f));
-        self.sources.insert(key.to_string(), Loaded { source: DecodedSource::new(Arc::new(image), Some(info)), header });
+        let decoded = decode(facts, bytes, max_edge)?;
+        self.insert(key, decoded);
         Ok(())
+    }
+
+    pub fn insert(&mut self, key: &str, decoded: Decoded) {
+        self.sources.insert(key.to_string(), decoded.0);
     }
 
     pub fn has(&self, key: &str) -> bool {
         self.sources.contains_key(key)
     }
 
+    /// Drops the caches one view of a source keeps (its stage cache and film scene), e.g. a zoomed window once the
+    /// view is back to fit.
+    pub fn forget_view(&mut self, key: &str, stages: &str) {
+        let view = format!("{key}:{stages}");
+        self.stages.remove(&view);
+        self.scenes.remove(&view);
+        self.stages.remove(&format!("{key}:look"));
+        self.looks.remove(key);
+    }
+
     pub fn release(&mut self, key: &str) {
         self.sources.remove(key);
         self.stages.retain(|view, _| !view.starts_with(key));
-        self.measures.retain(|view, _| !view.starts_with(key));
+        self.scenes.retain(|view, _| !view.starts_with(key));
+        self.looks.remove(key);
     }
 
     pub fn render(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
@@ -545,28 +788,36 @@ impl Engine {
         let req = v.request();
         let src = &loaded.source;
         let info = src.info_or(loaded.header.clone());
-        let native_long = info.native_long.unwrap_or(src.image.width.max(src.image.height));
         let cache = v.stages.as_ref().map(|name| self.stages.entry(format!("{key}:{name}")).or_default().clone());
-        let measure_key = v.stages.as_ref().map(|name| format!("{key}:{name}"));
-        let reuse = if v.draft { measure_key.as_ref().and_then(|k| self.measures.get(k)).cloned() } else { None };
-        let frame = Geometry::new(src.image.width, src.image.height, &s, req.apply_crop).fit(req.max_w, req.max_h);
-        let job = FilmJob { luts: &self.luts, film: v.film.as_ref(), light: light_of(&s), native_long, reuse, frame };
-        let (mut rendered, measure) = film_render(job, &req, || match &cache {
-            Some(cache) => pipeline::render_cached(&src.image, &info, &s, &req, cache),
-            None => pipeline::render(&src.image, &info, &s, &req),
+        let look_cache = (v.film.is_some() && req.window.is_some()).then(|| self.stages.entry(format!("{key}:look")).or_default().clone());
+        let stored = v.stages.as_ref().map(|name| format!("{key}:{name}"));
+        let job = FilmJob {
+            luts: &self.luts,
+            film: v.film.as_ref(),
+            light: light_of(&s),
+            view: stored.as_ref().and_then(|k| self.scenes.remove(k)),
+            look: self.looks.remove(key),
+            look_key: look_key(key, &s, &req),
+            native: native_frame(loaded.width, loaded.height, &s),
+        };
+        let size_of = |r: &RenderRequest| pipeline::output_size(src.image.width, src.image.height, &s, r);
+        let outcome = film_render(job, &req, size_of, |r, lane| match (lane, &cache, &look_cache) {
+            (Lane::View, Some(cache), _) | (Lane::Look, _, Some(cache)) => pipeline::render_cached(&src.image, &info, &s, r, cache),
+            _ => pipeline::render(&src.image, &info, &s, r),
         })?;
-        if let (Some(k), Some(m)) = (measure_key, measure) {
-            self.measures.insert(k, m);
+        let mut rendered = outcome.rendered;
+        let keep = outcome.keep;
+        if let (Some(k), Some(view)) = (stored, outcome.view) {
+            self.scenes.insert(k, view);
+        }
+        if let Some(look) = outcome.look {
+            self.looks.insert(key.to_string(), look);
         }
         if let Some(h) = pipeline::hdr_histogram(&src.image, &info, &s, &req) {
             rendered.histogram = h;
         }
-        Ok(Frame {
-            width: rendered.image.width as u32,
-            height: rendered.image.height as u32,
-            rgba: rendered.image.as_bytes(),
-            histogram: rendered.histogram.to_words(),
-        })
+        let (width, height, rgba) = cropped(rendered.image.width, rendered.image.height, rendered.image.as_bytes(), keep);
+        Ok(Frame { width: width as u32, height: height as u32, rgba, histogram: rendered.histogram.to_words() })
     }
 
     pub fn load_lut(&mut self, id: &str, text: &str) -> Fallible<()> {
@@ -596,9 +847,10 @@ impl Engine {
             display: None,
         };
         let info = loaded.source.info_or(loaded.header.clone());
-        let native_long = info.native_long.unwrap_or(loaded.source.image.width.max(loaded.source.image.height));
-        let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop), native_long, reuse: None, frame: (w, h) };
-        let (rendered, _) = film_render(job, &req, || pipeline::render(&loaded.source.image, &info, &p.develop, &req))?;
+        let native = native_frame(p.width, p.height, &p.develop);
+        let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop), view: None, look: None, look_key: 0, native };
+        let size_of = |r: &RenderRequest| pipeline::output_size(loaded.source.image.width, loaded.source.image.height, &p.develop, r);
+        let rendered = film_export(job, &req, size_of, |r| pipeline::render(&loaded.source.image, &info, &p.develop, r))?;
         let meta = export_metadata(&p, &Catalog::default(), &o);
         encode_rendered(&rendered, &o, meta.as_ref())
     }

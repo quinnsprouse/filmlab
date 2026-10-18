@@ -102,7 +102,6 @@ export function addSpot(spot: NewSpot): number | undefined {
     {
       label: `${modeLabel(spot.mode)} spot`,
       key: `spot.add.${addCount}`,
-      draft: false,
     },
   );
   return indexOf(result);
@@ -113,22 +112,17 @@ export function updateSpot(
   params: Record<string, unknown>,
   label: string,
   key: string,
-  draft = true,
 ): void {
-  editCommand("spot.update", { index, ...params }, { label, key: `spot.${index}.${key}`, draft });
+  editCommand("spot.update", { index, ...params }, { label, key: `spot.${index}.${key}` });
 }
 
 export function deleteSpot(index: number, label = "Delete spot"): void {
-  editCommand("spot.delete", { index }, { label, key: "spot.delete", draft: false });
+  editCommand("spot.delete", { index }, { label, key: "spot.delete" });
 }
 
 export function clearSpots(count: number): void {
   for (let index = count - 1; index >= 0; index -= 1) {
-    editCommand(
-      "spot.delete",
-      { index },
-      { label: "Clear spots", key: "spot.clear", draft: false },
-    );
+    editCommand("spot.delete", { index }, { label: "Clear spots", key: "spot.clear" });
   }
 }
 
@@ -136,15 +130,11 @@ export function refreshSource(index: number): void {
   editCommand(
     "spot.refreshSource",
     { index },
-    { label: "Refresh source", key: `spot.${index}.refresh`, draft: false },
+    { label: "Refresh source", key: `spot.${index}.refresh` },
   );
 }
 
 export function findDust(): number {
-  const result = editCommand(
-    "spot.findDust",
-    {},
-    { label: "Find dust", key: "spot.dust", draft: false },
-  );
+  const result = editCommand("spot.findDust", {}, { label: "Find dust", key: "spot.dust" });
   return isRecord(result) && typeof result.added === "number" ? result.added : 0;
 }

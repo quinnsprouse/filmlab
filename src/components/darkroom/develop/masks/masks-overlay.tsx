@@ -1,6 +1,6 @@
 import { useStore } from "@/hooks/use-store";
 import { develop } from "@/lib/develop/session";
-import type { DevelopSettings, Facts, RenderedFrame } from "@/lib/engine/types";
+import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
 import { cn } from "@/lib/utils";
 
 import { readMasks } from "./masks-model";
@@ -14,7 +14,7 @@ import { SceneLayer } from "./overlay-scene";
 interface LoadedProps {
   facts: Facts;
   settings: DevelopSettings;
-  frame: RenderedFrame;
+  frame: FrameSize;
 }
 
 function Loaded({ facts, settings, frame }: LoadedProps) {

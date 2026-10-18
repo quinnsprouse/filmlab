@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 
 import { useStore } from "@/hooks/use-store";
 import { develop } from "@/lib/develop/session";
-import type { DevelopSettings, Facts, RenderedFrame } from "@/lib/engine/types";
+import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
 
 import { dragHandle, straighten } from "./crop-commands";
 import { CropGuides, type Guide } from "./crop-guides";
@@ -71,7 +71,7 @@ function turned(from: number, to: number): number {
 interface SurfaceProps {
   facts: Facts;
   settings: DevelopSettings;
-  frame: RenderedFrame;
+  frame: FrameSize;
 }
 
 function CropSurface({ facts, settings, frame }: SurfaceProps) {

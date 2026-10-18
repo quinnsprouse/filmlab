@@ -10,11 +10,11 @@ function attempt(run: () => unknown): { result: unknown; error: string | undefin
   }
 }
 
-export function setAngle(angle: number, draft: boolean): void {
+export function setAngle(angle: number): void {
   editCommand(
     "develop.set",
     { values: { "crop.angle": angle } },
-    { label: `Straighten ${formatAngle(angle)}°`, key: "crop.angle", draft },
+    { label: `Straighten ${formatAngle(angle)}°`, key: "crop.angle" },
   );
 }
 
@@ -22,13 +22,13 @@ export function resetAngle(): void {
   editCommand(
     "develop.set",
     { values: { "crop.angle": 0 } },
-    { label: "Straighten reset", key: "crop.angle.reset", draft: false },
+    { label: "Straighten reset", key: "crop.angle.reset" },
   );
 }
 
 export function dragHandle(params: Record<string, unknown>, gesture: number): string | undefined {
   return attempt(() =>
-    editCommand("crop.drag", params, { label: "Crop", key: `crop.drag:${gesture}`, draft: true }),
+    editCommand("crop.drag", params, { label: "Crop", key: `crop.drag:${gesture}` }),
   ).error;
 }
 
@@ -40,32 +40,24 @@ export function straighten(angle: number, gesture: number): string | undefined {
       {
         label: `Straighten ${formatAngle(angle)}°`,
         key: `crop.straighten:${gesture}`,
-        draft: true,
       },
     ),
   ).error;
 }
 
 export function setAspect(aspect: string, label: string): string | undefined {
-  return attempt(() =>
-    editCommand("crop.aspect", { aspect }, { label, key: "crop.aspect", draft: false }),
-  ).error;
+  return attempt(() => editCommand("crop.aspect", { aspect }, { label, key: "crop.aspect" })).error;
 }
 
 export function rotateAspect(): string | undefined {
   return attempt(() =>
-    editCommand(
-      "crop.rotateAspect",
-      {},
-      { label: "Rotate crop", key: "crop.rotateAspect", draft: false },
-    ),
+    editCommand("crop.rotateAspect", {}, { label: "Rotate crop", key: "crop.rotateAspect" }),
   ).error;
 }
 
 export function resetCrop(): string | undefined {
-  return attempt(() =>
-    editCommand("crop.reset", {}, { label: "Reset crop", key: "crop.reset", draft: false }),
-  ).error;
+  return attempt(() => editCommand("crop.reset", {}, { label: "Reset crop", key: "crop.reset" }))
+    .error;
 }
 
 export function autoStraighten(): string | undefined {
@@ -73,7 +65,7 @@ export function autoStraighten(): string | undefined {
     editCommand(
       "crop.autoStraighten",
       {},
-      { label: "Auto straighten", key: "crop.autoStraighten", draft: false },
+      { label: "Auto straighten", key: "crop.autoStraighten" },
     ),
   );
   if (error) {
@@ -99,11 +91,7 @@ const orientationLabels: Record<Orientation, string> = {
 
 export function orient(kind: Orientation): string | undefined {
   return attempt(() =>
-    editCommand(
-      `photo.${kind}`,
-      {},
-      { label: orientationLabels[kind], key: `photo.${kind}`, draft: false },
-    ),
+    editCommand(`photo.${kind}`, {}, { label: orientationLabels[kind], key: `photo.${kind}` }),
   ).error;
 }
 
@@ -112,7 +100,7 @@ export function setAspectRatio(width: number, height: number): string | undefine
     editCommand(
       "crop.aspect",
       { aspect: [width, height] },
-      { label: `Crop ${width} : ${height}`, key: "crop.aspect", draft: false },
+      { label: `Crop ${width} : ${height}`, key: "crop.aspect" },
     ),
   ).error;
 }

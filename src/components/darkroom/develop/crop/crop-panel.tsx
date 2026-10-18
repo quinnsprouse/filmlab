@@ -81,7 +81,7 @@ export function CropPanel() {
           label="Angle"
           value={angle}
           range={angleRange}
-          onChange={(next) => setAngle(next, true)}
+          onChange={(next) => setAngle(next)}
           onReset={resetAngle}
         />
         <ButtonGroup

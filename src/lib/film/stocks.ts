@@ -29,6 +29,7 @@ export const stocks = createStore<StocksState>({
 
 const key = "film-folder";
 const loaded = new Map<string, Promise<void>>();
+const resident = new Set<string>();
 
 async function filesIn(
   directory: FileSystemDirectoryHandle,
@@ -173,6 +174,11 @@ async function readLut(id: string): Promise<string> {
 async function loadLut(id: string): Promise<void> {
   const text = await readLut(id);
   await renderPool().broadcast({ kind: "lut", id, text });
+  resident.add(id);
+}
+
+export function lutsResident(ids: string[]): boolean {
+  return ids.every((id) => resident.has(id));
 }
 
 export async function ensureLuts(ids: string[]): Promise<void> {
@@ -181,7 +187,10 @@ export async function ensureLuts(ids: string[]): Promise<void> {
       let pending = loaded.get(id);
       if (!pending) {
         pending = loadLut(id);
-        pending.catch(() => loaded.delete(id));
+        pending.catch(() => {
+          loaded.delete(id);
+          resident.delete(id);
+        });
         loaded.set(id, pending);
       }
       return pending;

@@ -1,52 +1,132 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 import { Icon, Loading03Icon } from "@/components/icons";
 import { useStore } from "@/hooks/use-store";
-import { develop, setViewport } from "@/lib/develop/session";
+import { fitScale, rectOf, type Rect } from "@/lib/develop/camera";
+import { develop, setViewport, viewer } from "@/lib/develop/session";
+import type { DisplayFrame } from "@/lib/develop/state";
 import { photoRecord } from "@/lib/library/library";
 import { cn } from "@/lib/utils";
 
 import { exposureSummary } from "./photo-facts";
 import { ToolOverlay } from "./tools/tool-overlay";
-import { useZoomPointer } from "./use-zoom-pointer";
+import { useCamera } from "./use-camera";
 
-function Canvas() {
-  const frame = useStore(develop, (state) => state.frame);
-  const zoomed = useStore(develop, (state) => state.zoom.level !== "fit");
-  const editing = useStore(develop, (state) => state.tool === "edit");
+const exact = 0.003;
+
+interface Placement {
+  width: string;
+  height: string;
+  transform: string;
+}
+
+function placement(frame: DisplayFrame, rect: Rect): Placement {
+  const ratio = window.devicePixelRatio;
+  let sx = rect.width / frame.width;
+  let sy = rect.height / frame.height;
+  let { x, y } = rect;
+  if (Math.abs(sx - 1) < exact && Math.abs(sy - 1) < exact) {
+    sx = 1;
+    sy = 1;
+    x = Math.round(x);
+    y = Math.round(y);
+  }
+  return {
+    width: `${frame.width / ratio}px`,
+    height: `${frame.height / ratio}px`,
+    transform: `translate(${x / ratio}px, ${y / ratio}px) scale(${sx}, ${sy})`,
+  };
+}
+
+function FrameCanvas({
+  frame,
+  rect,
+  label,
+  className,
+}: {
+  frame: DisplayFrame;
+  rect: Rect;
+  label?: string;
+  className?: string;
+}) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const pointer = useZoomPointer();
+  const place = placement(frame, rect);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const canvas = ref.current;
-    if (!canvas || !frame) {
+    if (!canvas || frame.bitmap.width === 0) {
       return;
     }
-    canvas.width = frame.pixelWidth;
-    canvas.height = frame.pixelHeight;
-    canvas
-      .getContext("2d")
-      ?.putImageData(new ImageData(frame.rgba, frame.pixelWidth, frame.pixelHeight), 0, 0);
+    if (canvas.width !== frame.width || canvas.height !== frame.height) {
+      canvas.width = frame.width;
+      canvas.height = frame.height;
+    }
+    canvas.getContext("2d", { alpha: false })?.drawImage(frame.bitmap, 0, 0);
   }, [frame]);
 
-  if (!frame) {
-    return null;
-  }
-  const scale = 1 / window.devicePixelRatio;
   return (
     <canvas
       ref={ref}
-      aria-label="Photo preview"
-      {...(editing ? pointer : {})}
+      aria-label={label}
+      aria-hidden={label ? undefined : true}
       className={cn(
-        "h-(--canvas-height) w-(--canvas-width) touch-none outline outline-1 -outline-offset-1 outline-outline-image",
-        editing && (zoomed ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in"),
+        "absolute top-0 left-0 h-(--frame-height) w-(--frame-width) origin-top-left [transform:var(--frame-place)]",
+        className,
       )}
       style={{
-        "--canvas-width": `${frame.width * scale}px`,
-        "--canvas-height": `${frame.height * scale}px`,
+        "--frame-width": place.width,
+        "--frame-height": place.height,
+        "--frame-place": place.transform,
       }}
     />
+  );
+}
+
+function Photo() {
+  const frame = useStore(develop, (state) => state.frame);
+  const detail = useStore(develop, (state) => state.detail);
+  const hasTool = useStore(develop, (state) => state.tool !== "edit");
+  const compare = useStore(develop, (state) => state.compare);
+  const { camera, native, viewport } = useStore(viewer, (state) => state);
+  if (!frame) {
+    return null;
+  }
+  const zoomed = camera.scale > fitScale(native, viewport) * 1.001;
+  const fitRect = rectOf(camera, frame.region, native, viewport);
+  const tools = placement(frame, { ...fitRect, width: frame.width, height: frame.height });
+  return (
+    <>
+      <FrameCanvas
+        frame={frame}
+        rect={fitRect}
+        label="Photo preview"
+        className="outline outline-1 -outline-offset-1 outline-outline-image"
+      />
+      {detail ? (
+        <FrameCanvas
+          frame={detail}
+          rect={rectOf(camera, detail.region, native, viewport)}
+          className={cn(!zoomed && "invisible", camera.scale > 1 && "[image-rendering:pixelated]")}
+        />
+      ) : null}
+      {hasTool || compare === "before" ? (
+        <div
+          className="absolute top-0 left-0 h-(--frame-height) w-(--frame-width) [transform:var(--frame-place)]"
+          style={{
+            "--frame-width": tools.width,
+            "--frame-height": tools.height,
+            "--frame-place": tools.transform,
+          }}
+        >
+          {hasTool ? <ToolOverlay /> : null}
+          {compare === "before" ? (
+            <span className="absolute top-xs left-xs rounded-xs bg-canvas/70 px-xs py-xxs font-data text-xxs text-foreground">
+              Before
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -78,6 +158,11 @@ function Caption() {
   const photoId = useStore(develop, (state) => state.photoId);
   const facts = useStore(develop, (state) => state.facts);
   const frame = useStore(develop, (state) => state.frame);
+  const zoom = useStore(viewer, (state) =>
+    state.camera.scale > fitScale(state.native, state.viewport) * 1.001
+      ? Math.round(state.camera.scale * 100)
+      : undefined,
+  );
   if (!photoId || !facts || !frame) {
     return null;
   }
@@ -88,7 +173,9 @@ function Caption() {
       style={{ "--canvas-width": `${frame.width / window.devicePixelRatio}px` }}
     >
       <span className="truncate text-secondary-text">{name}</span>
-      <span className="shrink-0 whitespace-pre text-tertiary-text">{exposureSummary(facts)}</span>
+      <span className="shrink-0 whitespace-pre text-tertiary-text">
+        {zoom === undefined ? exposureSummary(facts) : `${zoom}%`}
+      </span>
     </div>
   );
 }
@@ -98,8 +185,12 @@ export function Stage() {
   const status = useStore(develop, (state) => state.status);
   const error = useStore(develop, (state) => state.error);
   const photoId = useStore(develop, (state) => state.photoId);
-  const compare = useStore(develop, (state) => state.compare);
-  const hasFrame = useStore(develop, (state) => state.frame !== undefined);
+  const editing = useStore(develop, (state) => state.tool === "edit");
+  const zoomed = useStore(
+    viewer,
+    (state) => state.camera.scale > fitScale(state.native, state.viewport) * 1.001,
+  );
+  const camera = useCamera(areaRef, editing);
 
   useEffect(() => {
     const area = areaRef.current;
@@ -116,17 +207,16 @@ export function Stage() {
 
   return (
     <div className="flex min-h-0 grow flex-col items-center gap-s px-xl pt-l pb-m">
-      <div ref={areaRef} className="relative flex min-h-0 w-full grow items-center justify-center">
+      <div
+        ref={areaRef}
+        {...(editing ? camera : {})}
+        className={cn(
+          "relative min-h-0 w-full grow touch-none overflow-hidden",
+          editing && (zoomed ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in"),
+        )}
+      >
         <Placeholder />
-        <div className="relative">
-          <Canvas />
-          {hasFrame ? <ToolOverlay /> : null}
-          {compare === "before" && hasFrame ? (
-            <span className="absolute top-xs left-xs rounded-xs bg-canvas/70 px-xs py-xxs font-data text-xxs text-foreground">
-              Before
-            </span>
-          ) : null}
-        </div>
+        <Photo />
         {status === "loading" ? (
           <Notice>
             <Icon icon={Loading03Icon} size={16} className="animate-spin" />

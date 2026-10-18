@@ -36,7 +36,7 @@ function developKey(key: string): void {
     toggleTool(tool);
   } else if (key === "z") {
     const { zoom } = develop.get();
-    setZoom({ ...zoom, level: zoom.level === "fit" ? 1 : "fit" });
+    setZoom({ ...zoom, level: zoom.level === "fit" ? 1 : "fit" }, { animate: true });
   }
 }
 
