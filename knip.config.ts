@@ -3,7 +3,13 @@ import type { KnipConfig } from "knip";
 export default {
   // why: Knip cannot see files that tools load by path or by convention: hook and script
   // commands and route files.
-  entry: [".agents/hooks/*.mjs", "e2e/**/*.ts", "scripts/**/*.mjs", "src/routes/**/*.{ts,tsx}"],
+  entry: [
+    ".agents/hooks/*.mjs",
+    "e2e/**/*.ts",
+    "scripts/**/*.mjs",
+    "native/scripts/*.mjs",
+    "src/routes/**/*.{ts,tsx}",
+  ],
   ignoreDependencies: [
     // why: The commit-msg shell hook runs this executable, outside Knip's JavaScript analysis.
     "@commitlint/cli",

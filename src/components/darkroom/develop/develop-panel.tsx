@@ -23,40 +23,86 @@ interface RowProps {
   values: Record<string, number>;
 }
 
+function ToggleRow({
+  row,
+  settings,
+}: {
+  row: Extract<Row, { kind: "toggle" }>;
+  settings: DevelopSettings;
+}) {
+  const [section, field] = row.path;
+  return (
+    <Toggle
+      label={row.label}
+      checked={record(settings, section)[field] === true}
+      onChange={(checked) =>
+        editSettings(
+          { [section]: { [field]: checked } },
+          `${row.label} ${checked ? "on" : "off"}`,
+          `${section}.${field}`,
+        )
+      }
+    />
+  );
+}
+
+function TreatmentRow({ settings }: { settings: DevelopSettings }) {
+  return (
+    <Segmented
+      label="Treatment"
+      value={settings.treatment === "bw" ? "bw" : "color"}
+      onChange={(treatment) =>
+        editSettings({ treatment }, treatment === "bw" ? "Black & white" : "Color", "treatment")
+      }
+      options={[
+        { value: "color", label: "Color" },
+        { value: "bw", label: "B&W" },
+      ]}
+    />
+  );
+}
+
+function VignetteStyleRow({ settings }: { settings: DevelopSettings }) {
+  const style = record(settings, "vignette").style;
+  return (
+    <Segmented
+      label="Style"
+      value={typeof style === "string" ? style : "highlightPriority"}
+      onChange={(next) =>
+        editSettings({ vignette: { style: next } }, "Vignette style", "vignette.style")
+      }
+      options={[
+        { value: "highlightPriority", label: "Highlight" },
+        { value: "colorPriority", label: "Color" },
+        { value: "paintOverlay", label: "Paint" },
+      ]}
+    />
+  );
+}
+
+function GroupRow({
+  row,
+  facts,
+  settings,
+  values,
+}: RowProps & { row: Extract<Row, { kind: "group" }> }) {
+  return (
+    <Folder title={row.title} defaultOpen={false}>
+      {row.rows.map((child) => (
+        <RowView key={keyOf(child)} row={child} facts={facts} settings={settings} values={values} />
+      ))}
+    </Folder>
+  );
+}
+
 function RowView({ row, facts, settings, values }: RowProps) {
   switch (row.kind) {
     case "slider":
       return <ControlSlider id={row.id} label={row.label} value={values[row.id] ?? 0} />;
-    case "toggle": {
-      const [section, field] = row.path;
-      return (
-        <Toggle
-          label={row.label}
-          checked={record(settings, section)[field] === true}
-          onChange={(checked) =>
-            editSettings(
-              { [section]: { [field]: checked } },
-              `${row.label} ${checked ? "on" : "off"}`,
-              `${section}.${field}`,
-            )
-          }
-        />
-      );
-    }
+    case "toggle":
+      return <ToggleRow row={row} settings={settings} />;
     case "treatment":
-      return (
-        <Segmented
-          label="Treatment"
-          value={settings.treatment === "bw" ? "bw" : "color"}
-          onChange={(treatment) =>
-            editSettings({ treatment }, treatment === "bw" ? "Black & white" : "Color", "treatment")
-          }
-          options={[
-            { value: "color", label: "Color" },
-            { value: "bw", label: "B&W" },
-          ]}
-        />
-      );
+      return <TreatmentRow settings={settings} />;
     case "whiteBalance":
       return <WhiteBalanceRows facts={facts} settings={settings} />;
     case "filmStock":
@@ -71,37 +117,10 @@ function RowView({ row, facts, settings, values }: RowProps) {
       return <MixerRows values={values} bw={settings.treatment === "bw"} />;
     case "grading":
       return <GradingRows values={values} />;
-    case "vignetteStyle": {
-      const style = record(settings, "vignette").style;
-      return (
-        <Segmented
-          label="Style"
-          value={typeof style === "string" ? style : "highlightPriority"}
-          onChange={(next) =>
-            editSettings({ vignette: { style: next } }, "Vignette style", "vignette.style")
-          }
-          options={[
-            { value: "highlightPriority", label: "Highlight" },
-            { value: "colorPriority", label: "Color" },
-            { value: "paintOverlay", label: "Paint" },
-          ]}
-        />
-      );
-    }
+    case "vignetteStyle":
+      return <VignetteStyleRow settings={settings} />;
     case "group":
-      return (
-        <Folder title={row.title} defaultOpen={false}>
-          {row.rows.map((child) => (
-            <RowView
-              key={keyOf(child)}
-              row={child}
-              facts={facts}
-              settings={settings}
-              values={values}
-            />
-          ))}
-        </Folder>
-      );
+      return <GroupRow row={row} facts={facts} settings={settings} values={values} />;
   }
 }
 

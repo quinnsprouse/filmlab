@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 
+import { usePixelRatio } from "@/hooks/use-pixel-ratio";
 import { useStore } from "@/hooks/use-store";
 import { develop } from "@/lib/develop/session";
 import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
@@ -82,7 +83,7 @@ function CropSurface({ facts, settings, frame }: SurfaceProps) {
   const [cursor, setCursor] = useState("move");
   const [readout, setReadout] = useState<{ at: Vec; angle: number } | undefined>();
 
-  const scale = 1 / window.devicePixelRatio;
+  const scale = 1 / usePixelRatio();
   const surface: Surface = { width: frame.width * scale, height: frame.height * scale, scale };
   const map: FrameMap = frameMap(facts, settings, frame);
   const crop = readCrop(settings);

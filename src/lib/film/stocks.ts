@@ -164,11 +164,16 @@ async function readLut(id: string): Promise<string> {
   }
   const parts = `${id}.cube`.split("/");
   const name = parts.pop() ?? "";
-  const directory = await parts.reduce(
-    async (parent, part) => (await parent).getDirectoryHandle(part),
-    Promise.resolve(folder),
-  );
+  const directory = await directoryAt(folder, parts);
   return (await (await directory.getFileHandle(name)).getFile()).text();
+}
+
+async function directoryAt(
+  parent: FileSystemDirectoryHandle,
+  path: string[],
+): Promise<FileSystemDirectoryHandle> {
+  const [first, ...rest] = path;
+  return first === undefined ? parent : directoryAt(await parent.getDirectoryHandle(first), rest);
 }
 
 async function loadLut(id: string): Promise<void> {

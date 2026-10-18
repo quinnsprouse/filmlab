@@ -1,3 +1,4 @@
+import { usePixelRatio } from "@/hooks/use-pixel-ratio";
 import { useStore } from "@/hooks/use-store";
 import { develop } from "@/lib/develop/session";
 import type { DevelopSettings, Facts, FrameSize } from "@/lib/engine/types";
@@ -22,7 +23,7 @@ function Loaded({ facts, settings, frame }: LoadedProps) {
   const state = useStore(masksState, (current) => current);
   const masks = readMasks(settings);
   const activeId = state.photoId === photoId ? state.active : undefined;
-  const space = viewSpace(facts, settings, frame, window.devicePixelRatio);
+  const space = viewSpace(facts, settings, frame, usePixelRatio());
   const scene = buildScene(masks, activeId, space);
   const { interaction, brush } = state;
   const pointer = useMaskPointer({ space, scene, masks, activeId, interaction, brush });

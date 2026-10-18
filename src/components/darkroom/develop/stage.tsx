@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
 import { Icon, Loading03Icon } from "@/components/icons";
+import { usePixelRatio } from "@/hooks/use-pixel-ratio";
 import { useStore } from "@/hooks/use-store";
 import { fitScale, rectOf, type Rect } from "@/lib/develop/camera";
 import { develop, setViewport, viewer } from "@/lib/develop/session";
@@ -20,8 +21,7 @@ interface Placement {
   transform: string;
 }
 
-function placement(frame: DisplayFrame, rect: Rect): Placement {
-  const ratio = window.devicePixelRatio;
+function placement(frame: DisplayFrame, rect: Rect, ratio: number): Placement {
   let sx = rect.width / frame.width;
   let sy = rect.height / frame.height;
   let { x, y } = rect;
@@ -50,7 +50,7 @@ function FrameCanvas({
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const place = placement(frame, rect);
+  const place = placement(frame, rect, usePixelRatio());
 
   useLayoutEffect(() => {
     const canvas = ref.current;
@@ -88,12 +88,13 @@ function Photo() {
   const hasTool = useStore(develop, (state) => state.tool !== "edit");
   const compare = useStore(develop, (state) => state.compare);
   const { camera, native, viewport } = useStore(viewer, (state) => state);
+  const ratio = usePixelRatio();
   if (!frame) {
     return null;
   }
   const zoomed = camera.scale > fitScale(native, viewport) * 1.001;
   const fitRect = rectOf(camera, frame.region, native, viewport);
-  const tools = placement(frame, { ...fitRect, width: frame.width, height: frame.height });
+  const tools = placement(frame, { ...fitRect, width: frame.width, height: frame.height }, ratio);
   return (
     <>
       <FrameCanvas
@@ -163,6 +164,7 @@ function Caption() {
       ? Math.round(state.camera.scale * 100)
       : undefined,
   );
+  const ratio = usePixelRatio();
   if (!photoId || !facts || !frame) {
     return null;
   }
@@ -170,7 +172,7 @@ function Caption() {
   return (
     <div
       className="flex w-(--canvas-width) items-center justify-between gap-m font-data text-xs tabular-nums"
-      style={{ "--canvas-width": `${frame.width / window.devicePixelRatio}px` }}
+      style={{ "--canvas-width": `${frame.width / ratio}px` }}
     >
       <span className="truncate text-secondary-text">{name}</span>
       <span className="shrink-0 whitespace-pre text-tertiary-text">
