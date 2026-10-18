@@ -271,7 +271,13 @@ impl Curves<'_> {
     // why: FilmVision softens colours past 0.76 HSV saturation in Rec.709 linear light, twice, keeping luminance
     // (identified from Resolve renders, scratchpad flc/sat/report.md); the 709 curves keep their 0.081 step
     fn saturated(&self, cand: [f32; 3]) -> [f32; 3] {
-        let lin = cand.map(|c| self.to_linear(c.min(1.0)));
+        self.saturated_free(cand.map(|c| c.min(1.0)))
+    }
+
+    // why: after the halation the stage takes its values unclipped (above 1 and below 0); only its output is clipped
+    // (scratchpad flc/hal/model5.py sat_stage, identified from Resolve renders)
+    fn saturated_free(&self, value: [f32; 3]) -> [f32; 3] {
+        let lin = value.map(|c| self.to_linear(c));
         desaturate(desaturate(lin)).map(|l| self.to_code(l).clamp(0.0, 1.0))
     }
 }
@@ -432,5 +438,5 @@ fn detailed(input: Plane<[f32; 3]>, frame: Size, out: Region, p: &TextureParams)
     });
     let Some(h) = halation else { return candidates.par_iter().map(|&c| curves.saturated(c)).collect() };
     let clipped = Plane { region: wide, data: candidates.par_iter().map(|c| c.map(|v| v.min(1.0))).collect() };
-    halation::apply(&clipped, frame, out, &h, &curves).par_iter().map(|&c| curves.saturated(c)).collect()
+    halation::apply(&clipped, frame, out, &h, &curves).par_iter().map(|&c| curves.saturated_free(c)).collect()
 }

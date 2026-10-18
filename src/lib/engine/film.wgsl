@@ -330,7 +330,12 @@ fn desaturate(lin: vec3f) -> vec3f {
 }
 
 fn saturated(cand: vec3f) -> vec3f {
-  let lin = vec3f(toLinear(min(cand.x, 1.0)), toLinear(min(cand.y, 1.0)), toLinear(min(cand.z, 1.0)));
+  return saturatedFree(min(cand, vec3f(1.0)));
+}
+
+// after the halation the stage takes its values unclipped; only its output is clipped
+fn saturatedFree(value: vec3f) -> vec3f {
+  let lin = vec3f(toLinear(value.x), toLinear(value.y), toLinear(value.z));
   let soft = desaturate(desaturate(lin));
   return clamp(vec3f(toCode(soft.x), toCode(soft.y), toCode(soft.z)), vec3f(0.0), vec3f(1.0));
 }
@@ -895,5 +900,5 @@ fn pyramidCombine(@builtin(global_invocation_id) id: vec3u) {
     acc[c] = add(base[c], mul(m, sub(s[c], mul(total[c], base[c]))));
   }
   let lin = times(dwgAt + 9u, vec3f(toLinear(untransfer(acc.x)), toLinear(untransfer(acc.y)), toLinear(untransfer(acc.z))));
-  write3(id.y * params.dst.z + id.x, saturated(vec3f(toCode(lin.x), toCode(lin.y), toCode(lin.z))));
+  write3(id.y * params.dst.z + id.x, saturatedFree(vec3f(toCode(lin.x), toCode(lin.y), toCode(lin.z))));
 }
