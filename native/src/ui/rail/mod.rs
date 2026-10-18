@@ -1,5 +1,5 @@
 mod save;
-mod store;
+pub(crate) mod store;
 
 use std::time::Duration;
 
@@ -231,17 +231,25 @@ fn delete(app: &mut FilmlabApp, id: String, cx: &mut Context<FilmlabApp>) {
     cx.notify();
 }
 
+/// The few history steps worth showing: the newest five, or five around the current step after an undo (with up to
+/// two redo steps above it).
+fn shown_steps(cursor: usize, count: usize) -> std::ops::Range<usize> {
+    const SHOWN: usize = 5;
+    let end = (cursor + 3).min(count).max(SHOWN.min(count));
+    end.saturating_sub(SHOWN)..end
+}
+
 fn history_section(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
     let develop = app.develop.read(cx);
     let cursor = develop.cursor;
     let count = develop.history.len();
     let me = cx.entity();
-    let rows: Vec<AnyElement> = develop
-        .history
+    let shown = shown_steps(cursor, count);
+    let rows: Vec<AnyElement> = develop.history[shown.clone()]
         .iter()
-        .enumerate()
+        .zip(shown)
         .rev()
-        .map(|(index, step)| {
+        .map(|(step, index)| {
             let me = me.clone();
             div()
                 .id(SharedString::from(format!("history-{index}")))
@@ -265,7 +273,9 @@ fn history_section(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement
                         cx.notify();
                     })
                 })
-                .child(div().truncate().child(step.label.clone()))
+                .gap(px(7.))
+                .when(step.key.starts_with("agent."), |d| d.child(div().flex_none().size(px(5.)).rounded_full().bg(theme::accent())))
+                .child(div().min_w_0().truncate().child(step.label.clone()))
                 .into_any_element()
         })
         .collect();

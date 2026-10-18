@@ -5,6 +5,7 @@ pub mod film;
 pub mod glass;
 pub mod gpu;
 pub mod library;
+pub mod mcp;
 pub mod menu;
 pub mod perf;
 pub mod stocks;

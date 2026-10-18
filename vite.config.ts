@@ -369,7 +369,14 @@ export default defineConfig({
       },
       {
         // why: Config files must default-export, and Node scripts and hooks print to the terminal.
-        files: ["*.config.ts", "lint/**", "scripts/**", ".agents/hooks/**", "e2e/**"],
+        files: [
+          "*.config.ts",
+          "lint/**",
+          "scripts/**",
+          "native/scripts/**",
+          ".agents/hooks/**",
+          "e2e/**",
+        ],
         rules: {
           "import/no-default-export": "off",
           "no-console": "off",

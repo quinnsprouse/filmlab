@@ -26,9 +26,9 @@ actions!(
     ]
 );
 
-const TOP: f32 = 56.0;
-const MARGIN: f32 = 10.0;
-const INSPECTOR: f32 = 304.0;
+pub(crate) const TOP: f32 = 56.0;
+pub(crate) const MARGIN: f32 = 10.0;
+pub(crate) const INSPECTOR: f32 = 304.0;
 const RAIL: f32 = 236.0;
 const STRIP: f32 = 88.0;
 const PINCH_SPEED: f64 = 1.0;
@@ -164,7 +164,7 @@ impl FilmlabApp {
         cx.notify();
     }
 
-    fn open_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
+    pub fn open_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         remember(&folder, None);
         self.set_mode(Mode::Browse, cx);
         self.selected = None;
@@ -254,7 +254,7 @@ impl FilmlabApp {
         });
     }
 
-    fn is_zoomed(&self, cx: &App) -> bool {
+    pub fn is_zoomed(&self, cx: &App) -> bool {
         let d = self.develop.read(cx);
         d.camera.scale > fit_scale(d.native, d.viewport) * 1.001
     }
@@ -442,6 +442,7 @@ impl FilmlabApp {
             .child(div().flex().p(px(2.)).rounded_full().bg(theme::track()).child(tab("Library", Mode::Browse, me.clone())).child(tab("Develop", Mode::Develop, me.clone())))
             .child(div().flex_1().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::primary()).truncate().child(title))
             .when(mode == Mode::Browse && library.folder.is_some(), |d| d.child(self.browse_toolbar(cx)))
+            .when_some(crate::mcp::presence(), |d, presence| d.child(super::agent::pill(&presence)))
             .child(div().text_size(px(11.)).text_color(theme::tertiary()).child(saving))
             .child(button("open", "folder-open", true, Box::new(|app, window, cx| app.prompt_folder(&OpenFolder, window, cx)), me.clone()))
             .child(button("export", "download04", true, Box::new(|app, window, cx| export::open(app, window, cx)), me.clone()))
@@ -593,6 +594,8 @@ impl FilmlabApp {
             _ => None,
         };
         let stage = self.stage(window);
+        let seen = Bounds::new(point(px(stage.x as f32), px(stage.y as f32)), size(px(stage.width as f32), px(stage.height as f32)));
+        let outline = crate::mcp::presence().zip(self.fit_frame(window, cx)).map(|(presence, (frame, _))| super::agent::outline(&presence, frame.intersect(&seen)));
         div()
             .id("stage")
             .absolute()
@@ -602,6 +605,7 @@ impl FilmlabApp {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .on_pinch(cx.listener(Self::on_pinch))
+            .children(outline)
             .when_some(status, |d, text| {
                 d.child(
                     div()

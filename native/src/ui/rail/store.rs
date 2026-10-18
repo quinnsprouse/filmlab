@@ -77,6 +77,20 @@ pub fn build(name: &str, settings: &Value, groups: Vec<String>, film: Option<Val
     Some(Profile { id: new_id(), name: name.trim().to_string(), groups, partial: serde_json::from_str(&partial).ok()?, film, created_at: iso_now() })
 }
 
+/// The profiles the rail shows, read from disk the first time they're needed.
+pub fn shown(rail: &mut super::State) -> &mut Vec<Profile> {
+    if !rail.loaded {
+        rail.profiles = load();
+        rail.loaded = true;
+    }
+    &mut rail.profiles
+}
+
+/// Sets the rail's amount slider, which re-applies the active profile when moved.
+pub fn set_amount(rail: &mut super::State, percent: f64) {
+    rail.amount = percent;
+}
+
 fn new_id() -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let word = || {
@@ -88,7 +102,7 @@ fn new_id() -> String {
     format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, a & 0xfff, 0x8000 | (b & 0x3fff), (b >> 16) & 0xffff_ffff_ffff)
 }
 
-fn iso_now() -> String {
+pub fn iso_now() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let (secs, millis) = (now.as_secs() as i64, now.subsec_millis());
     let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));

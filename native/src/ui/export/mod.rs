@@ -1,4 +1,4 @@
-mod run;
+pub mod run;
 mod view;
 
 use std::collections::VecDeque;
@@ -56,6 +56,15 @@ impl Default for State {
 }
 
 impl State {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The exported files and the errors, once a run has finished.
+    pub fn outcome(&self) -> Option<(&[PathBuf], &[String])> {
+        (self.phase == Phase::Done).then_some((self.exported.as_slice(), self.errors.as_slice()))
+    }
+
     fn stopped(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
@@ -152,14 +161,24 @@ fn start(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>) {
         state.phase = Phase::Done;
     }
     let queue = Arc::new(Mutex::new(queue));
+    let run = Worker { token: app.export.token, cancel: app.export.cancel.clone(), choices: app.export.choices };
     for _ in 0..app.export.workers {
-        spawn_worker(queue.clone(), cx);
+        spawn_worker(queue.clone(), run.clone(), cx);
     }
     cx.notify();
 }
 
-fn spawn_worker(queue: Arc<Mutex<VecDeque<Job>>>, cx: &mut Context<FilmlabApp>) {
-    let (token, cancel, choices) = (cx.entity().read(cx).export.token, cx.entity().read(cx).export.cancel.clone(), cx.entity().read(cx).export.choices);
+#[derive(Clone)]
+struct Worker {
+    token: u64,
+    cancel: Arc<AtomicBool>,
+    choices: Choices,
+}
+
+// why: `start` runs inside an update of the app, so a worker takes the run's token, cancel flag and choices from it
+// rather than reading the app entity again (GPUI panics on reading an entity mid-update)
+fn spawn_worker(queue: Arc<Mutex<VecDeque<Job>>>, run: Worker, cx: &mut Context<FilmlabApp>) {
+    let Worker { token, cancel, choices } = run;
     cx.spawn(async move |this, cx| {
         let engine = Arc::new(Mutex::new(Engine::new()));
         while !cancel.load(Ordering::Relaxed) {
@@ -167,10 +186,9 @@ fn spawn_worker(queue: Arc<Mutex<VecDeque<Job>>>, cx: &mut Context<FilmlabApp>) 
             let (engine, task) = (engine.clone(), job.clone());
             let result = cx
                 .background_spawn(async move {
-                    crate::perf::initiated(|| {
-                        let mut engine = engine.lock().map_err(|e| e.to_string())?;
-                        run::export_one(&mut engine, &task, &choices)
-                    })
+                    let mut engine = engine.lock().map_err(|e| e.to_string())?;
+                    let engine = &mut *engine;
+                    crate::perf::initiated(|| run::export_one(engine, &task, &choices, None))
                 })
                 .await;
             let alive = this.update(cx, |app, cx| {

@@ -71,7 +71,7 @@ impl Choices {
 #[derive(Clone)]
 pub struct Job {
     pub name: String,
-    stem: String,
+    pub stem: String,
     path: PathBuf,
     facts: String,
     state: String,
@@ -112,7 +112,7 @@ fn create_unique(folder: &Path, stem: &str, extension: &str) -> Result<(PathBuf,
     Err("Too many exports of this photo already exist.".into())
 }
 
-pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices) -> Result<PathBuf, String> {
+pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices, folder: Option<&Path>) -> Result<PathBuf, String> {
     let options = choices.options();
     let plan: Value = serde_json::from_str(&core::export_plan(&job.facts, &job.state, &options)?).map_err(|e| e.to_string())?;
     let max_edge = plan["maxEdge"].as_u64().unwrap_or(0) as usize;
@@ -123,7 +123,7 @@ pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices) -> Result<P
     let encoded = engine.export(KEY, &job.facts, &job.state, &options, &job.film);
     engine.release(KEY);
     let encoded = encoded?;
-    let folder = job.path.parent().unwrap_or(Path::new(".")).join("Exports");
+    let folder = folder.map_or_else(|| job.path.parent().unwrap_or(Path::new(".")).join("Exports"), Path::to_path_buf);
     let (path, mut file) = create_unique(&folder, &job.stem, choices.format.extension())?;
     if let Err(e) = file.write_all(&encoded) {
         let _ = std::fs::remove_file(&path);

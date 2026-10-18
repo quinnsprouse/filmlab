@@ -7,7 +7,7 @@ use crate::camera::Zoom;
 
 // why: a scripted session (FILMLAB_SOAK=1) that walks Browse, Develop edits, zoom and photo changes, so memory can be
 // measured from outside without anyone driving the window
-fn footprint() -> u64 {
+pub(crate) fn footprint() -> u64 {
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, (&raw mut info).cast()) } == 0;
     if ok { info.ri_phys_footprint } else { 0 }

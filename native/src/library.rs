@@ -162,15 +162,20 @@ pub fn image_of(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Arc<Render
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
+// why: the engine is locked here, outside the thumbnail pool, and only its decode and render run in the pool; a pool
+// thread that waited on a lock held by a render it is helping would deadlock the pool
 fn thumbnail(slot: usize, facts: &Value, bytes: &[u8], settings: &Value, film: Option<&FilmSettings>) -> Result<Arc<RenderImage>, String> {
     let mut engine = INDEX_ENGINES[slot % INDEXERS].lock().map_err(|e| e.to_string())?;
-    ensure_luts(&mut engine, film)?;
-    engine.load("scratch", &facts.to_string(), bytes, THUMBNAIL_SOURCE)?;
+    let engine = &mut *engine;
+    ensure_luts(engine, film)?;
     let mut view = json!({"maxW": THUMBNAIL_EDGE, "maxH": THUMBNAIL_EDGE});
     if let Some(f) = film {
         view["film"] = f.to_value();
     }
-    let frame = engine.render("scratch", &settings.to_string(), &view.to_string());
+    let frame = crate::perf::background(|| {
+        engine.load("scratch", &facts.to_string(), bytes, THUMBNAIL_SOURCE)?;
+        engine.render("scratch", &settings.to_string(), &view.to_string())
+    });
     engine.release("scratch");
     let mut frame = frame?;
     image_of(frame.width, frame.height, frame.take_rgba()).ok_or_else(|| "the thumbnail has no pixels".to_string())
@@ -234,7 +239,7 @@ impl Library {
                         break;
                     };
                     let id = file.id.clone();
-                    let result = cx.background_spawn(async move { crate::perf::background(|| index(slot, &file)) }).await;
+                    let result = cx.background_spawn(async move { index(slot, &file) }).await;
                     let alive = this.update(cx, |library, cx| {
                         if library.generation != run {
                             return false;
@@ -274,10 +279,8 @@ impl Library {
         cx.spawn(async move |this, cx| {
             let made = cx
                 .background_spawn(async move {
-                    crate::perf::background(|| {
-                        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                        thumbnail(0, &probed.facts, &bytes, &state.settings, render_film(state.film().as_ref()).as_ref())
-                    })
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    thumbnail(0, &probed.facts, &bytes, &state.settings, render_film(state.film().as_ref()).as_ref())
                 })
                 .await;
             if let Ok(image) = made {
@@ -306,6 +309,26 @@ impl Library {
             let Some(state) = self.record(id).and_then(|r| r.state.clone()) else { continue };
             if state.flag != flag {
                 self.write(id, PhotoState { flag: flag.to_string(), ..state }, false, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_rating(&mut self, ids: &[String], rating: u8, cx: &mut Context<Library>) {
+        for id in ids {
+            let Some(state) = self.record(id).and_then(|r| r.state.clone()) else { continue };
+            if state.rating != rating {
+                self.write(id, PhotoState { rating, ..state }, false, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_label(&mut self, ids: &[String], label: Option<String>, cx: &mut Context<Library>) {
+        for id in ids {
+            let Some(state) = self.record(id).and_then(|r| r.state.clone()) else { continue };
+            if state.label != label {
+                self.write(id, PhotoState { label: label.clone(), ..state }, false, cx);
             }
         }
         cx.notify();

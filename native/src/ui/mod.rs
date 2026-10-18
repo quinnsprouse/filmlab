@@ -1,10 +1,14 @@
+pub mod agent;
 pub mod app;
 pub mod browse;
 pub mod controls;
+pub mod driver;
+pub mod e2e;
 pub mod export;
 pub mod glass_layer;
 pub mod icon;
 pub mod inspector;
+pub mod motion;
 pub mod panel;
 pub mod rail;
 pub mod slider;

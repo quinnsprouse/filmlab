@@ -41,6 +41,18 @@ pub struct State {
     order: Vec<String>,
 }
 
+impl State {
+    /// Where a photo's tile was last laid out, in window points.
+    pub fn tile(&self, id: &str) -> Option<Bounds<Pixels>> {
+        self.tiles.borrow().get(id).copied()
+    }
+
+    /// The photos as the grid shows them, after the filter and the sort.
+    pub fn order(&self) -> &[String] {
+        &self.order
+    }
+}
+
 struct Tile {
     id: String,
     index: usize,

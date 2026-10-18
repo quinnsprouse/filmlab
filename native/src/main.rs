@@ -21,6 +21,8 @@ fn main() {
             filmlab_engine::install_gpu(Box::new(Runner(gpu.clone())));
         }
     }
+    // why: scripted runs (the end-to-end test, MCP test launches with FILMLAB_BACKGROUND=1) leave the user's focus alone
+    let e2e = std::env::var_os("FILMLAB_E2E").is_some() || std::env::var_os("FILMLAB_BACKGROUND").is_some();
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         let _ = cx.text_system().add_fonts(fonts());
@@ -34,11 +36,16 @@ fn main() {
             titlebar: Some(TitlebarOptions { title: Some("Filmlab".into()), appears_transparent: true, traffic_light_position: Some(point(px(18.), px(26.))) }),
             window_background: WindowBackgroundAppearance::Transparent,
             window_min_size: Some(size(px(900.), px(600.))),
+            focus: !e2e,
             ..Default::default()
         };
         let gpu = gpu.clone();
-        let (_, app) = gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| FilmlabApp::new(gpu, window, cx))).expect("window");
+        let (window, app) = gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| FilmlabApp::new(gpu, window, cx))).expect("window");
         filmlab::ui::soak::start(&app, cx);
-        cx.activate(true);
+        filmlab::ui::e2e::start(&app, window, cx);
+        filmlab::mcp::start(&app, window, cx);
+        if !e2e {
+            cx.activate(true);
+        }
     });
 }

@@ -50,6 +50,15 @@ pub enum Tool {
     Masks,
 }
 
+pub struct RenderJob {
+    pub engine: Arc<Mutex<Engine>>,
+    pub key: String,
+    pub full: bool,
+    pub settings: Value,
+    pub film: Option<FilmSettings>,
+    pub facts: Value,
+}
+
 pub struct DisplayFrame {
     pub width: u32,
     pub height: u32,
@@ -100,6 +109,40 @@ pub struct Develop {
     last_request: Instant,
     load_token: u64,
     pub applied: Option<Applied>,
+}
+
+// why: a run of slider edits in one section (exposure, then contrast, then highlights) is one change in the history
+// and undoes as one; keys of slider edits are their control ids, so the section comes from the controls catalog
+fn section_of(key: &str) -> Option<&'static str> {
+    static SECTIONS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
+        let raw: Vec<Value> = core::controls().ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+        raw.iter().filter_map(|c| Some((c["id"].as_str()?.to_string(), c["section"].as_str()?.to_string()))).collect()
+    });
+    let mut sections = key.split(',').map(|id| SECTIONS.get(id).map(String::as_str));
+    let first = sections.next()??;
+    sections.all(|s| s == Some(first)).then(|| section_title(first))
+}
+
+fn section_title(section: &str) -> &'static str {
+    match section {
+        "light" => "Light",
+        "curve" => "Tone curve",
+        "color" => "Color",
+        "mixer" => "Color mixer",
+        "bwMix" | "bw_mix" => "B&W mix",
+        "grading" => "Color grading",
+        "effects" => "Effects",
+        "vignette" => "Vignette",
+        "grain" => "Grain",
+        "detail" => "Detail",
+        "optics" => "Optics",
+        "geometry" => "Geometry",
+        "profile" => "Profile",
+        "calibration" => "Calibration",
+        "pointColor" | "point_color" => "Point color",
+        "redEye" | "red_eye" => "Red eye",
+        _ => "Edit",
+    }
 }
 
 fn source_key(id: &str, level: Level) -> String {
@@ -155,6 +198,11 @@ impl Develop {
         &self.library
     }
 
+    /// The revision the next render plans for: the edit's, or a separate one for the before view.
+    pub fn planned_revision(&self) -> u64 {
+        self.revision + u64::from(self.compare == Compare::Before) * (1 << 40)
+    }
+
     fn shown_settings(&self) -> Option<&Value> {
         if self.compare == Compare::Before { self.before.as_ref() } else { self.settings.as_ref() }
     }
@@ -171,7 +219,7 @@ impl Develop {
         let film = if self.compare == Compare::Before { None } else { render_film(self.film.as_ref()) };
         Some(Inputs {
             photo_id,
-            revision: self.revision + u64::from(self.compare == Compare::Before) * (1 << 40),
+            revision: self.planned_revision(),
             settings,
             film,
             overlay: self.overlay.clone(),
@@ -311,12 +359,12 @@ impl Develop {
             let loaded = {
                 let key = key.clone();
                 cx.background_spawn(async move {
-                    crate::perf::background(|| {
+                    let decoded = crate::perf::background(|| {
                         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                        let decoded = core::decode(&facts, &bytes, Level::Preview.max_edge())?;
-                        engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
-                        Ok::<(), String>(())
-                    })
+                        core::decode(&facts, &bytes, Level::Preview.max_edge())
+                    })?;
+                    engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
+                    Ok::<(), String>(())
                 })
                 .await
             };
@@ -407,11 +455,12 @@ impl Develop {
         cx.spawn(async move |this, cx| {
             let rendered = cx
                 .background_spawn(async move {
-                    crate::perf::interactive(|| {
-                        let mut engine = engine.lock().map_err(|e| e.to_string())?;
-                        ensure_luts(&mut engine, film.as_ref())?;
-                        engine.render(&key, &settings, &view.to_string())
-                    })
+                    // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
+                    // render that holds it would deadlock the pool
+                    let mut engine = engine.lock().map_err(|e| e.to_string())?;
+                    let engine = &mut *engine;
+                    ensure_luts(engine, film.as_ref())?;
+                    crate::perf::interactive(|| engine.render(&key, &settings, &view.to_string()))
                 })
                 .await;
             if std::env::var_os("FILMLAB_TRACE").is_some()
@@ -495,7 +544,7 @@ impl Develop {
 
     // why: only a zoomed view needs the full-size decode (about 300 MB for a 24 MP raw), so it is read on the
     // first zoom rather than with every photo
-    fn ensure_full(&mut self, cx: &mut Context<Develop>) {
+    pub fn ensure_full(&mut self, cx: &mut Context<Develop>) {
         let (Some(id), Some(path), Some(facts)) = (self.photo_id.clone(), self.path.clone(), self.facts.clone()) else { return };
         let key = source_key(&id, Level::Full);
         if self.ready.contains(&key) || self.loading.contains(&key) {
@@ -512,12 +561,12 @@ impl Develop {
             let loaded = {
                 let key = key.clone();
                 cx.background_spawn(async move {
-                    crate::perf::initiated(|| {
+                    let decoded = crate::perf::initiated(|| {
                         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                        let decoded = core::decode(&facts, &bytes, Level::Full.max_edge())?;
-                        engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
-                        Ok::<(), String>(())
-                    })
+                        core::decode(&facts, &bytes, Level::Full.max_edge())
+                    })?;
+                    engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
+                    Ok::<(), String>(())
                 })
                 .await
             };
@@ -630,13 +679,21 @@ impl Develop {
         {
             let _ = self.commands.open(&facts.to_string(), &settings.to_string());
         }
+        let appending = self.cursor + 1 == self.history.len();
         self.history.truncate(self.cursor + 1);
         let now = Instant::now();
-        let coalesce = self.history.last().is_some_and(|last| last.key == key && now.duration_since(last.at) < COALESCE);
-        if coalesce {
-            self.history.pop();
+        let section = section_of(key).filter(|_| appending && self.history.len() > 1 && !key.starts_with("agent."));
+        let mut label = label.to_string();
+        if let Some(last) = self.history.last() {
+            let same_run = section.is_some() && section_of(&last.key) == section;
+            if same_run || (last.key == key && now.duration_since(last.at) < COALESCE) {
+                if last.key != key && let Some(title) = section {
+                    label = title.to_string();
+                }
+                self.history.pop();
+            }
         }
-        self.history.push(Step { label: label.to_string(), key: key.to_string(), settings: settings.clone(), film: film.clone(), at: now });
+        self.history.push(Step { label, key: key.to_string(), settings: settings.clone(), film: film.clone(), at: now });
         self.cursor = self.history.len() - 1;
         self.settings = Some(settings);
         self.film = film;
@@ -662,6 +719,37 @@ impl Develop {
         Some(parsed["result"].clone())
     }
 
+    /// Runs a LightCraft command for an agent: the engine's own error on failure, and a history step only when
+    /// the photo's settings changed. Returns the command's result and whether the photo changed.
+    pub fn try_command(&mut self, command: &str, params: Value, label: &str, key: &str, cx: &mut Context<Develop>) -> Result<(Value, bool), String> {
+        let current = self.settings.clone().ok_or("no photo is open; open_photo first")?;
+        let out = self.commands.run(command, &params.to_string())?;
+        let mut parsed: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+        let changed = parsed["settings"] != current;
+        if changed {
+            let film = self.film.clone();
+            self.commit(parsed["settings"].take(), label, key, film, cx);
+        }
+        Ok((parsed["result"].take(), changed))
+    }
+
+    /// Every LightCraft command as (id, params doc).
+    pub fn command_catalog(&self) -> Vec<(&'static str, &'static str)> {
+        self.commands.catalog()
+    }
+
+    pub fn command_label(&self, id: &str) -> Option<&'static str> {
+        self.commands.label_of(id)
+    }
+
+    /// Puts back a saved state of the open photo (settings and film) as one new history step.
+    pub fn restore(&mut self, settings: Value, film: Option<FilmSettings>, label: &str, key: &str, cx: &mut Context<Develop>) -> Result<(), String> {
+        let facts = self.facts.as_ref().ok_or("no photo is open; open_photo first")?;
+        self.commands.open(&facts.to_string(), &settings.to_string())?;
+        self.commit(settings, label, key, film, cx);
+        Ok(())
+    }
+
     /// Runs a LightCraft command that changes the session but not the photo (e.g. `mask.select`), so it
     /// leaves history, rendering and saving alone.
     pub fn run(&mut self, command: &str, params: Value) -> Option<Value> {
@@ -672,7 +760,10 @@ impl Develop {
     pub fn edit_controls(&mut self, values: &[(&str, f64)], label: &str, cx: &mut Context<Develop>) {
         let mut keys: Vec<&str> = values.iter().map(|(k, _)| *k).collect();
         keys.sort_unstable();
-        let map: serde_json::Map<String, Value> = values.iter().map(|(k, v)| ((*k).to_string(), json!(v))).collect();
+        // why: the Temp slider is in kelvin for raw photos and -100..100 for rendered ones, while develop.set stores kelvin
+        let facts = self.facts.as_ref().map(Value::to_string).unwrap_or_default();
+        let setting = |k: &str, v: f64| if k == "wb.temp" { core::temp_setting(&facts, v).unwrap_or(v) } else { v };
+        let map: serde_json::Map<String, Value> = values.iter().map(|(k, v)| ((*k).to_string(), json!(setting(k, *v)))).collect();
         self.command("develop.set", json!({"values": map}), label, &keys.join(","), cx);
     }
 
@@ -727,6 +818,29 @@ impl Develop {
     pub fn set_compare(&mut self, compare: Compare, cx: &mut Context<Develop>) {
         self.compare = compare;
         self.request_render(cx);
+    }
+
+    /// What an off-screen render of the open photo needs: its engine, decoded sources and settings. `before` takes
+    /// the photo as it was opened, without film.
+    pub fn render_job(&self, before: bool) -> Option<RenderJob> {
+        let id = self.photo_id.clone()?;
+        let settings = if before { self.before.clone()? } else { self.settings.clone()? };
+        let film = if before { None } else { render_film(self.film.as_ref()) };
+        let ready = |level| self.ready.contains(&source_key(&id, level));
+        let level = if ready(Level::Full) { Level::Full } else if ready(Level::Preview) { Level::Preview } else { return None };
+        Some(RenderJob { engine: self.engine.clone(), key: source_key(&id, level), full: level == Level::Full, settings, film, facts: self.facts.clone()? })
+    }
+
+    /// Whether the full-resolution source is decoded, or the photo is small enough that the preview is full size.
+    pub fn full_ready(&self) -> bool {
+        let Some(id) = &self.photo_id else { return false };
+        let long = self.facts.as_ref().map_or(0.0, |f| f["width"].as_f64().unwrap_or(0.0).max(f["height"].as_f64().unwrap_or(0.0)));
+        self.ready.contains(&source_key(id, Level::Full)) || (long <= plans::PREVIEW_EDGE && self.ready.contains(&source_key(id, Level::Preview)))
+    }
+
+    /// The plan behind the frame on screen (the fit frame, or the zoomed window's).
+    pub fn shown_plan(&self, detail: bool) -> Option<&Plan> {
+        self.shown.get(&detail)
     }
 
     pub fn control_values(&self) -> HashMap<String, f64> {
