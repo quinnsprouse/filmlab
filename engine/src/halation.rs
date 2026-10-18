@@ -1,8 +1,8 @@
 use rayon::prelude::*;
 
 use crate::halation_tables::{
-    BETA, DOWN_SD, F_BELOW_SLOPE, F_GRID, FROM_DWG, G_HUE, G_LAYER, KAPPA, KERNEL_TRUNCATE, LEVEL_MAX, LEVEL_SWITCH, LEVEL_VAR, MASK_COEF, MASK_SIGMA, MASK_TERMS, MASK_TRUNCATE,
-    OCTAVE_WEIGHTS, SIGMA0, TO_DWG, UP_SD,
+    DOWN_SD, F_BELOW_SLOPE, F_GRID, FROM_DWG, KAPPA, KERNEL_TRUNCATE, LAYER_RATES, LEVEL_MAX, LEVEL_SWITCH, LEVEL_VAR, MASK_COEF, MASK_SIGMA, MASK_TERMS, MASK_TRUNCATE,
+    SIGMA0, TO_DWG, UP_SD,
 };
 use crate::pyramid::{Level, Span};
 use crate::texture::{Curves, Plane, Region, Size};
@@ -99,28 +99,24 @@ fn gaussian(sigma: f64, radius: isize) -> Vec<f32> {
     raw.iter().map(|v| (v / total) as f32).collect()
 }
 
-fn interp(x: f64, xs: &[f64], ys: impl Fn(usize) -> f64) -> f64 {
-    if x <= xs[0] {
-        return ys(0);
-    }
-    let last = xs.len() - 1;
-    if x >= xs[last] {
-        return ys(last);
-    }
-    let i = xs.partition_point(|&v| v <= x) - 1;
-    ys(i) + (ys(i + 1) - ys(i)) * (x - xs[i]) / (xs[i + 1] - xs[i])
-}
-
-fn mix(sat: f64, g: f64) -> f64 {
-    let v = (1.0 - sat) + sat * g / (2.0 - g);
+// why: Film Look Creator's colour law (scratchpad flc/hal, v6): each DWG layer's share of octave k is t = 2v/(1+v) with
+// v = (1 - sat) + sat * h, where red takes all of it, blue none, and green follows the hue less 0.3 per octave
+fn layer_share(j: usize, k: usize, hue: f64, sat: f64) -> f64 {
+    let h = match j {
+        0 => 1.0,
+        1 => (hue - 0.3 * k as f64).clamp(0.0, 1.0),
+        _ => 0.0,
+    };
+    let v = (1.0 - sat) + sat * h;
     2.0 * v / (1.0 + v)
 }
 
-fn octave_weight(k: usize, amount: f64, t: f64) -> f64 {
-    match k {
-        0 => OCTAVE_WEIGHTS[0] * (1.0 - (-BETA * amount * t).exp()) / (1.0 - (-BETA * 0.5).exp()),
-        _ => OCTAVE_WEIGHTS[k] * amount * t / 0.5,
-    }
+// why: the amount law (v6): per layer the octaves lerp in turn toward their blur of the original, by x_k = rate_k * A * t
+// (octave 0's amount capped at 1); as one sum u + Σ w_k (B_k u - u) that is w2 = x2, w1 = x1 (1 - x2),
+// w0 = x0 (1 - x1)(1 - x2)
+fn layer_weights(amount: f64, t: [f64; 3]) -> [f64; 3] {
+    let x = [LAYER_RATES[0] * amount.min(1.0) * t[0], LAYER_RATES[1] * amount * t[1], LAYER_RATES[2] * amount * t[2]];
+    [x[0] * (1.0 - x[1]) * (1.0 - x[2]), x[1] * (1.0 - x[2]), x[2]]
 }
 
 impl Halation {
@@ -132,12 +128,8 @@ impl Halation {
         }
         let (amount, hue, sat) = (f64::from(p.amount), f64::from(p.hue), f64::from(p.sat));
         let s0 = SIGMA0 * (f64::from(p.radius) / 4.0) * (frame.h as f64 / 1600.0);
-        let layer = |j: usize, k: usize| match j {
-            0 => 1.0,
-            1 => mix(sat, interp(hue, &G_HUE, |i| G_LAYER[i][k])),
-            _ => mix(sat, 0.0),
-        };
-        let weights = std::array::from_fn(|k| std::array::from_fn(|j| octave_weight(k, amount, layer(j, k)) as f32));
+        let per_layer: [[f64; 3]; 3] = std::array::from_fn(|j| layer_weights(amount, std::array::from_fn(|k| layer_share(j, k, hue, sat))));
+        let weights = std::array::from_fn(|k| std::array::from_fn(|j| per_layer[j][k] as f32));
         let octaves = std::array::from_fn(|k| Octave::of(s0 * f64::from(1u32 << k), KERNEL_TRUNCATE));
         let mask = p.highlights_only.then(|| Octave::of(MASK_SIGMA * s0, MASK_TRUNCATE));
         Some(Halation { weights, octaves, mask })

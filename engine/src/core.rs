@@ -5,7 +5,7 @@ use lightcraft_engine::Session;
 use lightcraft_engine::catalog::{Catalog, ColorLabel, Flag, MediaKind, Meta, Op, Photo, PhotoId, Source};
 use lightcraft_engine::develop::{CONTROLS, DevelopSettings, EmbeddedLens, SettingsGroup, WbMode, apply_partial, controls as specs, extract_groups};
 use lightcraft_engine::pipeline::local::{effective_wb, normalize_wb};
-use lightcraft_engine::export::{ExportOptions, encode_rendered, export_metadata, output_size};
+use lightcraft_engine::export::{ExportOptions, MetadataPolicy, encode_rendered, export_metadata, output_size};
 use lightcraft_engine::media::{DecodedSource, SourceLevel, source_info};
 use lightcraft_engine::pipeline::geometry::Frame as Geometry;
 use lightcraft_engine::pipeline::{self, MaskView, OutputDepth, OutputSpace, Overlay, PixelWindow, Quality, RenderRequest, SourceInfo, StageCache};
@@ -274,6 +274,13 @@ fn rel_to_k(r: f64) -> f64 {
     1e6 / (1e6 / 6500.0 - r * 0.8)
 }
 
+/// The settings value for a Temp slider position: kelvin for raw photos, the relative -100..100 scale (converted to
+/// the kelvin LightCraft stores) for rendered ones.
+pub fn temp_setting(facts: &str, slider: f64) -> Fallible<f64> {
+    let p = photo_of(&parse(facts)?);
+    Ok(if kelvin_scale(&p) { slider } else { rel_to_k(slider) })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WhiteBalanceView {
@@ -536,6 +543,7 @@ pub fn decode(facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<Decoded> {
 #[derive(Default)]
 pub struct Engine {
     sources: HashMap<String, Loaded>,
+    originals: HashMap<String, lightcraft_meta::Metadata>,
     stages: HashMap<String, Arc<StageCache>>,
     luts: LutLibrary,
     scenes: HashMap<String, CachedScene>,
@@ -753,6 +761,7 @@ impl Engine {
     pub fn load(&mut self, key: &str, facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<()> {
         let decoded = decode(facts, bytes, max_edge)?;
         self.insert(key, decoded);
+        self.originals.insert(key.to_string(), lightcraft_meta::extract(bytes));
         Ok(())
     }
 
@@ -776,6 +785,7 @@ impl Engine {
 
     pub fn release(&mut self, key: &str) {
         self.sources.remove(key);
+        self.originals.remove(key);
         self.stages.retain(|view, _| !view.starts_with(key));
         self.scenes.retain(|view, _| !view.starts_with(key));
         self.looks.remove(key);
@@ -851,9 +861,73 @@ impl Engine {
         let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop), view: None, look: None, look_key: 0, native };
         let size_of = |r: &RenderRequest| pipeline::output_size(loaded.source.image.width, loaded.source.image.height, &p.develop, r);
         let rendered = film_export(job, &req, size_of, |r| pipeline::render(&loaded.source.image, &info, &p.develop, r))?;
-        let meta = export_metadata(&p, &Catalog::default(), &o);
+        let meta = export_metadata(&p, &Catalog::default(), &o).map(|m| {
+            let mut m = match self.originals.get(key) {
+                Some(original) => with_original(m, original, &o),
+                None => m,
+            };
+            if o.metadata != MetadataPolicy::Copyright {
+                m.label = p.label.map(|l| format!("{l:?}"));
+            }
+            m.software = Some("Filmlab".into());
+            m
+        });
         encode_rendered(&rendered, &o, meta.as_ref())
     }
+}
+
+fn trimmed(text: &Option<String>) -> Option<String> {
+    text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(String::from)
+}
+
+// why: LightCraft's export writes the fields its catalog keeps, and an export should carry the rest of the original's
+// metadata as a raw developer's would: make apart from the model, serial numbers, lens, flash, exposure bias and
+// program, metering, white balance, 35 mm focal length, GPS with altitude, the capture time with its zone, and the
+// creator's text; the export's policy (camera details, location) still decides what goes out
+fn with_original(mut out: lightcraft_meta::Metadata, original: &lightcraft_meta::Metadata, o: &ExportOptions) -> lightcraft_meta::Metadata {
+    macro_rules! fill {
+        ($($field:ident),*) => {$(
+            if out.$field.is_none() {
+                out.$field = original.$field.clone();
+            }
+        )*};
+    }
+    macro_rules! fill_text {
+        ($($field:ident),*) => {$(
+            if trimmed(&out.$field).is_none() {
+                out.$field = trimmed(&original.$field);
+            }
+        )*};
+    }
+    fill_text!(artist, copyright, usage_terms, copyright_url);
+    fill!(copyright_marked);
+    if o.metadata == MetadataPolicy::Copyright {
+        return out;
+    }
+    fill_text!(title, caption, alt_text, extended_description);
+    if out.keywords.is_empty() {
+        out.keywords.clone_from(&original.keywords);
+        out.hierarchical_keywords.clone_from(&original.hierarchical_keywords);
+    }
+    if original.capture_time.is_some() {
+        out.capture_time = original.capture_time.clone();
+    }
+    if !o.remove_location {
+        fill_text!(sublocation, city, state, country);
+        if original.gps.is_some() {
+            out.gps = original.gps.clone();
+        }
+    }
+    if o.metadata != MetadataPolicy::All {
+        return out;
+    }
+    if let (Some(make), Some(model)) = (trimmed(&original.make), trimmed(&original.model)) {
+        out.make = Some(make);
+        out.model = Some(model);
+    }
+    fill_text!(serial_number, lens_make, lens_model, lens_serial_number);
+    fill!(lens_spec, exposure_time, f_number, iso, focal_length, focal_length_35mm, flash, exposure_bias, exposure_program, metering_mode, white_balance);
+    out
 }
 
 pub struct Commands {
@@ -903,6 +977,16 @@ impl Commands {
 
     pub fn attach(&mut self, bytes: Vec<u8>) {
         *self.pixels.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(bytes));
+    }
+
+    /// Every command the session knows, as (id, params doc).
+    pub fn catalog(&self) -> Vec<(&'static str, &'static str)> {
+        self.session.commands().into_iter().map(|c| (c.id, c.params)).collect()
+    }
+
+    /// A command's own name, as LightCraft's menus show it.
+    pub fn label_of(&self, id: &str) -> Option<&'static str> {
+        self.session.commands().into_iter().find(|c| c.id == id).map(|c| c.label)
     }
 
     pub fn run(&mut self, command: &str, params: &str) -> Fallible<String> {
