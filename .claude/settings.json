@@ -13,18 +13,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PROJECT_DIR}/.agents/hooks/post-edit.mjs\"",
-            "timeout": 120
-          }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
