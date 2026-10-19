@@ -4291,7 +4291,7 @@ dependencies = [
  "lightcraft-meta",
  "lightcraft-raster",
  "lightcraft-tiff",
- "miniz_oxide 0.8.9",
+ "miniz_oxide 0.9.1",
  "rayon",
  "serde",
  "thiserror 2.0.21",
