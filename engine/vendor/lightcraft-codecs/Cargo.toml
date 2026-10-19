@@ -30,7 +30,7 @@ ravif = { version = "0.13", default-features = false, features = ["threading"], 
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
 avif-serialize = { version = "0.8.6", optional = true }
 # spawns threads of its own (std::thread), which wasm32 has not got
-jixel = { version = "=0.3.4", optional = true }
+jixel = { version = "=0.4.2", optional = true }
 
 [features]
 default = ["parallel", "jxl", "avif"]
