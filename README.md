@@ -1,63 +1,81 @@
 # Filmlab
 
-A film photo editor that runs in the browser and edits the photos already on your computer. Open a folder,
-develop with Lightroom-style controls, and print through FilmVision Pro film stocks. Nothing is uploaded: edits
-are saved as XMP sidecars next to the originals, and exports go to an `Exports` folder beside them.
+Filmlab is a macOS photo editor that makes raw files look like film. It develops each raw with LightCraft's
+pipeline, prints it through FilmVision Pro's negative and print LUTs, and adds grain, halation and dust.
 
-The image math is [LightCraft](https://github.com/storytold/lightcraft)'s own Rust pipeline compiled to
-WebAssembly, so renders match LightCraft desktop (exactly on native; within one level on ~0.002 % of values in
-the browser, from the browser's math library). The film stage adds FilmVision's negative and print LUTs after
-LightCraft's scene-referred stages, with FilmVision's Texture node between them: its tone and detail
-operator, its saturation roll-off, film blur, dust specks, image defocus and grain (`engine/src/texture.rs`,
-`engine/src/dust.rs`, `engine/src/grain.rs`). These were measured from Resolve renders of FilmVision Pro; the
-deterministic parts match Resolve to about one 16-bit level, dust to within a few levels on common frame
-shapes, and grain matches its statistics (Resolve's random generator can't be reproduced).
+You open a folder and edit in place. Edits go into XMP sidecars next to the originals, and exports land in an
+`Exports` folder beside them. The interface is GPUI with Liquid Glass, and the film stage runs on the GPU
+through wgpu and Metal.
 
 ## Requirements
 
-- Node 24 and npm 11 (see `package.json`).
-- Rust via mise: `mise install rust@1.99.1`, plus `rustup target add wasm32-unknown-unknown` and
-  `rustup toolchain install nightly --component rust-src --target wasm32-unknown-unknown` for the threaded build.
-- `cargo install wasm-bindgen-cli --version 0.2.129 --locked`, and binaryen (`brew install binaryen`).
-- Chrome, Edge or Arc to save into folders (Safari and Firefox can open a folder read-only).
-- FilmVision Pro installed in DaVinci Resolve for film stocks. The app reads them from
-  `/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/FilmVision Pro` (override with
-  `FILMVISION_DIR`); they are never copied into the project.
+- macOS 26.
+- [mise](https://mise.jdx.dev), which installs the Rust and Node versions pinned in `mise.toml`.
+- FilmVision Pro installed in DaVinci Resolve, if you want film stocks.
 
-## Develop
+Filmlab reads stocks from `/Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/FilmVision Pro`.
+Set `FILMVISION_DIR` to read them from somewhere else. FilmVision Pro has its own license, so this repo doesn't
+include the LUTs. Without them Filmlab still develops photos, and the stock list stays empty.
 
-```bash
-npm ci
-npm run build:engine   # wasm engine: engine/pkg (single-threaded) and engine/pkg-mt (threads)
-npm run dev            # http://localhost:3000
+## Build and run
+
+```sh
+mise install
+scripts/setup.sh
+cd native && cargo run --release
 ```
 
-`npm run check` runs format, lint, types and guardrail tests; `npm run check:push` adds the build, dead-code check
-and the Playwright suite, including a byte-parity test against a LightCraft desktop render.
+`scripts/setup.sh` points Git at the hooks in `.githooks`.
+
+## Check
+
+`scripts/check.sh` runs clippy with warnings denied and the tests for both crates. The pre-push hook runs it too.
+
+`engine/tests/parity.rs` exports a Ricoh GR III raw to PNG and compares it with LightCraft desktop's render of the
+same settings. Every pixel has to match. `scripts/fixtures.sh` downloads that raw from
+[raw.pixls.us](https://raw.pixls.us), where it's released as CC0, and checks its SHA-256.
+
+`native/scripts/e2e.sh <photo folder>` runs the app's built-in end-to-end script on a copy of a folder and saves
+screenshots.
+
+## Package
+
+`native/scripts/bundle.sh` builds `Filmlab.app`, a zip and a DMG in `native/target-dist/bundle`. Set
+`FILMLAB_SIGN` to your signing identity, or the script signs the app ad hoc.
+
+## Agents
+
+While Filmlab runs, it serves MCP at `http://127.0.0.1:47428/mcp`. An agent can open folders and photos, change
+controls and film stocks, preview, analyze and export. Each change is one undo step and goes into the sidecar,
+the same as an edit by hand. The server only listens on loopback and refuses requests that carry a browser
+`Origin` header.
+
+To add it to Claude Code:
+
+```sh
+claude mcp add --transport http filmlab http://127.0.0.1:47428/mcp
+```
+
+Set `FILMLAB_MCP_PORT` to move it, or `FILMLAB_MCP=0` to turn it off. `node native/scripts/mcp_e2e.mjs <photo folder>`
+tests the tools against a release build.
 
 ## Layout
 
-- `engine/`: the Rust crate wrapping LightCraft (decode, render, export, XMP, LightCraft's command layer) and the
-  film stage; `engine/vendor/lightcraft-pipeline` is LightCraft's pipeline with a tone-map hook for film.
-- `src/lib/`: engine workers, folder access, library, develop session, profiles, film stocks.
-- `src/components/darkroom/`: Browse, Develop (DialKit panels, crop, heal, masks), top bar, first run.
-- `e2e/`: Playwright tests.
+- `engine/` wraps LightCraft and adds the film stage. `engine/vendor/` holds LightCraft crates with Filmlab's changes.
+- `native/` is the app. `native/src/film.wgsl` is the GPU film stage, and `native/src/mcp/` is the MCP server.
+- `scripts/` holds the check, the fixture download and the hook setup.
 
-## How previews stay fast
+`engine/` and `native/` are separate Cargo workspaces with their own lockfiles. Run cargo inside the one you're
+changing.
 
-- Edits render at full quality in a threaded wasm worker, newest edit first; stale ones are dropped.
-- The film stage keeps the scene before the film, its scan levels and Texture output, and the filmed
-  pixels, so an edit only reruns what it changes (a colour edit skips the film entirely).
-- The develop view keeps a fit render of the whole photo and, when zoomed, a full-resolution render
-  of the visible window. Zoom and pan move both instantly; the window re-renders when it settles.
-- The film stage runs on the GPU when the browser has WebGPU (`src/lib/engine/film.wgsl`, driven by
-  `gpu.worker.ts`). Every operation is forced to round on its own and divisions are corrected, so
-  its pixels match the CPU path bit for bit; without a GPU the CPU path runs instead.
-- `cargo run --release --example pipeline_bench -- <photo> <negative.cube> <print.cube>` (in
-  `engine/`) times a run of edits natively and prints a hash of each frame, so speed work can prove
-  it changed no pixels.
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) first. It's written for coding agents, and the rules apply to people too. Commits
+follow Conventional Commits, like `fix(native): keep the crop inside the frame`, with no Co-Authored-By trailer.
+The commit-msg hook checks both, and `scripts/check.sh` has to pass.
 
 ## License
 
-MIT for this project. LightCraft is MIT OR Apache-2.0 (`engine/vendor/lightcraft-pipeline/LICENSE-*`).
-FilmVision Pro LUTs are licensed separately and not included.
+Filmlab is under the [MIT license](LICENSE). The vendored LightCraft crates are MIT OR Apache-2.0. Open Runde, the
+interface font, ships with its SIL Open Font License 1.1 in `native/assets/fonts/LICENSE.txt`. The Hugeicons icons
+are MIT, with their notice in `native/assets/icons/LICENSE.md`.
