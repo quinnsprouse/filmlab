@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::rc::Rc;
 
 use filmlab_engine::core;
 use gpui_kit::{AppContext, AsyncApp};
@@ -6,9 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Answer, Output, args};
-use crate::develop::RenderJob;
 use crate::develop::plans::PREVIEW_EDGE;
 use crate::library::ensure_luts;
+use crate::mcp::session::{Held, Hub};
 use crate::ui::driver::Driver;
 
 pub struct Shot {
@@ -28,28 +29,11 @@ fn ordered(region: [f64; 4]) -> Result<[f64; 4], String> {
     Ok(r)
 }
 
-async fn job(driver: &Driver, cx: &mut AsyncApp, before: bool, full: bool) -> Result<RenderJob, String> {
-    if driver.read(cx, |a, cx| a.develop.read(cx).photo_id.is_none()).unwrap_or(true) {
-        return Err("no photo is open; open_photo first".into());
-    }
-    if full {
-        driver.develop(cx, |d, cx| d.ensure_full(cx));
-        if !driver.wait(cx, 120, |a, cx| a.develop.read(cx).full_ready()).await {
-            return Err("the full-resolution decode didn't finish within 120 s".into());
-        }
-    }
-    let wanted = move |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| a.develop.read(cx).render_job(before).is_some_and(|j| j.full || !full);
-    if !driver.wait(cx, 60, wanted).await {
-        return Err("the photo isn't decoded yet".into());
-    }
-    driver.read(cx, |a, cx| a.develop.read(cx).render_job(before)).flatten().ok_or_else(|| "the photo closed".into())
-}
-
-/// Renders the open photo off screen: the whole cropped frame within `max_edge`, or `region` (0-1 of the cropped
+/// Renders the held photo off screen: the whole cropped frame within `max_edge`, or `region` (0-1 of the cropped
 /// frame) at up to full resolution.
-pub async fn render(driver: &Driver, cx: &mut AsyncApp, max_edge: u32, region: Option<[f64; 4]>, before: bool) -> Result<Shot, String> {
+pub async fn render(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: u32, region: Option<[f64; 4]>, before: bool) -> Result<Shot, String> {
     let region = region.map(ordered).transpose()?;
-    let probe = job(driver, cx, before, false).await?;
+    let probe = held.render_job(driver, cx, before, false).await?;
     let size: [f64; 2] = serde_json::from_str(&core::frame_size(&probe.facts.to_string(), &probe.settings.to_string(), true)?).map_err(|e| e.to_string())?;
     let [w, h] = size;
     let edge = f64::from(max_edge);
@@ -64,8 +48,10 @@ pub async fn render(driver: &Driver, cx: &mut AsyncApp, max_edge: u32, region: O
             (json!({"maxW": fw as usize, "maxH": fh as usize, "stages": STAGES, "applyCrop": true, "window": window.map(|v| v as usize)}), fw.max(fh) > PREVIEW_EDGE)
         }
     };
-    let job = if full { self::job(driver, cx, before, true).await? } else { probe };
+    let job = if full && !probe.full { held.render_job(driver, cx, before, true).await? } else { probe };
     cx.background_spawn(async move {
+        // why: the lock is taken here, outside the render pool; a pool thread waiting on it while helping a render
+        // that holds it would deadlock the pool
         let mut engine = job.engine.lock().map_err(|e| e.to_string())?;
         let engine = &mut *engine;
         ensure_luts(engine, job.film.as_ref())?;
@@ -171,32 +157,39 @@ fn measure(shot: &Shot) -> Value {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Look {
+    photo: Option<String>,
     max_edge: Option<u32>,
     region: Option<[f64; 4]>,
     before: Option<bool>,
     quality: Option<u8>,
 }
 
-pub async fn preview(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn preview(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Look = args(value)?;
-    let shot = render(driver, cx, p.max_edge.unwrap_or(768).clamp(64, 2048), p.region, p.before.unwrap_or(false)).await?;
-    let image = jpeg(&shot, p.quality.unwrap_or(80).clamp(30, 95))?;
-    Ok(Output::json(brief(&shot)).with_image(image))
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let shot = render(&held, driver, cx, p.max_edge.unwrap_or(768).clamp(64, 2048), p.region, p.before.unwrap_or(false)).await?;
+    drop(held);
+    let quality = p.quality.unwrap_or(80).clamp(30, 95);
+    let (image, stats) = cx.background_spawn(async move { (jpeg(&shot, quality), brief(&shot)) }).await;
+    Ok(Output::json(stats).with_image(image?))
 }
 
 /// A JPEG of the current edit for tools that take `preview`: true (768 px) or a long edge.
-pub async fn attach(driver: &Driver, cx: &mut AsyncApp, output: Output, preview: Option<&Value>) -> Answer {
+pub async fn attach(held: &Held, driver: &Driver, cx: &mut AsyncApp, output: Output, preview: Option<&Value>) -> Answer {
     let edge = match preview {
         Some(Value::Bool(true)) => 768,
         Some(Value::Number(n)) => n.as_u64().unwrap_or(768).clamp(64, 2048) as u32,
         _ => return Ok(output),
     };
-    let shot = render(driver, cx, edge, None, false).await?;
-    Ok(output.with_image(jpeg(&shot, 80)?))
+    let shot = render(held, driver, cx, edge, None, false).await?;
+    let image = cx.background_spawn(async move { jpeg(&shot, 80) }).await?;
+    Ok(output.with_image(image))
 }
 
-pub async fn analyze(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn analyze(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Look = args(value)?;
-    let shot = render(driver, cx, p.max_edge.unwrap_or(1024).clamp(64, 2048), p.region, p.before.unwrap_or(false)).await?;
-    Ok(Output::json(measure(&shot)))
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let shot = render(&held, driver, cx, p.max_edge.unwrap_or(1024).clamp(64, 2048), p.region, p.before.unwrap_or(false)).await?;
+    drop(held);
+    Ok(Output::json(cx.background_spawn(async move { measure(&shot) }).await))
 }

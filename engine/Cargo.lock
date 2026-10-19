@@ -1263,7 +1263,6 @@ dependencies = [
 [[package]]
 name = "lightcraft-codecs"
 version = "0.8.0"
-source = "git+https://github.com/storytold/lightcraft?rev=f34c7a8a89e0d1bade0a6889185f40acecc84a9f#f34c7a8a89e0d1bade0a6889185f40acecc84a9f"
 dependencies = [
  "avif-serialize",
  "bytemuck",
@@ -1496,7 +1495,6 @@ dependencies = [
 [[package]]
 name = "lightcraft-raster"
 version = "0.8.0"
-source = "git+https://github.com/storytold/lightcraft?rev=f34c7a8a89e0d1bade0a6889185f40acecc84a9f#f34c7a8a89e0d1bade0a6889185f40acecc84a9f"
 dependencies = [
  "lightcraft-color",
  "lightcraft-geom",
@@ -1507,7 +1505,6 @@ dependencies = [
 [[package]]
 name = "lightcraft-raw"
 version = "0.8.0"
-source = "git+https://github.com/storytold/lightcraft?rev=f34c7a8a89e0d1bade0a6889185f40acecc84a9f#f34c7a8a89e0d1bade0a6889185f40acecc84a9f"
 dependencies = [
  "jpeg-encoder",
  "jxl-oxide",

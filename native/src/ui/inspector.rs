@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use filmlab_engine::core;
@@ -79,9 +79,11 @@ impl Default for Ui {
 
 type Rows = Vec<AnyElement>;
 
-fn control(id: impl Into<String>, label: impl Into<String>, values: &HashMap<String, f64>, develop: &Entity<Develop>) -> Option<AnyElement> {
+fn control(id: impl Into<String>, label: impl Into<String>, ctx: &Ctx, develop: &Entity<Develop>) -> Option<AnyElement> {
     let (id, label): (String, String) = (id.into(), label.into());
     let spec = spec(&id)?;
+    let values = &ctx.values;
+    let agent = ctx.marks.contains(&id);
     let d = develop.clone();
     let reset = spec.default;
     let value = values.get(&id).copied().unwrap_or(0.0);
@@ -90,6 +92,7 @@ fn control(id: impl Into<String>, label: impl Into<String>, values: &HashMap<Str
             .step(spec.step)
             .decimals(spec.decimals)
             .fallback(reset)
+            .agent(agent)
             .on_change(move |v, _, cx| {
                 let text = format(spec, v);
                 d.update(cx, |d, cx| d.edit_controls(&[(id.as_str(), v)], &format!("{label} {text}"), cx));
@@ -153,7 +156,7 @@ fn needs_stock() -> AnyElement {
 }
 
 // why: Film Look Creator's own halation controls, as FilmVision's PowerGrade sets them
-fn halation_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
+fn halation_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let h = film.halation;
     let stock = crate::film::Halation::stock(film.gauge().unwrap_or(crate::film::Gauge::G65));
     let edit = |develop: &Entity<Develop>, film: &FilmSettings, key: &'static str, label: String, change: Box<dyn Fn(&mut crate::film::Halation)>| {
@@ -173,6 +176,7 @@ fn halation_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
             .step(step)
             .fallback(reset)
             .disabled(!h.enabled())
+            .agent(marks.contains(&format!("film.halation.{id}")))
             .on_change(move |v, _, cx| edit(&d, &f, id, format!("Halation {} {v}", label.to_lowercase()), Box::new(move |h| apply(h, v)))(cx))
             .into_any_element()
     };
@@ -191,7 +195,7 @@ fn halation_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
     rows
 }
 
-fn grain_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
+fn grain_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let g = film.grain;
     let fallback = crate::film::Gauge::G65.grain();
     let gauge = film.gauge();
@@ -217,6 +221,7 @@ fn grain_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
         ParamSlider::new(id, label, value, min, max)
             .step(step)
             .fallback(reset)
+            .agent(marks.contains(id))
             .on_change(move |v, _, cx| {
                 let mut next = f.clone();
                 apply(&mut next, v);
@@ -232,7 +237,7 @@ fn grain_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
     rows
 }
 
-fn dust_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
+fn dust_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let dust = film.dust.unwrap_or(crate::film::STOCK_DUST);
     let (d, f) = (develop.clone(), film.clone());
     let mut rows: Rows = vec![
@@ -249,6 +254,7 @@ fn dust_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
             .step(0.01)
             .fallback(1.758)
             .disabled(!dust.on)
+            .agent(marks.contains("film.dust.size"))
             .on_change(move |v, _, cx| {
                 let mut next = f.clone();
                 next.dust = Some(crate::film::Dust { size: v, ..dust });
@@ -262,6 +268,7 @@ fn dust_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
             .step(0.5)
             .fallback(24.5)
             .disabled(!dust.on)
+            .agent(marks.contains("film.dust.softness"))
             .on_change(move |v, _, cx| {
                 let mut next = f.clone();
                 next.dust = Some(crate::film::Dust { softness: v / 100.0, ..dust });
@@ -272,7 +279,7 @@ fn dust_rows(film: &FilmSettings, develop: &Entity<Develop>) -> Rows {
     rows
 }
 
-fn white_balance_rows(facts: &Value, settings: &Value, develop: &Entity<Develop>) -> Rows {
+fn white_balance_rows(facts: &Value, settings: &Value, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let Some(view) = core::white_balance(&facts.to_string(), &settings.to_string()).ok().and_then(|j| serde_json::from_str::<WhiteBalance>(&j).ok()) else { return Vec::new() };
     let (temp, tint) = if view.kelvin { ((2000.0, 12000.0, 50.0), (-150.0, 150.0, 1.0)) } else { ((-100.0, 100.0, 1.0), (-100.0, 100.0, 1.0)) };
     let current = WB_MODES.iter().find(|(v, _)| *v == view.mode).map(|(_, l)| *l).unwrap_or("Custom");
@@ -296,6 +303,7 @@ fn white_balance_rows(facts: &Value, settings: &Value, develop: &Entity<Develop>
         ParamSlider::new(id, label, value, min, max)
             .step(step)
             .decimals(0)
+            .agent(marks.contains(id))
             .on_change(move |v, _, cx| {
                 d.update(cx, |d, cx| d.edit_controls(&[(id, v)], &format!("{label} {}", v.round()), cx));
             })
@@ -307,7 +315,7 @@ fn white_balance_rows(facts: &Value, settings: &Value, develop: &Entity<Develop>
 fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut Context<FilmlabApp>) {
     let develop = &app.develop;
     match r {
-        Row::Slider(id, label) => rows.extend(control(*id, *label, &ctx.values, develop)),
+        Row::Slider(id, label) => rows.extend(control(*id, *label, ctx, develop)),
         Row::Toggle(section, field, label) => {
             let on = ctx.settings[section][field].as_bool().unwrap_or(false);
             let d = develop.clone();
@@ -330,17 +338,17 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
                 .into_any_element(),
             );
         }
-        Row::WhiteBalance => rows.extend(white_balance_rows(&ctx.facts, &ctx.settings, develop)),
+        Row::WhiteBalance => rows.extend(white_balance_rows(&ctx.facts, &ctx.settings, &ctx.marks, develop)),
         Row::FilmStock => rows.extend(film_rows(&ctx.film, &app.stocks, develop)),
-        Row::Halation if ctx.film.is_on() => rows.extend(halation_rows(&ctx.film, develop)),
-        Row::Grain if ctx.film.is_on() => rows.extend(grain_rows(&ctx.film, develop)),
-        Row::Dust if ctx.film.is_on() => rows.extend(dust_rows(&ctx.film, develop)),
+        Row::Halation if ctx.film.is_on() => rows.extend(halation_rows(&ctx.film, &ctx.marks, develop)),
+        Row::Grain if ctx.film.is_on() => rows.extend(grain_rows(&ctx.film, &ctx.marks, develop)),
+        Row::Dust if ctx.film.is_on() => rows.extend(dust_rows(&ctx.film, &ctx.marks, develop)),
         Row::Halation | Row::Grain | Row::Dust => rows.push(needs_stock()),
         Row::Mixer => {
             let bw = ctx.settings["treatment"].as_str() == Some("bw");
             if bw {
                 for band in MIXER_BANDS {
-                    rows.extend(control(format!("bw.{band}"), sentence(band), &ctx.values, develop));
+                    rows.extend(control(format!("bw.{band}"), sentence(band), ctx, develop));
                 }
             } else {
                 let channel = ["hue", "sat", "lum"][app.ui.mixer];
@@ -356,7 +364,7 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
                     .into_any_element(),
                 );
                 for band in MIXER_BANDS {
-                    rows.extend(control(format!("mixer.{band}.{channel}"), sentence(band), &ctx.values, develop));
+                    rows.extend(control(format!("mixer.{band}.{channel}"), sentence(band), ctx, develop));
                 }
             }
         }
@@ -374,10 +382,10 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
                 .into_any_element(),
             );
             for (part, label) in [("hue", "Hue"), ("sat", "Saturation"), ("lum", "Luminance")] {
-                rows.extend(control(format!("grading.{region}.{part}"), label, &ctx.values, develop));
+                rows.extend(control(format!("grading.{region}.{part}"), label, ctx, develop));
             }
-            rows.extend(control("grading.blending", "Blending", &ctx.values, develop));
-            rows.extend(control("grading.balance", "Balance", &ctx.values, develop));
+            rows.extend(control("grading.blending", "Blending", ctx, develop));
+            rows.extend(control("grading.balance", "Balance", ctx, develop));
         }
         Row::VignetteStyle => {
             let style = ctx.settings["vignette"]["style"].as_str().unwrap_or("highlightPriority").to_string();
@@ -407,6 +415,46 @@ struct Ctx {
     settings: Value,
     values: HashMap<String, f64>,
     film: FilmSettings,
+    /// Controls an agent set that nobody has changed since.
+    marks: HashSet<String>,
+}
+
+// why: an agent's marks are counted per section so a closed section still says the agent worked in it
+fn section_of_mark(id: &str) -> Option<&'static str> {
+    static SLIDERS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+        fn walk(section: &'static str, rows: &'static [Row], out: &mut HashMap<&'static str, &'static str>) {
+            for r in rows {
+                match r {
+                    Row::Slider(id, _) => {
+                        out.insert(*id, section);
+                    }
+                    Row::Group(_, children) => walk(section, children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for s in SECTIONS {
+            walk(s.id, s.rows, &mut out);
+        }
+        out
+    });
+    let prefixed = [("film.halation.", "halation"), ("film.grain.", "grain"), ("film.blur", "grain"), ("film.dust.", "dust"), ("film.", "film"), ("mixer.", "mixer"), ("bw.", "mixer"), ("grading.", "grading"), ("wb.", "color")];
+    prefixed.iter().find(|(p, _)| id.starts_with(p)).map(|(_, s)| *s).or_else(|| SLIDERS.get(id).copied())
+}
+
+fn agent_chip(count: usize) -> AnyElement {
+    div()
+        .flex_none()
+        .h(px(16.))
+        .px(px(6.))
+        .rounded_full()
+        .bg(theme::accent().opacity(0.12))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::accent())
+        .child(format!("{} · {count}", crate::mcp::agent()))
+        .into_any_element()
 }
 
 fn histogram(counts: &[u32]) -> impl IntoElement {
@@ -445,7 +493,8 @@ pub fn inspector(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
     let (Some(facts), Some(settings)) = (d.facts.clone(), d.settings.clone()) else {
         return div().p_4().text_size(px(12.)).text_color(theme::tertiary()).child("Open a photo to develop it.").into_any_element();
     };
-    let ctx = Ctx { values: d.control_values(), facts, settings, film: d.film.clone().map(|f| f.normalized()).unwrap_or_default() };
+    let marks: HashSet<String> = d.agent_marks.keys().cloned().collect();
+    let ctx = Ctx { values: d.control_values(), facts, settings, film: d.film.clone().map(|f| f.normalized()).unwrap_or_default(), marks };
     let counts = d.fit.as_ref().map(|f| f.histogram.clone()).unwrap_or_default();
     let mut sections: Vec<AnyElement> = Vec::new();
     for section in SECTIONS {
@@ -477,7 +526,15 @@ pub fn inspector(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
                                 cx.notify();
                             })
                         })
-                        .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::label()).child(section.title))
+                        .child({
+                            let marked = ctx.marks.iter().filter(|m| section_of_mark(m) == Some(id)).count();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::label()).child(section.title))
+                                .when(marked > 0, |d| d.child(agent_chip(marked)))
+                        })
                         .child(div().opacity(0.7).child(icon::icon(if open { "arrow-down01" } else { "arrow-right01" }, px(14.)))),
                 )
                 .when(open, |d| d.child(div().flex().flex_col().gap(px(theme::GAP)).pb(px(10.)).children(rows)))

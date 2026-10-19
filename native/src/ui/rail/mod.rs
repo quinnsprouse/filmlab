@@ -8,11 +8,13 @@ use gpui_kit::*;
 
 use super::app::FilmlabApp;
 use super::slider::ParamSlider;
-use super::{icon, theme};
+use super::{icon, motion, theme};
 use crate::film::FilmSettings;
+use crate::library::Saving;
 use store::Profile;
 
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+const MARK_FADE: Duration = Duration::from_millis(150);
 
 pub struct State {
     profiles: Vec<Profile>,
@@ -239,11 +241,37 @@ fn shown_steps(cursor: usize, count: usize) -> std::ops::Range<usize> {
     end.saturating_sub(SHOWN)..end
 }
 
+/// Whether the step on screen is on disk, at the end of its row: a dot while the edit waits to be written, like an
+/// unsaved document, then a quiet check, or a warning if writing failed. The slot is always there so the row never
+/// shifts.
+fn save_mark(saving: Saving) -> AnyElement {
+    let slot = div().flex_none().size(px(14.)).flex().items_center().justify_center();
+    let (key, mark) = match saving {
+        Saving::Idle => return slot.into_any_element(),
+        Saving::Saving => ("unsaved", div().size(px(6.)).rounded_full().bg(theme::tertiary()).into_any_element()),
+        Saving::Saved => ("saved", svg().path("icons/tick02.svg").size(px(12.)).text_color(theme::tertiary()).into_any_element()),
+        Saving::Failed => ("failed", svg().path("icons/alert02.svg").size(px(13.)).text_color(theme::danger()).into_any_element()),
+    };
+    let slot = slot.child(mark);
+    if motion::reduced() {
+        return slot.into_any_element();
+    }
+    slot.with_animation(SharedString::from(format!("save-mark-{key}")), Animation::new(MARK_FADE).with_easing(motion::emphasized()), |e, t| e.opacity(t)).into_any_element()
+}
+
 fn history_section(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
     let develop = app.develop.read(cx);
     let cursor = develop.cursor;
     let count = develop.history.len();
     let me = cx.entity();
+    let library = app.library.read(cx);
+    let saving = match develop.photo_id.as_deref() {
+        // why: the untouched original of a photo with no sidecar has nothing to save
+        Some(id) if cursor == 0 && library.record(id).is_none_or(|r| r.file.sidecar.is_none()) => Saving::Idle,
+        Some(_) if develop.unsaved() => Saving::Saving,
+        Some(id) => library.saved(id),
+        None => Saving::Idle,
+    };
     let shown = shown_steps(cursor, count);
     let rows: Vec<AnyElement> = develop.history[shown.clone()]
         .iter()
@@ -274,8 +302,8 @@ fn history_section(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement
                     })
                 })
                 .gap(px(7.))
-                .when(step.key.starts_with("agent."), |d| d.child(div().flex_none().size(px(5.)).rounded_full().bg(theme::accent())))
-                .child(div().min_w_0().truncate().child(step.label.clone()))
+                .child(div().flex_1().min_w_0().truncate().child(step.label.clone()))
+                .when(index == cursor, |d| d.child(save_mark(saving)))
                 .into_any_element()
         })
         .collect();

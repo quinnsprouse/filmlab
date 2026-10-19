@@ -214,7 +214,7 @@ pub(crate) struct Prepared {
     pub chroma_blur: Option<Arc<Rgb32f>>,
     /// Airlight of `dark` (before exposure).
     pub air: f32,
-    pub masks: Vec<masks::Evaluated>,
+    pub masks: Arc<Vec<masks::Evaluated>>,
     /// Output pixels per unit of the source long edge.
     pub px_per_long: f64,
 }
@@ -459,6 +459,14 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     Plan { settings, frame, w, h, px_per_long, src_long, detail_scale, geo, lin_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
 }
 
+/// Filmlab: whether planning a render of `s` reads the source's pixels (an automatic Upright not yet stored, the
+/// lateral CA estimate, red eye detection), which a render made in parts would then do once for each.
+pub fn plan_reads_pixels(s: &DevelopSettings) -> bool {
+    let g = &s.geometry;
+    let upright = !matches!(g.upright, lightcraft_develop::Upright::Off | lightcraft_develop::Upright::Guided) && g.upright_transform.is_none() && s.section_enabled("geometry");
+    upright || (s.optics.remove_ca && s.section_enabled("optics")) || !s.red_eye.is_empty()
+}
+
 /// Whether the scene-linear stage needs work only the CPU does (defringe, spot removal).
 pub fn lin_needs_cpu(s: &DevelopSettings, info: &SourceInfo) -> bool {
     let o = &s.optics;
@@ -542,13 +550,6 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     let edit: &DevelopSettings = &effective;
     let rendition = settings_for(edit, req);
     let s: &DevelopSettings = &rendition;
-    // `Instant::now()` panics on wasm32-unknown-unknown: only read the clock when profiling.
-    let lap = |what: &str, t: &mut Option<std::time::Instant>| {
-        if let Some(t) = t {
-            eprintln!("  {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-            *t = std::time::Instant::now();
-        }
-    };
     let mut t = profiling().then(std::time::Instant::now);
     let src_img: &Rgb32f = match &src {
         Src::Borrowed(r) => r,
@@ -562,18 +563,49 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         (Src::Shared(a), Some(c)) => Some((*a, c)),
         _ => None,
     };
+    // why: Filmlab: a film's final pass (a precomputed tone hook) reads nothing the scene-referred stages make
+    // but the masks' alphas: without masks or an overlay, an uncached render of it (an export's final pass) goes
+    // straight to the per-pixel stage, which only takes the frame's size from the image it would have read; so
+    // does one, cached or not, whose hook holds the masks its capture evaluated for this render (the same masks,
+    // at its size), which it then takes instead of evaluating them again
+    let film = film_hook::current().filter(|f| f.precomputed());
+    let kept = film.as_ref().and_then(|f| f.masks()).filter(|m| masks::same_masks(m, &s.masks, w, h));
+    if film.is_some() && req.overlay == Overlay::None && (kept.is_some() || (shared.is_none() && s.masks.is_empty())) {
+        let hollow = Arc::new(Rgb32f { width: w, height: h, data: Vec::new() });
+        let plane = Arc::new(Plane { width: w, height: h, data: Vec::new() });
+        let prep = Prepared {
+            img: hollow,
+            log_l: plane.clone(),
+            base: plane,
+            clarity_blur: None,
+            texture_blur: None,
+            dark: None,
+            chroma_blur: None,
+            air: 1.0,
+            masks: kept.unwrap_or_default(),
+            px_per_long,
+        };
+        lap("prepare (precomputed)", &mut t);
+        return finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t);
+    }
     let cached = shared.and_then(|(a, c)| c.get(a, geo));
-    let sampled = match &cached {
+    // (an `Option` so an uncached render can move the buffer on below)
+    let mut sampled = Some(match &cached {
         Some(e) => e.sampled.clone(),
         None => Arc::new(frame.sample(src_img, w, h)),
-    };
+    });
     lap("sample", &mut t);
 
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == lin_key) {
         Some((_, img)) => img,
         None => {
             // Without a cache the resampled buffer is ours: work on it in place.
-            let mut img = if shared.is_some() { (*sampled).clone() } else { Arc::unwrap_or_clone(sampled.clone()) };
+            // why: moved out rather than cloned: `sampled` kept a second reference to it, so `unwrap_or_clone`
+            // copied the whole frame (288 MB for a 24 MP export) on every uncached render
+            let mut img = match (&shared, sampled.as_ref()) {
+                (Some(_), Some(a)) => a.par_copy(),
+                _ => sampled.take().map(Arc::unwrap_or_clone).unwrap_or_else(|| frame.sample(src_img, w, h)),
+            };
             lin_cpu(&mut img, info, &plan);
             local::denoise(&mut img, s, detail_scale);
             Arc::new(img)
@@ -594,18 +626,54 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         prep.air = a;
     }
     lap("prepare", &mut t);
-    if let Some((a, c)) = shared {
+    if let (Some((a, c)), Some(sampled)) = (shared, sampled) {
         c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });
     }
+    finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t)
+}
+
+/// Print a stage's time under `LIGHTCRAFT_PROFILE` (`t` is set only then) and restart the clock.
+// `Instant::now()` panics on wasm32-unknown-unknown: only read the clock when profiling.
+fn lap(what: &str, t: &mut Option<std::time::Instant>) {
+    if let Some(t) = t {
+        eprintln!("  {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        *t = std::time::Instant::now();
+    }
+}
+
+/// The per-pixel stage, histogram and overlays of [`render_impl`] on its prepared planes.
+#[allow(clippy::too_many_arguments)]
+fn finish_rendered(
+    prep: &Prepared,
+    info: &SourceInfo,
+    req: &RenderRequest,
+    plan: &Plan<'_>,
+    src_img: &Rgb32f,
+    edit: &DevelopSettings,
+    t: &mut Option<std::time::Instant>,
+) -> Rendered {
+    let (s, frame) = (&*plan.settings, &plan.frame);
+    // why: Filmlab: a capture-only film hook takes the pass's scene (`ToneHook::capture`) and the render's own
+    // pixels go unused, so none are made: the image keeps only the size it would have had, and no histogram
+    if let Some(film) = film_hook::current().filter(|f| f.capture_only()) {
+        finish::finish(prep, s, frame, info, req.space, None, None);
+        film.captured_masks(prep.masks.clone());
+        lap("capture", t);
+        let (width, height) = match plan.keep {
+            Some(k) if req.depth == OutputDepth::U8 => (k.w, k.h),
+            _ => (prep.img.width, prep.img.height),
+        };
+        return Rendered { image: Rgba8 { width, height, data: Vec::new() }, histogram: Histogram::of_srgb8(&Rgba8::new(0, 0)), deep: None };
+    }
     if req.depth != OutputDepth::U8 {
-        let deep = finish::finish_deep(&prep, s, frame, info, req.space, req.depth, req.proof);
+        let deep = finish::finish_deep(prep, s, frame, info, req.space, req.depth, req.proof);
         let image = deep.to_rgba8();
         let histogram = Histogram::of_srgb8(&image);
-        lap("finish (deep)", &mut t);
+        lap("finish (deep)", t);
         return Rendered { image, histogram, deep: Some(deep) };
     }
-    let image = finish::finish(&prep, s, frame, info, req.space, req.display.as_ref(), req.proof);
-    lap("finish", &mut t);
+    let image = finish::finish(prep, s, frame, info, req.space, req.display.as_ref(), req.proof);
+    lap("finish", t);
     let cut = |i: &Rgba8| match plan.keep {
         Some(k) => i.crop(k.x, k.y, k.w, k.h),
         None => i.clone(),
@@ -614,11 +682,11 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         Some(_) => Histogram::of_srgb8(&cut(&image)),
         None => Histogram::of_srgb8(&image),
     };
-    lap("histogram", &mut t);
+    lap("histogram", t);
     let mut image = image;
-    let mask = overlay_alpha(req.overlay, &plan, &prep);
-    let masks = overlay_alphas_all(req.overlay, &plan, &prep);
-    visualize::apply(&mut image, req.overlay, &plan, mask.as_ref(), masks.as_deref());
+    let mask = overlay_alpha(req.overlay, plan, prep);
+    let masks = overlay_alphas_all(req.overlay, plan, prep);
+    visualize::apply(&mut image, req.overlay, plan, mask.as_ref(), masks.as_deref());
     let mut image = if plan.keep.is_some() { cut(&image) } else { image };
     if req.overlay == Overlay::HdrRange && edit.hdr.enabled {
         // the HDR rendition of the same request says how far above SDR white each pixel goes
@@ -626,7 +694,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         if let Some(hdr) = render(src_img, info, edit, &hreq).deep {
             visualize::hdr_range(&mut image, &hdr, req.space.luma());
         }
-        lap("visualize hdr", &mut t);
+        lap("visualize hdr", t);
     }
     Rendered { image, histogram, deep: None }
 }

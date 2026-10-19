@@ -16,7 +16,7 @@ interface Stored {
 }
 
 const scope = workerScope<GpuMessage, GpuReply>();
-const isProgram = withKeys<GpuProgram>("buffers", "copies", "writes", "passes", "reads");
+const isProgram = withKeys<GpuProgram>("buffers", "copies", "writes", "passes", "reads", "keep");
 const isBlock = withKeys<MemoryBlock>("id", "at", "len");
 const mapRead = 0x1;
 const paramsSlot = 512;
@@ -128,7 +128,24 @@ function settle(state: GpuState): void {
   }
 }
 
+function holdsKept(program: GpuProgram): boolean {
+  return program.keep.every((keep) => !keep.need || stored.get(keep.buffer)?.holds === keep.id);
+}
+
+function markKept(program: GpuProgram, done: boolean): void {
+  for (const keep of program.keep) {
+    const buffer = stored.get(keep.buffer);
+    if (!keep.need && buffer) {
+      buffer.holds = done ? keep.id : undefined;
+    }
+  }
+}
+
 async function run(g: Gpu, program: GpuProgram): Promise<void> {
+  if (!holdsKept(program)) {
+    settle(GpuState.Failed);
+    return;
+  }
   g.device.pushErrorScope("validation");
   for (const spec of program.buffers) {
     if (spec.upload) {
@@ -137,6 +154,7 @@ async function run(g: Gpu, program: GpuProgram): Promise<void> {
       ensure(g, spec.name, spec.words);
     }
   }
+  markKept(program, false);
   for (const write of program.writes) {
     g.device.queue.writeBuffer(bufferOf(write.buffer), write.offset * 4, words(write.block));
   }
@@ -192,6 +210,7 @@ async function run(g: Gpu, program: GpuProgram): Promise<void> {
   if (failure) {
     throw new Error(failure.message);
   }
+  markKept(program, true);
   if (!out) {
     finishWrite(() => undefined);
     return;

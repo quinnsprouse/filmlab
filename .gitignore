@@ -49,6 +49,7 @@ playwright-report
 
 # Native macOS app build output (cargo build in native/)
 /native/target/
+/native/target-dist/
 
 # Disposable agent and local experiments
 /.scratch/
@@ -67,3 +68,5 @@ __pycache__/
 
 # Downloaded e2e fixtures (sha256-checked)
 /e2e/.cache/
+/native/target-*/
+/engine/target-*/

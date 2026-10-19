@@ -478,18 +478,22 @@ struct Loaded {
 struct CachedScene {
     key: u64,
     scene: Arc<Scene>,
+    ceiling: Option<(CeilingKey, f32)>,
     textured: Option<(String, Arc<Textured>)>,
     scan: Option<(String, Scan)>,
     toned: Option<(String, Arc<Toned>)>,
 }
 
+// what the halation's ceiling depends on besides the scene: contrast and the utility LUT
+type CeilingKey = (u32, Option<u64>);
+
 impl CachedScene {
     fn new(key: u64, scene: Scene) -> CachedScene {
-        CachedScene { key, scene: Arc::new(scene), textured: None, scan: None, toned: None }
+        CachedScene { key, scene: Arc::new(scene), ceiling: None, textured: None, scan: None, toned: None }
     }
 
     fn look(&self, key: u64) -> CachedScene {
-        CachedScene { key, scene: self.scene.clone(), textured: self.textured.clone(), scan: self.scan.clone(), toned: None }
+        CachedScene { key, scene: self.scene.clone(), ceiling: self.ceiling, textured: self.textured.clone(), scan: self.scan.clone(), toned: None }
     }
 
     fn textured(&mut self, dev: &Developer, key: &str, out: Region) -> Arc<Textured> {
@@ -602,13 +606,16 @@ struct FilmOutcome {
     look: Option<CachedScene>,
 }
 
-fn cropped(w: usize, h: usize, rgba: Vec<u8>, keep: Option<Region>) -> (usize, usize, Vec<u8>) {
+// why: the pixels leave as bytes without a copy, and a zoomed window's margin is cut off its rows in parallel
+fn cropped(w: usize, h: usize, rgba: Vec<[u8; 4]>, keep: Option<Region>) -> (usize, usize, Vec<u8>) {
+    use rayon::prelude::*;
     match keep {
         Some(k) if (k.w, k.h) != (w, h) => {
-            let rows = (k.y..k.y + k.h).flat_map(|y| &rgba[(y * w + k.x) * 4..(y * w + k.x + k.w) * 4]);
-            (k.w, k.h, rows.copied().collect())
+            let mut out = vec![0u8; k.w * k.h * 4];
+            out.par_chunks_mut(k.w.max(1) * 4).enumerate().for_each(|(j, row)| row.copy_from_slice(rgba[(k.y + j) * w + k.x..][..k.w].as_flattened()));
+            (k.w, k.h, out)
         }
-        _ => (w, h, rgba),
+        _ => (w, h, rgba.into_flattened()),
     }
 }
 
@@ -630,12 +637,50 @@ fn capture_scene(region: Region, render: impl Fn() -> pipeline::Rendered) -> Sce
 const LOOK_EDGE: usize = 1024;
 const EXPORT_BAND: usize = 1024;
 
-fn textured_key(request: &FilmRequest, light: Light) -> String {
-    format!("{:?}{}{}", request.utility, request.texture_key(), light.contrast)
+fn textured_key(request: &FilmRequest, dev: &Developer) -> String {
+    let ceiling = dev.texture.and_then(|t| t.halation).map(|h| h.ceiling);
+    format!("{:?}{}{}{ceiling:?}", request.utility, request.texture_key(), dev.light.contrast)
 }
 
-fn scan_key(request: &FilmRequest, light: Light) -> String {
-    format!("{}{:?}{:?}{}{light:?}", textured_key(request, light), request.negative, request.print, request.auto_scan)
+fn scan_key(request: &FilmRequest, dev: &Developer) -> String {
+    format!("{}{:?}{:?}{}{:?}", textured_key(request, dev), request.negative, request.print, request.auto_scan, dev.light)
+}
+
+/// The small render of the whole frame that scan levels and the halation's ceiling are measured on.
+fn whole_look<'a>(
+    req: &RenderRequest,
+    size_of: impl Fn(&RenderRequest) -> (usize, usize),
+    render: impl Fn(&RenderRequest) -> pipeline::Rendered,
+    look: &'a mut Option<CachedScene>,
+    look_key: u64,
+) -> &'a mut CachedScene {
+    let whole = RenderRequest { max_w: LOOK_EDGE, max_h: LOOK_EDGE, window: None, ..*req };
+    look.get_or_insert_with(|| {
+        let (lw, lh) = size_of(&whole);
+        let fresh = CachedScene::new(look_key, capture_scene(Region::whole(lw, lh), || render(&whole)));
+        crate::gpu::prefetch(&fresh.scene);
+        fresh
+    })
+}
+
+/// Sets the halation's ceiling from `cached`, a render of the whole frame (halation::Headroom), which keeps it while
+/// what it depends on stays.
+fn measure_ceiling(dev: &mut Developer, cached: &mut CachedScene) {
+    if dev.texture.is_some_and(|t| t.halation.is_some()) {
+        let key = (dev.light.contrast.to_bits(), dev.chain.utility.as_ref().map(|u| u.id));
+        let ceiling = match cached.ceiling {
+            Some((k, ceiling)) if k == key => ceiling,
+            _ => {
+                let ceiling = spent("ceiling", || dev.chain.ceiling(&cached.scene, dev.light.contrast));
+                cached.ceiling = Some((key, ceiling));
+                ceiling
+            }
+        };
+        if pipeline::profiling() {
+            eprintln!("  film halation ceiling: {ceiling:.4}");
+        }
+        dev.texture = dev.texture.map(|t| t.with_ceiling(ceiling));
+    }
 }
 
 fn whole_scan(
@@ -647,19 +692,13 @@ fn whole_scan(
     look: &mut Option<CachedScene>,
     look_key: u64,
 ) -> Scan {
-    let scan_key = scan_key(request, dev.light);
-    let whole = RenderRequest { max_w: LOOK_EDGE, max_h: LOOK_EDGE, window: None, ..*req };
-    let look = look.get_or_insert_with(|| {
-        let (lw, lh) = size_of(&whole);
-        let fresh = CachedScene::new(look_key, capture_scene(Region::whole(lw, lh), || render(&whole)));
-        crate::gpu::prefetch(&fresh.scene);
-        fresh
-    });
+    let scan_key = scan_key(request, dev);
+    let look = whole_look(req, size_of, render, look, look_key);
     if let Some((_, scan)) = look.scan.as_ref().filter(|(k, _)| *k == scan_key) {
         return scan.clone();
     }
     let region = look.scene.region;
-    let textured_key = textured_key(request, dev.light);
+    let textured_key = textured_key(request, dev);
     let textured = look.textured(dev, &textured_key, region);
     look.scan(dev, (&textured_key, &scan_key), textured, region, request.auto_scan).0
 }
@@ -667,29 +706,76 @@ fn whole_scan(
 fn film_export(
     job: FilmJob<'_>,
     req: &RenderRequest,
+    bands: bool,
     size_of: impl Fn(&RenderRequest) -> (usize, usize),
     render: impl Fn(&RenderRequest) -> pipeline::Rendered,
 ) -> Fallible<pipeline::Rendered> {
     let Some(request) = job.film else { return Ok(render(req)) };
     let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(render(req)) };
-    let dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
     let (fw, fh) = size_of(req);
     let frame = Size { w: fw, h: fh };
-    let scan = whole_scan(&dev, request, req, &size_of, &render, &mut None, 0);
+    let mut look = None;
+    measure_ceiling(&mut dev, whole_look(req, &size_of, &render, &mut look, 0));
+    let scan = spent("export scan", || whole_scan(&dev, request, req, &size_of, &render, &mut look, 0));
     let margin = dev.texture.map_or(0, |p| texture::margin(frame, &p));
-    let whole = capture_scene(Region::whole(fw, fh), || render(req));
-    let mut rgb = vec![[0.0f32; 3]; fw * fh];
-    for y in (0..fh).step_by(EXPORT_BAND) {
-        let out = Region { x: 0, y, w: fw, h: EXPORT_BAND.min(fh - y) };
+    let whole = spent("export capture", || capture_scene(Region::whole(fw, fh), || render(req)));
+    let band = |y: usize| Region { x: 0, y, w: fw, h: EXPORT_BAND.min(fh - y) };
+    let part = |out: Region| {
         let scene = whole.part(out.grown(margin, frame));
-        let toned = match dev.finish(&dev.textured(&scene, out), &scan) {
-            Some(t) => t,
-            None => dev.finish(&dev.textured_on_cpu(&scene, out), &scan).ok_or("the film stage failed on the CPU")?,
+        crate::gpu::prefetch(&scene);
+        scene
+    };
+    // why: with `bands`, the final pass is made a band at a time (`Toned::band`), each while the GPU textures the
+    // next band, and no toned copy of the whole frame is kept; every row is the one the whole frame's pass makes.
+    // Otherwise the bands' toned rows are read back into the frame's own, without a buffer of their own and a copy
+    let mut rgb = if bands { Vec::new() } else { vec![[0.0f32; 3]; fw * fh] };
+    let mut image: Vec<[u8; 4]> = Vec::with_capacity(if bands { fw * fh } else { 0 });
+    let mut scene = (fh > 0).then(|| spent("band part", || part(band(0))));
+    let mut tex = scene.as_ref().map(|s| spent("band textured", || dev.band(s, band(0))));
+    for y in (0..fh).step_by(EXPORT_BAND) {
+        let out = band(y);
+        let (Some(this), Some(textured)) = (scene.take(), tex.take()) else { break };
+        // why: the next band is cut and sent to the GPU while the GPU textures this one
+        let next = (y + EXPORT_BAND < fh).then(|| spent("band part", || part(band(y + EXPORT_BAND))));
+        let mut own = Vec::new();
+        let rows: &mut [[f32; 3]] = if bands {
+            own = vec![[0.0f32; 3]; out.w * out.h];
+            &mut own
+        } else {
+            &mut rgb[y * fw..(y + out.h) * fw]
         };
-        rgb[y * fw..(y + out.h) * fw].copy_from_slice(&toned.rgb);
+        if !spent("band finish", || dev.finish_into(&textured, &scan, rows)) && !dev.finish_into(&dev.textured_on_cpu(&this, out), &scan, rows) {
+            return Err("the film stage failed on the CPU".into());
+        }
+        tex = next.as_ref().map(|s| spent("band textured", || dev.band(s, band(y + EXPORT_BAND))));
+        scene = next;
+        if bands {
+            let toned = Arc::new(Toned { region: out, rgb: own, masks: whole.masks.clone(), band: true });
+            let rendered = spent("band final", || pipeline::film_hook::with_tone_hook(toned, || render(req)));
+            if (rendered.image.width, rendered.image.height) != (fw, out.h) {
+                return Err("an export band's final pass made the wrong rows".into());
+            }
+            image.extend_from_slice(&rendered.image.data);
+        }
     }
-    let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb });
-    Ok(pipeline::film_hook::with_tone_hook(toned, || render(req)))
+    if bands {
+        let image = lightcraft_raster::Rgba8 { width: fw, height: fh, data: image };
+        let histogram = lightcraft_raster::Histogram::of_srgb8(&image);
+        return Ok(pipeline::Rendered { image, histogram, deep: None });
+    }
+    let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb, masks: whole.masks.clone(), band: false });
+    Ok(spent("export final", || pipeline::film_hook::with_tone_hook(toned, || render(req))))
+}
+
+fn spent<R>(what: &str, f: impl FnOnce() -> R) -> R {
+    if !pipeline::profiling() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    eprintln!("  film {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    r
 }
 
 fn film_render(
@@ -701,7 +787,7 @@ fn film_render(
     let plain = |job: FilmJob<'_>| FilmOutcome { rendered: render(req, Lane::View), keep: None, view: job.view, look: job.look };
     let Some(request) = job.film else { return Ok(plain(job)) };
     let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(plain(job)) };
-    let dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
     let (fw, fh) = size_of(req);
     let frame = Size { w: fw, h: fh };
     let window = req.window.map(|w| w.clamped(fw, fh));
@@ -715,20 +801,26 @@ fn film_render(
     let mut view = match job.view.filter(|c| c.key == key) {
         Some(c) => c,
         None => {
-            let fresh = CachedScene::new(key, capture_scene(region, || render(&capture, Lane::View)));
-            crate::gpu::prefetch(&fresh.scene);
+            let fresh = CachedScene::new(key, spent("capture", || capture_scene(region, || render(&capture, Lane::View))));
+            spent("prefetch", || crate::gpu::prefetch(&fresh.scene));
             fresh
         }
     };
-    let textured_key = textured_key(request, job.light);
-    let scan_key = scan_key(request, job.light);
-    let mut textured = view.textured(&dev, &textured_key, out);
+    // why: a zoomed window takes the halation's ceiling from the whole frame, as its scan levels, so it glows as the
+    // fit view and the export do
+    let mut look = window.and(job.look).filter(|c| c.key == job.look_key);
+    match window {
+        Some(_) => measure_ceiling(&mut dev, whole_look(req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key)),
+        None => measure_ceiling(&mut dev, &mut view),
+    }
+    let textured_key = textured_key(request, &dev);
+    let scan_key = scan_key(request, &dev);
+    let mut textured = spent("textured", || view.textured(&dev, &textured_key, out));
     let (scan, look) = if window.is_some() {
-        let mut look = job.look.filter(|c| c.key == job.look_key);
         let scan = whole_scan(&dev, request, req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key);
         (scan, look.ok_or("the whole-frame render is missing")?)
     } else {
-        let (scan, kept) = view.scan(&dev, (&textured_key, &scan_key), textured.clone(), out, request.auto_scan);
+        let (scan, kept) = spent("scan", || view.scan(&dev, (&textured_key, &scan_key), textured.clone(), out, request.auto_scan));
         textured = kept;
         (scan, view.look(job.look_key))
     };
@@ -736,19 +828,19 @@ fn film_render(
     let toned = match view.toned.as_ref().filter(|(k, _)| *k == toned_key) {
         Some((_, t)) => t.clone(),
         None => {
-            let t = match dev.finish(&textured, &scan) {
+            let t = match spent("finish", || dev.finish(&textured, &scan)) {
                 Some(t) => t,
                 None => {
                     let cpu = view.on_cpu(&dev, &textured_key, out);
                     dev.finish(&cpu, &scan).ok_or("the film stage failed on the CPU")?
                 }
             };
-            let t = Arc::new(t);
+            let t = Arc::new(Toned { masks: view.scene.masks.clone(), ..t });
             view.toned = Some((toned_key, t.clone()));
             t
         }
     };
-    let rendered = pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View));
+    let rendered = spent("final", || pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View)));
     let keep = window.map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
     Ok(FilmOutcome { rendered, keep, view: Some(view), look: Some(look) })
 }
@@ -767,6 +859,18 @@ impl Engine {
 
     pub fn insert(&mut self, key: &str, decoded: Decoded) {
         self.sources.insert(key.to_string(), decoded.0);
+    }
+
+    /// The decode loaded as `key`, for another engine to [`Engine::insert`] (its pixels are shared, not copied): an
+    /// export of the photo on screen can take the loupe's decode at the size it needs instead of decoding again.
+    pub fn decoded(&self, key: &str) -> Option<Decoded> {
+        let l = self.sources.get(key)?;
+        Some(Decoded(Loaded { source: l.source.clone(), header: l.header.clone(), width: l.width, height: l.height }))
+    }
+
+    /// Reads the original file's metadata for `key`'s exports, as [`Engine::load`] does besides the pixels.
+    pub fn read_original(&mut self, key: &str, bytes: &[u8]) {
+        self.originals.insert(key.to_string(), lightcraft_meta::extract(bytes));
     }
 
     pub fn has(&self, key: &str) -> bool {
@@ -823,10 +927,10 @@ impl Engine {
         if let Some(look) = outcome.look {
             self.looks.insert(key.to_string(), look);
         }
-        if let Some(h) = pipeline::hdr_histogram(&src.image, &info, &s, &req) {
+        if let Some(h) = spent("hdr histogram", || pipeline::hdr_histogram(&src.image, &info, &s, &req)) {
             rendered.histogram = h;
         }
-        let (width, height, rgba) = cropped(rendered.image.width, rendered.image.height, rendered.image.as_bytes(), keep);
+        let (width, height, rgba) = spent("crop", || cropped(rendered.image.width, rendered.image.height, rendered.image.data, keep));
         Ok(Frame { width: width as u32, height: height as u32, rgba, histogram: rendered.histogram.to_words() })
     }
 
@@ -860,7 +964,9 @@ impl Engine {
         let native = native_frame(p.width, p.height, &p.develop);
         let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop), view: None, look: None, look_key: 0, native };
         let size_of = |r: &RenderRequest| pipeline::output_size(loaded.source.image.width, loaded.source.image.height, &p.develop, r);
-        let rendered = film_export(job, &req, size_of, |r| pipeline::render(&loaded.source.image, &info, &p.develop, r))?;
+        // (by bands for an 8-bit render whose plan reads no pixels: see film_export)
+        let bands = req.depth == OutputDepth::U8 && req.overlay == Overlay::None && !pipeline::plan_reads_pixels(&p.develop);
+        let rendered = film_export(job, &req, bands, size_of, |r| pipeline::render(&loaded.source.image, &info, &p.develop, r))?;
         let meta = export_metadata(&p, &Catalog::default(), &o).map(|m| {
             let mut m = match self.originals.get(key) {
                 Some(original) => with_original(m, original, &o),
@@ -872,7 +978,7 @@ impl Engine {
             m.software = Some("Filmlab".into());
             m
         });
-        encode_rendered(&rendered, &o, meta.as_ref())
+        spent("export encode", || encode_rendered(&rendered, &o, meta.as_ref()))
     }
 }
 

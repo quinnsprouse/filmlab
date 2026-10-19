@@ -5,6 +5,7 @@ mod export;
 mod library;
 mod look;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::AsyncApp;
@@ -12,6 +13,7 @@ use rmcp::model::{Tool, ToolAnnotations};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use super::session::Hub;
 use crate::ui::driver::Driver;
 
 /// A tool's answer: compact text (usually one line of JSON) and any JPEG images.
@@ -68,7 +70,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "status",
         kind: Kind::Read,
-        description: "Where the app is: mode, folder, photo, selection, tool, zoom, the region the user is viewing, history.",
+        description: "Where the app is: mode, folder, photo, selection, tool, zoom, the region the user is viewing, history, agent sessions.",
         schema: r#"{"type":"object"}"#,
     },
     Spec {
@@ -98,26 +100,26 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "get_edit",
         kind: Kind::Read,
-        description: "The open photo's edit: non-default controls, film, crop, masks, spots. all: every control.",
-        schema: r#"{"type":"object","properties":{"all":{"type":"boolean"}}}"#,
+        description: "A photo's edit: non-default controls, film, crop, masks, spots. all: every control.",
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string","description":"id; default the open photo"},"all":{"type":"boolean"}}}"#,
     },
     Spec {
         name: "set_controls",
         kind: Kind::Set,
         description: "Set develop controls by id (catalog controls) in one undo step. Numbers are absolute, strings like \"+0.3\" relative.",
-        schema: r#"{"type":"object","properties":{"values":{"type":"object","description":"{\"light.exposure\":0.4,\"color.vibrance\":\"+10\"}"},"label":{"type":"string"},"preview":{"type":"integer","description":"also return a JPEG this long, e.g. 768"}},"required":["values"]}"#,
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"values":{"type":"object","description":"{\"light.exposure\":0.4,\"color.vibrance\":\"+10\"}"},"label":{"type":"string"},"preview":{"type":"integer","description":"also return a JPEG this long, e.g. 768"}},"required":["values"]}"#,
     },
     Spec {
         name: "set_film",
         kind: Kind::Set,
         description: "Change the FilmVision look; omitted fields stay, negative \"\" removes it. gauge: FilmVision's grain, halation and blur for 16/35/65/120.",
-        schema: r#"{"type":"object","properties":{"negative":{"type":"string"},"print":{"type":"string"},"utility":{"type":"string"},"gauge":{"enum":[16,35,65,120]},"halation":{"type":"object","description":"on, amount, hue, sat, radius, highlights_only"},"grain":{"type":"object","description":"amount, size, softness, defocus"},"blur":{"type":"number"},"dust":{"type":"object","description":"on, size, softness"},"preview":{"type":"integer"}}}"#,
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"negative":{"type":"string"},"print":{"type":"string"},"utility":{"type":"string"},"gauge":{"enum":[16,35,65,120]},"halation":{"type":"object","description":"on, amount, hue, sat, radius, highlights_only"},"grain":{"type":"object","description":"amount, size, softness, defocus"},"blur":{"type":"number"},"dust":{"type":"object","description":"on, size, softness"},"preview":{"type":"integer"}}}"#,
     },
     Spec {
         name: "command",
         kind: Kind::Act,
-        description: "Run a LightCraft command (crop.*, mask.*, spot.*, develop.*; see catalog commands) on the open photo as one undo step.",
-        schema: r#"{"type":"object","properties":{"name":{"type":"string"},"params":{"type":"object"},"preview":{"type":"integer"}},"required":["name"]}"#,
+        description: "Run a LightCraft command (crop.*, mask.*, spot.*, develop.*; see catalog commands) on a photo as one undo step.",
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"name":{"type":"string"},"params":{"type":"object"},"preview":{"type":"integer"}},"required":["name"]}"#,
     },
     Spec {
         name: "catalog",
@@ -128,32 +130,32 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "history",
         kind: Kind::Act,
-        description: "List the open photo's history, undo, redo, or go to a step.",
-        schema: r#"{"type":"object","properties":{"action":{"enum":["list","undo","redo","go_to"]},"step":{"type":"integer"}},"required":["action"]}"#,
+        description: "List a photo's history, undo, redo, or go to a step.",
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"action":{"enum":["list","undo","redo","go_to"]},"step":{"type":"integer"}},"required":["action"]}"#,
     },
     Spec {
         name: "profiles",
         kind: Kind::Act,
         description: "Saved looks: list, save the current edit, apply at an amount (0-200, default 100), delete.",
-        schema: r#"{"type":"object","properties":{"action":{"enum":["list","save","apply","delete"]},"id":{"type":"string"},"name":{"type":"string"},"groups":{"type":"array","items":{"type":"string"},"description":"default: the look groups"},"amount":{"type":"number"}},"required":["action"]}"#,
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"action":{"enum":["list","save","apply","delete"]},"id":{"type":"string"},"name":{"type":"string"},"groups":{"type":"array","items":{"type":"string"},"description":"default: the look groups"},"amount":{"type":"number"}},"required":["action"]}"#,
     },
     Spec {
         name: "snapshots",
         kind: Kind::Act,
-        description: "Named states of the open photo's edit: save, list, restore (one undo step), delete.",
-        schema: r#"{"type":"object","properties":{"action":{"enum":["save","list","restore","delete"]},"name":{"type":"string"}},"required":["action"]}"#,
+        description: "Named states of a photo's edit: save, list, restore (one undo step), delete.",
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"action":{"enum":["save","list","restore","delete"]},"name":{"type":"string"}},"required":["action"]}"#,
     },
     Spec {
         name: "preview",
         kind: Kind::Read,
-        description: "JPEG of the open photo as edited (before: as opened) with brief stats; region [x0,y0,x1,y1] (0-1) shows that area at full detail.",
-        schema: r#"{"type":"object","properties":{"max_edge":{"type":"integer","description":"64-2048, default 768"},"region":{"type":"array","items":{"type":"number"}},"before":{"type":"boolean"},"quality":{"type":"integer","description":"default 80"}}}"#,
+        description: "JPEG of a photo as edited (before: as opened) with brief stats; region [x0,y0,x1,y1] (0-1) shows that area at full detail.",
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"max_edge":{"type":"integer","description":"64-2048, default 768"},"region":{"type":"array","items":{"type":"number"}},"before":{"type":"boolean"},"quality":{"type":"integer","description":"default 80"}}}"#,
     },
     Spec {
         name: "analyze",
         kind: Kind::Read,
         description: "Numbers instead of pixels: luma percentiles, clipping, mean colour, neutral cast, chroma, histogram. Optional region and before.",
-        schema: r#"{"type":"object","properties":{"region":{"type":"array","items":{"type":"number"}},"before":{"type":"boolean"}}}"#,
+        schema: r#"{"type":"object","properties":{"photo":{"type":"string"},"region":{"type":"array","items":{"type":"number"}},"before":{"type":"boolean"}}}"#,
     },
     Spec {
         name: "view",
@@ -199,26 +201,28 @@ pub fn args<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|e| format!("bad arguments: {e}"))
 }
 
-pub async fn run(driver: &Driver, cx: &mut AsyncApp, name: &str, value: Value) -> Output {
+/// Runs one call. Calls arrive concurrently; each tool takes the hub's locks it needs (the window for what the user
+/// sees, the photo for edits), so only calls on the same photo or on the window wait for each other.
+pub async fn run(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, name: &str, value: Value) -> Output {
     let answer = match name {
         "guide" => guide::guide(value),
-        "status" => app::status(driver, cx),
-        "screenshot" => app::screenshot(driver, cx, value).await,
-        "view" => app::view(driver, cx, value).await,
-        "open_folder" => library::open_folder(driver, cx, value).await,
+        "status" => app::status(hub, driver, cx),
+        "screenshot" => app::screenshot(hub, driver, cx, value).await,
+        "view" => app::view(hub, driver, cx, value).await,
+        "open_folder" => library::open_folder(hub, driver, cx, value).await,
         "list_photos" => library::list_photos(driver, cx, value),
         "set_flags" => library::set_flags(driver, cx, value).await,
-        "open_photo" => library::open_photo(driver, cx, value).await,
-        "get_edit" => edit::get_edit(driver, cx, value),
-        "set_controls" => edit::set_controls(driver, cx, value).await,
-        "set_film" => edit::set_film(driver, cx, value).await,
-        "command" => edit::command(driver, cx, value).await,
+        "open_photo" => library::open_photo(hub, driver, cx, value).await,
+        "get_edit" => edit::get_edit(hub, driver, cx, value),
+        "set_controls" => edit::set_controls(hub, driver, cx, value).await,
+        "set_film" => edit::set_film(hub, driver, cx, value).await,
+        "command" => edit::command(hub, driver, cx, value).await,
         "catalog" => edit::catalog(driver, cx, value),
-        "history" => edit::history(driver, cx, value).await,
-        "profiles" => edit::profiles(driver, cx, value).await,
-        "snapshots" => edit::snapshots(driver, cx, value).await,
-        "preview" => look::preview(driver, cx, value).await,
-        "analyze" => look::analyze(driver, cx, value).await,
+        "history" => edit::history(hub, driver, cx, value).await,
+        "profiles" => edit::profiles(hub, driver, cx, value).await,
+        "snapshots" => edit::snapshots(hub, driver, cx, value).await,
+        "preview" => look::preview(hub, driver, cx, value).await,
+        "analyze" => look::analyze(hub, driver, cx, value).await,
         "export" => export::export(driver, cx, value).await,
         _ => Err(format!("unknown tool {name}")),
     };

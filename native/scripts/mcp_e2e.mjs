@@ -716,6 +716,143 @@ await check("agent/feedback-loop", async () => {
   return `p50 ${cur.toFixed(4)} after 6`;
 });
 
+const unescapeXml = (s) =>
+  s
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+function sidecar(id) {
+  const file = path.join(photos, `${id.replace(/\.[^.]+$/, "")}.xmp`);
+  assert(fs.existsSync(file), `no sidecar ${file}`);
+  const text = fs.readFileSync(file, "utf8");
+  const field = (name) => {
+    const m = text.match(new RegExp(`<(\\w+):${name}>([\\s\\S]*?)</\\1:${name}>`));
+    return m ? JSON.parse(unescapeXml(m[2])) : undefined;
+  };
+  return { settings: field("settings"), film: field("film") };
+}
+const exposureOf = (edit) => edit?.controls?.["light.exposure"] ?? 0;
+const near = (a, b) => Math.abs(a - b) < 0.011;
+
+async function agent(id, exposure, gauge) {
+  const started = performance.now();
+  const set = await tool(
+    "set_controls",
+    { photo: id, values: { "light.exposure": exposure } },
+    { label: "set_controls(photo)" },
+  );
+  const film = await tool("set_film", { photo: id, gauge }, { label: "set_film(photo)" });
+  const look = await tool("preview", { photo: id, max_edge: 512 }, { label: "preview(photo)" });
+  return { id, ms: performance.now() - started, set, film, look };
+}
+
+const others = photoIds.filter((id) => id !== first);
+const [photoA, photoB, photoC, photoD] = others;
+let uiEdit;
+let pair = [];
+
+await check("concurrency/two-agents", async () => {
+  assert(others.length >= 4, `need 4 photos besides the open one, have ${others.length}`);
+  uiEdit = (await tool("get_edit")).text;
+  const serialC = await agent(photoC, 0.3, 65);
+  const serialD = await agent(photoD, -0.3, 120);
+  const serial = serialC.ms + serialD.ms;
+  const started = performance.now();
+  pair = await Promise.all([agent(photoA, 0.6, 35), agent(photoB, -0.6, 16)]);
+  const wall = performance.now() - started;
+  for (const r of pair) {
+    assert(r.set.json?.photo === r.id, `set_controls answered for ${r.set.json?.photo}`);
+    assert(r.film.json?.photo === r.id, `set_film answered for ${r.film.json?.photo}`);
+    assert(r.look.images.length === 1, `${r.id}: no preview image`);
+  }
+  assert(
+    wall < serial,
+    `concurrent ${wall.toFixed(0)} ms is not under the serial sum ${serial.toFixed(0)} ms`,
+  );
+  return `concurrent ${wall.toFixed(0)} ms (${pair.map((r) => r.ms.toFixed(0)).join(" + ")}) vs serial ${serialC.ms.toFixed(0)} + ${serialD.ms.toFixed(0)} = ${serial.toFixed(0)} ms`;
+});
+
+await check("concurrency/no-cross-talk", async () => {
+  assert(pair.length === 2, "the two-agent run didn't finish");
+  const [a, b] = await Promise.all([
+    tool("get_edit", { photo: photoA }),
+    tool("get_edit", { photo: photoB }),
+  ]);
+  assert(near(exposureOf(a.json), 0.6), `${photoA} exposure ${exposureOf(a.json)}, want 0.6`);
+  assert(near(exposureOf(b.json), -0.6), `${photoB} exposure ${exposureOf(b.json)}, want -0.6`);
+  assert(a.json?.film?.gauge === 35, `${photoA} gauge ${a.json?.film?.gauge}, want 35`);
+  assert(b.json?.film?.gauge === 16, `${photoB} gauge ${b.json?.film?.gauge}, want 16`);
+  const ui = (await tool("get_edit")).text;
+  assert(ui === uiEdit, `the open photo's edit changed: ${uiEdit} -> ${ui}`);
+  const s = (await tool("status")).json;
+  assert(
+    [photoA, photoB].every((id) => s.sessions?.includes(id)),
+    `status sessions ${JSON.stringify(s.sessions)}`,
+  );
+  return `${photoA} ${exposureOf(a.json)} g${a.json.film.gauge}, ${photoB} ${exposureOf(b.json)} g${b.json.film.gauge}; sessions ${s.sessions.join(",")}`;
+});
+
+await check("concurrency/sidecars", async () => {
+  await wait(300);
+  const a = sidecar(photoA);
+  const b = sidecar(photoB);
+  assert(
+    near(a.settings?.light?.exposure, 0.6),
+    `${photoA} sidecar exposure ${a.settings?.light?.exposure}`,
+  );
+  assert(
+    near(b.settings?.light?.exposure, -0.6),
+    `${photoB} sidecar exposure ${b.settings?.light?.exposure}`,
+  );
+  assert(a.film?.grain?.amount !== b.film?.grain?.amount, "both sidecars carry the same grain");
+  const rows = rowsOf((await tool("list_photos", { filter: "edited" })).json).map((r) => r.id);
+  assert(rows.includes(photoA) && rows.includes(photoB), `edited filter ${rows.join(",")}`);
+  return `${photoA} ${a.settings.light.exposure} grain ${a.film?.grain?.amount}, ${photoB} ${b.settings.light.exposure} grain ${b.film?.grain?.amount}`;
+});
+
+await check("concurrency/same-photo", async () => {
+  const before = (await tool("history", { photo: photoA, action: "list" })).json;
+  const bump = () =>
+    tool(
+      "set_controls",
+      { photo: photoA, values: { "light.exposure": "+0.25" } },
+      { label: "set_controls(photo)" },
+    );
+  const [x, y] = await Promise.all([bump(), bump()]);
+  const values = [x, y].map((r) => r.json.set["light.exposure"]).toSorted((p, q) => p - q);
+  assert(near(values[0], 0.85) && near(values[1], 1.1), `answers ${values.join(", ")}`);
+  const after = (await tool("history", { photo: photoA, action: "list" })).json;
+  assert(after.steps === before.steps + 2, `steps ${before.steps} -> ${after.steps}`);
+  const tail = after.list.slice(-2).map(([i]) => i);
+  assert(tail[0] !== tail[1], `steps ${tail.join(", ")}`);
+  const edit = (await tool("get_edit", { photo: photoA })).json;
+  assert(near(exposureOf(edit), 1.1), `exposure ${exposureOf(edit)}, want 1.1`);
+  await wait(300);
+  const disk = sidecar(photoA).settings?.light?.exposure;
+  assert(near(disk, 1.1), `sidecar exposure ${disk}, want 1.1`);
+  return `${values.join(" then ")}; steps ${before.steps} -> ${after.steps}; sidecar ${disk}`;
+});
+
+await check("concurrency/hand-over", async () => {
+  const steps = (await tool("history", { photo: photoA, action: "list" })).json.steps;
+  await tool("open_photo", { id: photoA });
+  const edit = (await tool("get_edit")).json;
+  assert(near(exposureOf(edit), 1.1), `the window shows exposure ${exposureOf(edit)}, want 1.1`);
+  const s = (await tool("status")).json;
+  assert(s.photo?.id === photoA, `open photo ${s.photo?.id}`);
+  assert(!s.sessions?.includes(photoA), `${photoA} still has a session`);
+  assert(
+    s.history.steps === steps,
+    `window history ${s.history.steps} steps, session had ${steps}`,
+  );
+  await tool("history", { action: "undo" });
+  const undone = exposureOf((await tool("get_edit", { photo: photoA })).json);
+  assert(near(undone, 0.85), `undo in the window -> exposure ${undone}, want 0.85`);
+  return `window took ${steps} steps; undo -> ${undone}`;
+});
+
 console.log("\n# token report (tokens ~ bytes/4)");
 const byLabel = new Map();
 for (const u of usage) {

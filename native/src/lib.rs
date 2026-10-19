@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod cache;
 pub mod camera;
 pub mod develop;
 pub mod film;

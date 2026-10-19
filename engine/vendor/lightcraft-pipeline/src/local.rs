@@ -4,7 +4,7 @@
 use lightcraft_color::cct::{temp_tint_to_xy, wb_matrix, xy_to_temp_tint};
 use lightcraft_color::{REC2020, luminance_2020};
 use lightcraft_develop::{DevelopSettings, Process};
-use lightcraft_raster::blur::gaussian;
+use lightcraft_raster::blur::{self, gaussian};
 use std::sync::Arc;
 
 use lightcraft_raster::{Plane, Rgb32f, par_join};
@@ -220,13 +220,70 @@ pub fn median_hv(p: &Plane, r: usize) -> Plane {
     transpose(&rows(&transpose(&rows(p))))
 }
 
+/// Taps of the widest window [`median_row`] keeps on the stack (the base's [`BASE_DETAIL_MAX`] radius).
+const MEDIAN_TAPS: usize = 2 * BASE_DETAIL_MAX + 1;
+
+/// `f32::total_cmp`'s order as an integer: `key(a) < key(b)` exactly when `a.total_cmp(&b)` is `Less`.
+#[inline]
+fn median_key(v: f32) -> i32 {
+    let b = v.to_bits() as i32;
+    b ^ (((b >> 31) as u32) >> 1) as i32
+}
+
+#[inline]
+fn median_value(k: i32) -> f32 {
+    f32::from_bits((k ^ (((k >> 31) as u32) >> 1) as i32) as u32)
+}
+
 /// Running median of `src` over `2r+1` taps (clamped edges) into `out`: a sorted window that
 /// drops the leaving value and inserts the entering one.
+// why: Filmlab: the window as `total_cmp` keys in an array on the stack, the leaving and entering values placed by
+// counting the keys below them (no branches to mispredict) and the run between them shifted once: the window holds
+// the same sorted values as the binary searches and `Vec::remove`/`insert` kept, so every median is the same (a
+// full-size base's median took 260 ms, now 80)
 fn median_row(src: &[f32], out: &mut [f32], r: usize) {
     let n = src.len();
     if n == 0 {
         return;
     }
+    if 2 * r + 1 > MEDIAN_TAPS {
+        return median_row_wide(src, out, r);
+    }
+    let at = |i: isize| src[i.clamp(0, n as isize - 1) as usize];
+    let (r_, taps) = (r as isize, 2 * r + 1);
+    let mut win = [0i32; MEDIAN_TAPS];
+    for (k, i) in (-r_..=r_).enumerate() {
+        win[k] = median_key(at(i));
+    }
+    win[..taps].sort_unstable();
+    let below = |win: &[i32; MEDIAN_TAPS], k: i32| win[..taps].iter().map(|&v| usize::from(v < k)).sum::<usize>();
+    for (x, o) in out.iter_mut().enumerate() {
+        *o = median_value(win[r]);
+        let (old, new) = (at(x as isize - r_), at(x as isize + r_ + 1));
+        if old.to_bits() != new.to_bits() {
+            let (leaving, entering) = (median_key(old), median_key(new));
+            let (i, j) = (below(&win, leaving), below(&win, entering));
+            // (shifted in loops: `copy_within` called memmove to move a few values)
+            if entering < leaving {
+                let mut k = i;
+                while k > j {
+                    win[k] = win[k - 1];
+                    k -= 1;
+                }
+                win[j] = entering;
+            } else {
+                for k in i..j - 1 {
+                    win[k] = win[k + 1];
+                }
+                win[j - 1] = entering;
+            }
+        }
+    }
+}
+
+/// [`median_row`] for a window wider than [`MEDIAN_TAPS`].
+fn median_row_wide(src: &[f32], out: &mut [f32], r: usize) {
+    let n = src.len();
     let at = |i: isize| src[i.clamp(0, n as isize - 1) as usize];
     let r_ = r as isize;
     let mut win: Vec<f32> = (-r_..=r_).map(at).collect();
@@ -383,17 +440,24 @@ pub fn apply_nr(img: &mut Rgb32f, lum: Option<NrLum>, col: Option<NrColor>) {
     }
     if let Some(nr) = col {
         let _t = crate::profiling().then(std::time::Instant::now);
-        let chroma = img.map(|c| {
+        let chroma = |c: [f32; 3]| {
             let y = luminance_2020(c).max(1e-6);
             [c[0] / y, c[1] / y, c[2] / y]
+        };
+        // why: the chromaticity is blurred as it is computed (the blur's first half fills its rows) and mixed
+        // back in as the blur's last pass makes each row, with the pixel's own chromaticity worked out again
+        // from the same unchanged pixel: the same values as before without the chromaticity image, the blur's
+        // copy of it and its result (three full-size buffers and their passes)
+        let src = &*img;
+        let h = blur::gaussian_h(w, img.height, nr.sigma, |y, row: &mut [[f32; 3]]| {
+            for (o, c) in row.iter_mut().zip(src.row(y)) {
+                *o = chroma(*c);
+            }
         });
-        let b = gaussian(&chroma, nr.sigma);
-        for_rows(&mut img.data, w, |y, row| {
-            for (x, p) in row.iter_mut().enumerate() {
-                let i = y * w + x;
+        blur::gaussian_v_into(h, nr.sigma, &mut img.data, |_, blurred, row| {
+            for (p, cb) in row.iter_mut().zip(blurred) {
                 let yl = luminance_2020(*p);
-                let c0 = chroma.data[i];
-                let cb = b.data[i];
+                let c0 = chroma(*p);
                 *p = [0, 1, 2].map(|k| ((c0[k] + (cb[k] - c0[k]) * nr.t) * yl).max(0.0));
             }
         });
@@ -572,7 +636,7 @@ pub(crate) fn prepare(
         None => (None, 1.0),
     };
     let ev = s.light.exposure as f32;
-    let masks = timed("masks", || masks::evaluate(&s.masks, frame, img.width, img.height, &img, &log_l, ev, mattes));
+    let masks = Arc::new(timed("masks", || masks::evaluate(&s.masks, frame, img.width, img.height, &img, &log_l, ev, mattes)));
     Prepared { img, log_l, base, clarity_blur, texture_blur, dark, chroma_blur, air, masks, px_per_long }
 }
 

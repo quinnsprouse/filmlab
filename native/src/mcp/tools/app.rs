@@ -1,8 +1,11 @@
+use std::rc::Rc;
+
 use gpui_kit::{AppContext, AsyncApp};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Answer, Output, args};
+use crate::mcp::session::Hub;
 use crate::camera::{Camera, Zoom};
 use crate::develop::{Compare, Status, Tool};
 use crate::ui::app::Mode;
@@ -17,7 +20,8 @@ pub fn tool_name(tool: Tool) -> &'static str {
     }
 }
 
-pub fn status(driver: &Driver, cx: &mut AsyncApp) -> Answer {
+pub fn status(hub: &Hub, driver: &Driver, cx: &mut AsyncApp) -> Answer {
+    let sessions = hub.live();
     let value = driver
         .read(cx, |a, cx| {
             let library = a.library.read(cx);
@@ -54,6 +58,7 @@ pub fn status(driver: &Driver, cx: &mut AsyncApp) -> Answer {
                 "history": {"step": d.cursor, "steps": d.history.len(), "last": last},
                 "render": render,
                 "error": d.error,
+                "sessions": sessions,
             })
         })
         .ok_or("Filmlab's window is gone")?;
@@ -107,7 +112,7 @@ fn zoom_of(value: &Value, at: Option<[f64; 2]>, current: Camera) -> Result<Zoom,
     }
 }
 
-pub async fn view(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn view(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: View = args(value)?;
     let gone = "Filmlab's window is gone";
     if let Some(ids) = &p.select {
@@ -136,21 +141,26 @@ pub async fn view(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
         Some("after") => Some(Compare::After),
         Some(other) => return Err(format!("unknown compare {other}; use before or after")),
     };
+    let _window = hub.window().await;
     let develops = mode == Some(Mode::Develop);
     if develops {
-        let ok = driver
-            .act(cx, |a, cx| {
-                if a.develop.read(cx).photo_id.is_none() {
-                    let Some(id) = a.selected.clone() else { return false };
-                    a.open_photo(&id, cx);
-                } else {
-                    a.set_mode(Mode::Develop, cx);
-                }
-                true
+        let opens = driver.read(cx, |a, cx| a.develop.read(cx).photo_id.is_none().then(|| a.selected.clone())).ok_or(gone)?;
+        if opens == Some(None) {
+            return Err("no photo is open or selected; open_photo first".into());
+        }
+        // why: a photo an agent has open off screen finishes its running call and is saved before Develop reads it
+        let adopting = match opens.flatten() {
+            Some(id) => Some((hub.photo(&id).await, id)),
+            None => None,
+        };
+        driver
+            .act(cx, |a, cx| match a.develop.read(cx).photo_id.is_none().then(|| a.selected.clone()).flatten() {
+                Some(id) => a.open_photo(&id, cx),
+                None => a.set_mode(Mode::Develop, cx),
             })
             .ok_or(gone)?;
-        if !ok {
-            return Err("no photo is open or selected; open_photo first".into());
+        if let Some((_, id)) = &adopting {
+            hub.hand_over(driver, cx, id);
         }
     }
     let in_develop = driver.read(cx, |a, _| a.mode == Mode::Develop).ok_or(gone)?;
@@ -197,11 +207,12 @@ pub async fn view(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
         let detail = driver.read(cx, |a, cx| a.is_zoomed(cx)).unwrap_or(false);
         driver.settled(cx, detail).await;
     }
-    status(driver, cx)
+    status(hub, driver, cx)
 }
 
-pub async fn screenshot(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn screenshot(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Shot = args(value)?;
+    let _window = hub.window().await;
     let edge = p.max_edge.unwrap_or(1280).clamp(256, 2048);
     let number = driver
         .on_window(cx, |window, _| crate::glass::renderer_view(window).and_then(|v| v.window()).map(|w| w.windowNumber()))

@@ -3,7 +3,7 @@ name = "lightcraft-pipeline"
 version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "LightCraft's develop pipeline (vendored at f34c7a8) with Filmlab's film-stage hook"
+description = "LightCraft's develop pipeline (vendored at f34c7a8) with Filmlab's film-stage hook and faster colour and noise stages (bit-identical)"
 
 [dependencies]
 lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }

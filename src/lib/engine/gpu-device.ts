@@ -34,7 +34,6 @@ const entries = [
   "pyramidReduce",
   "pyramidBlur",
   "pyramidExpand",
-  "pyramidAdd",
   "pyramidCombine",
 ];
 

@@ -13,7 +13,12 @@ use gpui_kit::*;
 static ALLOCATOR: MiMalloc = MiMalloc;
 
 fn main() {
+    filmlab::ui::bench::mark_launch();
+    let opening = std::time::Instant::now();
     let gpu = Gpu::open();
+    if std::env::var_os("FILMLAB_TRACE").is_some() {
+        eprintln!("gpu open {:.1} ms", opening.elapsed().as_secs_f64() * 1000.0);
+    }
     if let Some(gpu) = &gpu {
         filmlab::gpu::share(gpu);
         // why: FILMLAB_CPU=1 keeps the film stage on the CPU, to compare against the GPU path
@@ -22,7 +27,7 @@ fn main() {
         }
     }
     // why: scripted runs (the end-to-end test, MCP test launches with FILMLAB_BACKGROUND=1) leave the user's focus alone
-    let e2e = std::env::var_os("FILMLAB_E2E").is_some() || std::env::var_os("FILMLAB_BACKGROUND").is_some();
+    let e2e = ["FILMLAB_E2E", "FILMLAB_BACKGROUND", "FILMLAB_BENCH"].iter().any(|k| std::env::var_os(k).is_some());
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         let _ = cx.text_system().add_fonts(fonts());
@@ -32,7 +37,9 @@ fn main() {
         theme_now.font_family = theme::FONT.into();
         bind(cx);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1480.), px(940.)), cx))),
+            // why: macOS stops presenting a window that's fully covered, and a scripted run opens behind the user's own
+            // (centred) Filmlab window, so it sits at the top left where it's never wholly hidden
+            window_bounds: Some(WindowBounds::Windowed(if e2e { Bounds::new(point(px(0.), px(0.)), size(px(1480.), px(940.))) } else { Bounds::centered(None, size(px(1480.), px(940.)), cx) })),
             titlebar: Some(TitlebarOptions { title: Some("Filmlab".into()), appears_transparent: true, traffic_light_position: Some(point(px(18.), px(26.))) }),
             window_background: WindowBackgroundAppearance::Transparent,
             window_min_size: Some(size(px(900.), px(600.))),
@@ -43,6 +50,7 @@ fn main() {
         let (window, app) = gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| FilmlabApp::new(gpu, window, cx))).expect("window");
         filmlab::ui::soak::start(&app, cx);
         filmlab::ui::e2e::start(&app, window, cx);
+        filmlab::ui::bench::start(&app, window, cx);
         filmlab::mcp::start(&app, window, cx);
         if !e2e {
             cx.activate(true);

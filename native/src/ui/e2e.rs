@@ -291,6 +291,17 @@ async fn edits(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     run.check("edit: history step 0 is the opened photo", first.is_some_and(|l| l.hash == before.hash), format!("{history} steps"));
     run.develop(cx, |d, cx| d.go_to(history.saturating_sub(1), cx));
     run.verify(cx, "edit: back to the latest history step matches", false).await;
+
+    // why: an agent's change stays marked in the inspector until you change that control yourself
+    run.develop(cx, |d, cx| d.command("develop.set", json!({"values": {"light.shadows": 30}}), "Open shadows", "agent.e2e.0", cx));
+    let marked = run.read(cx, |a, cx| a.develop.read(cx).agent_marks.contains_key("light.shadows")).unwrap_or(false);
+    run.develop(cx, |d, cx| d.edit_controls(&[("light.shadows", 35.0)], "Shadows", cx));
+    let cleared = run.read(cx, |a, cx| !a.develop.read(cx).agent_marks.contains_key("light.shadows")).unwrap_or(false);
+    run.develop(cx, |d, cx| d.undo(cx));
+    let back = run.read(cx, |a, cx| a.develop.read(cx).agent_marks.contains_key("light.shadows")).unwrap_or(false);
+    run.check("edit: an agent's change is marked until you take it over", marked && cleared && back, format!("marked {marked}, cleared {cleared}, marked again after undo {back}"));
+    run.develop(cx, |d, cx| d.undo(cx));
+    run.verify(cx, "edit: undoing the agent's change matches", false).await;
 }
 
 async fn film(run: &mut Run, cx: &mut AsyncApp) {

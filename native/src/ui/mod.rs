@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod app;
+pub mod bench;
 pub mod browse;
 pub mod controls;
 pub mod driver;

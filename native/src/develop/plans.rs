@@ -84,7 +84,7 @@ fn level_for(shown_long: f64) -> Level {
     if shown_long > PREVIEW_EDGE { Level::Full } else { Level::Preview }
 }
 
-fn fit_plan(inputs: &Inputs, viewport: Size) -> Plan {
+pub fn fit_plan(inputs: &Inputs, viewport: Size) -> Plan {
     let fit = fit_scale(inputs.native, viewport);
     let view = json!({
         "maxW": viewport.width.round().max(1.0) as usize,
@@ -123,6 +123,21 @@ fn detail_plan(inputs: &Inputs, camera: Camera, viewport: Size) -> Plan {
     });
     let region = Region { u0: x / full_w, v0: y / full_h, u1: (x + width) / full_w, v1: (y + height) / full_h };
     inputs.plan(Layer::Detail, level_for(full_w.max(full_h)), view, region)
+}
+
+/// The fit plan drawn while a slider moves: half the size, a quarter of the pixels, with its own stage cache so the
+/// full-size one is still warm when the slider stops.
+pub fn draft_plan(fit: &Plan) -> Plan {
+    let mut view = fit.view.clone();
+    for k in ["maxW", "maxH"] {
+        view[k] = json!((view[k].as_f64().unwrap_or(1.0) / 2.0).round().max(1.0) as usize);
+    }
+    view["stages"] = json!("draft");
+    Plan { view, ..fit.clone() }
+}
+
+pub fn is_draft(plan: &Plan) -> bool {
+    plan.view["stages"] == "draft"
 }
 
 pub fn same_look(a: &Plan, b: &Plan) -> bool {

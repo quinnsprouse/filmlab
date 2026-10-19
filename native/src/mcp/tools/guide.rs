@@ -11,6 +11,9 @@ command for crop / masks / healing / white balance and anything else LightCraft 
 undo step (history) and is saved to the photo's XMP sidecar automatically.
 Look closely: preview region=[x0,y0,x1,y1] (0-1 of the cropped frame) renders that area at full detail; analyze gives numbers \
 for the same region. view drives the window (zoom, tool, mode) when you want the user to see something.
+Other photos: get_edit, set_controls, set_film, command, history, snapshots, profiles, preview and analyze take photo=<id> to \
+work on that photo without opening it (its own history; saved like any edit; status lists them under sessions). Without photo \
+they act on the open photo. Calls on different photos run at the same time; calls on one photo run in order.
 Keep states: snapshots save/restore named states of one photo; profiles save a look to apply to other photos (amount 0-200%).
 Finish with export when asked. Prefer small steps and check each with preview or analyze.";
 

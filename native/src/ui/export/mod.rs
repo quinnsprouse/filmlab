@@ -140,7 +140,7 @@ fn start(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>) {
         return;
     }
     app.develop.update(cx, |d, cx| d.flush(cx));
-    let planned = run::jobs_for(app.library.read(cx), &ids);
+    let planned = run::jobs_for(app.library.read(cx), app.develop.read(cx), &ids, &app.export.choices);
     let state = &mut app.export;
     state.token += 1;
     state.cancel = Arc::default();
@@ -186,9 +186,10 @@ fn spawn_worker(queue: Arc<Mutex<VecDeque<Job>>>, run: Worker, cx: &mut Context<
             let (engine, task) = (engine.clone(), job.clone());
             let result = cx
                 .background_spawn(async move {
+                    let decoded = task.loupe().and_then(run::Loupe::decoded);
                     let mut engine = engine.lock().map_err(|e| e.to_string())?;
                     let engine = &mut *engine;
-                    crate::perf::initiated(|| run::export_one(engine, &task, &choices, None))
+                    crate::perf::initiated(|| run::export_one(engine, &task, &choices, None, decoded))
                 })
                 .await;
             let alive = this.update(cx, |app, cx| {

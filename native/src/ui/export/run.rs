@@ -1,10 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use filmlab_engine::core::{self, Engine};
+use filmlab_engine::core::{self, Decoded, Engine};
 use serde_json::{Value, json};
 
+use crate::develop::Develop;
 use crate::film::render_film;
 use crate::library::{self, Library, PhotoRecord};
 
@@ -76,6 +78,28 @@ pub struct Job {
     facts: String,
     state: String,
     film: String,
+    loupe: Option<Loupe>,
+}
+
+/// The loupe's decode of the photo at the size its export decodes to.
+#[derive(Clone)]
+pub struct Loupe {
+    engine: Arc<Mutex<Engine>>,
+    key: String,
+}
+
+impl Loupe {
+    /// The decode, shared rather than copied, if the loupe still holds it. Takes the loupe's engine lock, so it is
+    /// called outside the render pools.
+    pub fn decoded(&self) -> Option<Decoded> {
+        self.engine.lock().ok()?.decoded(&self.key)
+    }
+}
+
+impl Job {
+    pub fn loupe(&self) -> Option<&Loupe> {
+        self.loupe.as_ref()
+    }
 }
 
 pub fn job_of(record: &PhotoRecord) -> Result<Job, String> {
@@ -90,11 +114,25 @@ pub fn job_of(record: &PhotoRecord) -> Result<Job, String> {
         facts: probed.facts.to_string(),
         state: serde_json::to_string(state).map_err(|e| e.to_string())?,
         film: film.to_string(),
+        loupe: None,
     })
 }
 
-pub fn jobs_for(library: &Library, ids: &[String]) -> Vec<(String, Result<Job, String>)> {
-    ids.iter().map(|id| (id.clone(), library.record(id).ok_or_else(|| "The photo is no longer in the folder.".to_string()).and_then(job_of))).collect()
+fn max_edge(job: &Job, choices: &Choices) -> Result<usize, String> {
+    let plan: Value = serde_json::from_str(&core::export_plan(&job.facts, &job.state, &choices.options())?).map_err(|e| e.to_string())?;
+    Ok(plan["maxEdge"].as_u64().unwrap_or(0) as usize)
+}
+
+// why: the photo open in Develop is usually already decoded at full size (about 300 MB for 24 MP), so its export
+// shares that decode instead of making a second one
+pub fn jobs_for(library: &Library, develop: &Develop, ids: &[String], choices: &Choices) -> Vec<(String, Result<Job, String>)> {
+    let job = |id: &String| -> Result<Job, String> {
+        let mut job = job_of(library.record(id).ok_or("The photo is no longer in the folder.")?)?;
+        let loupe = max_edge(&job, choices).ok().and_then(|edge| develop.decode_at(id, edge));
+        job.loupe = loupe.map(|(engine, key)| Loupe { engine, key });
+        Ok(job)
+    };
+    ids.iter().map(|id| (id.clone(), job(id))).collect()
 }
 
 // why: the web app overwrites; the native app keeps earlier exports by numbering the new file instead
@@ -112,14 +150,19 @@ fn create_unique(folder: &Path, stem: &str, extension: &str) -> Result<(PathBuf,
     Err("Too many exports of this photo already exist.".into())
 }
 
-pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices, folder: Option<&Path>) -> Result<PathBuf, String> {
+/// Exports `job`, from `decoded` (the loupe's decode at the export's size) when given.
+pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices, folder: Option<&Path>, decoded: Option<Decoded>) -> Result<PathBuf, String> {
     let options = choices.options();
-    let plan: Value = serde_json::from_str(&core::export_plan(&job.facts, &job.state, &options)?).map_err(|e| e.to_string())?;
-    let max_edge = plan["maxEdge"].as_u64().unwrap_or(0) as usize;
     let bytes = std::fs::read(&job.path).map_err(|e| format!("Couldn't read the photo: {e}"))?;
     let film = serde_json::from_str::<Value>(&job.film).ok().and_then(|v| crate::film::FilmSettings::of(&v));
     library::ensure_luts(engine, film.as_ref())?;
-    engine.load(KEY, &job.facts, &bytes, max_edge)?;
+    match decoded {
+        Some(decoded) => {
+            engine.insert(KEY, decoded);
+            engine.read_original(KEY, &bytes);
+        }
+        None => engine.load(KEY, &job.facts, &bytes, max_edge(job, choices)?)?,
+    }
     let encoded = engine.export(KEY, &job.facts, &job.state, &options, &job.film);
     engine.release(KEY);
     let encoded = encoded?;

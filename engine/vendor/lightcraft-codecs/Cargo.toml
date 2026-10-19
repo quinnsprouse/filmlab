@@ -1,0 +1,45 @@
+[package]
+name = "lightcraft-codecs"
+version = "0.8.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "LightCraft standard image codecs (vendored at f34c7a8) with Filmlab's banded parallel DCT-scaled JPEG decode"
+
+[dependencies]
+lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-color = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
+lightcraft-heif = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f", optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = { version = "2" }
+rayon = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "webp", "gif", "bmp"] }
+zune-jpeg = { version = "0.5", default-features = false, features = ["std", "x86", "neon"] }
+zune-core = { version = "0.5", default-features = false, features = ["std"] }
+jpeg-decoder = { version = "0.3", default-features = false }
+jpeg-encoder = { version = "0.7", default-features = false, features = ["std"] }
+png = { version = "0.18" }
+tiff = { version = "0.11" }
+image-webp = { version = "0.2" }
+moxcms = { version = "0.9", default-features = false, features = ["lut"] }
+jxl-oxide = { version = "0.12", default-features = false, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ravif = { version = "0.13", default-features = false, features = ["threading"], optional = true }
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
+avif-serialize = { version = "0.8.6", optional = true }
+# spawns threads of its own (std::thread), which wasm32 has not got
+jixel = { version = "=0.3.4", optional = true }
+
+[features]
+default = ["parallel", "jxl", "avif"]
+parallel = ["dep:rayon", "lightcraft-raster/parallel", "jpeg-decoder/rayon"]
+## JPEG XL decode (jxl-oxide) and, on native targets, encode (jixel); both pure Rust.
+jxl = ["dep:jxl-oxide", "dep:jixel"]
+# HEIC/HEIF decode via the optional lightcraft-heif crate (heic-rs, pure Rust). Off by default so
+# distributors choose it at build time (HEVC patents are a distributor's call, same policy as
+# PhotoCraft); `cargo xtask ci` clippies and tests it (`--features heif`), releases don't ship it yet.
+heif = ["dep:lightcraft-heif"]
+## AVIF encoding via ravif/rav1e (pure Rust, BSD). Native targets only; a no-op on wasm32.
+avif = ["dep:ravif", "dep:rav1e", "dep:avif-serialize"]

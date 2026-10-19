@@ -4,7 +4,7 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::OnceLock;
 
-use lightcraft_color::perceptual::{hsv_to_rgb, lab_to_lch, lch_to_lab, oklab_from_2020, oklab_to_2020};
+use lightcraft_color::perceptual::{hsv_to_rgb, lab_to_lch, lch_to_lab, oklab_from_2020, oklab_matrices, oklab_to_2020};
 use lightcraft_color::{Mat3, REC2020, SRGB};
 use lightcraft_develop::{Calibration, DevelopSettings, MIXER_HUES, PointColor};
 
@@ -24,19 +24,48 @@ pub fn band_hues() -> &'static [f32; 8] {
 
 #[inline]
 fn wrap(a: f32) -> f32 {
-    (a + PI).rem_euclid(TAU) - PI
+    rem_tau(a + PI) - PI
+}
+
+/// `x.rem_euclid(TAU)`, bit for bit.
+// why: `%` on floats is a call to fmodf, made several times per pixel by the hue arithmetic below; for
+// |x| < TAU `x % TAU` is `x` itself, and for TAU < |x| < 2·TAU it is `x ∓ TAU`, which that subtraction gives
+// exactly (Sterbenz), so only other values (±TAU, larger, not finite) still take the call
+#[inline]
+fn rem_tau(x: f32) -> f32 {
+    let a = x.abs();
+    let r = if a < TAU {
+        x
+    } else if a > TAU && a < 2.0 * TAU {
+        x - TAU.copysign(x)
+    } else {
+        x % TAU
+    };
+    if r < 0.0 { r + TAU } else { r }
+}
+
+/// The span (radians) from each colour-mixer band centre to the next.
+// why: the spans are fixed, but `band_weights` worked them out again for every band it tried, on every pixel
+fn band_spans() -> &'static [f32; 8] {
+    static S: OnceLock<[f32; 8]> = OnceLock::new();
+    S.get_or_init(|| {
+        let hues = band_hues();
+        std::array::from_fn(|i| wrap(hues[(i + 1) % 8] - hues[i]).rem_euclid(TAU))
+    })
 }
 
 /// Partition-of-unity weights of hue `h` over the 8 bands (raised cosine between neighbours).
 #[inline]
 pub fn band_weights(h: f32) -> [f32; 8] {
-    let hues = band_hues();
+    weights_in(band_hues(), band_spans(), h)
+}
+
+#[inline]
+fn weights_in(hues: &[f32; 8], spans: &[f32; 8], h: f32) -> [f32; 8] {
     let mut w = [0.0f32; 8];
     for i in 0..8 {
-        let a = hues[i];
-        let b = hues[(i + 1) % 8];
-        let span = wrap(b - a).rem_euclid(TAU);
-        let d = wrap(h - a).rem_euclid(TAU);
+        let span = spans[i];
+        let d = rem_tau(wrap(h - hues[i]));
         if d <= span {
             let t = d / span;
             let s = 0.5 - 0.5 * (t * PI).cos();
@@ -144,6 +173,15 @@ pub struct ColorOps {
     pub grading: Option<([WheelK; 4], f32, f32)>,
     /// OkLCh hue of skin tones (protected by vibrance).
     pub skin: f32,
+    // why: per-render constants of the per-pixel path, fetched once here instead of per pixel: the OkLab
+    // matrices (behind a lock-free once-cell that kept the compiler from hoisting them), the band hues and
+    // spans, the skin hue's direction (see `skin_weight`) and which path `apply` takes
+    ok: [[[f32; 3]; 3]; 4],
+    hues: [f32; 8],
+    spans: [f32; 8],
+    skin_dir: [f32; 2],
+    identity: bool,
+    chroma_only: bool,
 }
 
 fn wheel(w: &lightcraft_develop::Wheel) -> WheelK {
@@ -156,7 +194,8 @@ impl ColorOps {
     pub fn new(s: &DevelopSettings) -> ColorOps {
         let bands = s.mixer.bands();
         let g = &s.grading;
-        ColorOps {
+        let skin = oklch_hue_of_srgb_hue(25.0);
+        let mut ops = ColorOps {
             vibrance: (s.color.vibrance / 100.0) as f32,
             saturation: (s.color.saturation / 100.0) as f32,
             hue: bands.map(|b| (b.hue / 100.0) as f32 * 0.5),
@@ -176,30 +215,182 @@ impl ColorOps {
                     (g.balance / 100.0) as f32,
                 )
             }),
-            skin: oklch_hue_of_srgb_hue(25.0),
-        }
+            skin,
+            ok: oklab_matrices(),
+            hues: *band_hues(),
+            spans: *band_spans(),
+            skin_dir: [skin.cos(), skin.sin()],
+            identity: false,
+            chroma_only: false,
+        };
+        ops.identity = ops.is_identity();
+        ops.chroma_only = !ops.mixer && ops.points.is_empty() && ops.bw.is_none();
+        ops
     }
 
     pub fn is_identity(&self) -> bool {
         self.vibrance == 0.0 && self.saturation == 0.0 && !self.mixer && self.points.is_empty() && self.bw.is_none() && self.grading.is_none()
     }
 
+    /// Vibrance's skin protection (1 = none) of an OkLab colour whose chroma is `c0`.
+    // why: away from skin tones the protection is exactly 1: once the hue is over 82° from skin's,
+    // 0.6·exp(−(Δh/0.35)²) is below half a unit in the last place of 1, so `1 − …` rounds to 1. A hue on the
+    // far side of the perpendicular to skin's direction (a negative dot product with it, which rounding can't
+    // fake by more than about 1e-6 rad once the chroma is above 1e-6) is at least 90° away: there the result is
+    // 1 without the atan2, rem_euclid and exp, bit for bit
+    #[inline]
+    fn skin_weight(&self, lab: [f32; 3], c0: f32) -> f32 {
+        if c0 > 1e-6 && lab[1] * self.skin_dir[0] + lab[2] * self.skin_dir[1] < 0.0 {
+            return 1.0;
+        }
+        1.0 - 0.6 * (-(wrap(lab[2].atan2(lab[1]) - self.skin) / 0.35).powi(2)).exp()
+    }
+
     /// `local_sat` (−1..1) and `local_hue` (radians) come from masks.
     #[inline]
     pub fn apply(&self, rgb: [f32; 3], local_sat: f32, local_hue: f32) -> [f32; 3] {
-        if self.is_identity() && local_sat == 0.0 && local_hue == 0.0 {
+        if self.identity && local_sat == 0.0 && local_hue == 0.0 {
             return rgb;
         }
-        let lab = oklab_from_2020(rgb);
+        self.apply_lab(oklab_from(&self.ok, rgb), local_sat, local_hue)
+    }
+
+    /// [`Self::apply`] without local adjustments on a row of colours, in place, bit for bit.
+    // why: done in passes over the row, the OkLab conversion (with an inline copy of the platform's cube root,
+    // see `cbrt_row`) and the chroma-only path vectorise, and only the hues vibrance's skin protection can
+    // act on take the scalar atan2
+    pub fn apply_row(&self, row: &mut [[f32; 3]]) {
+        if self.identity {
+            return;
+        }
+        let m = &self.ok;
+        for p in row.iter_mut() {
+            *p = mul(&m[0], *p);
+        }
+        cbrt_row(row.as_flattened_mut());
+        for p in row.iter_mut() {
+            *p = mul(&m[2], *p);
+        }
+        if !self.chroma_only {
+            self.apply_row_lch(row);
+            return;
+        }
+        // (the chroma-only path of `apply_lab` with `local_sat` 0, the skin protection worked out first)
+        let mut skin = vec![1.0f32; row.len()];
+        if self.vibrance > 0.0 {
+            for (s, lab) in skin.iter_mut().zip(row.iter()) {
+                *s = self.skin_weight(*lab, (lab[1] * lab[1] + lab[2] * lab[2]).sqrt());
+            }
+        }
+        for (lab, skin) in row.iter_mut().zip(&skin) {
+            let c0 = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
+            let mut c = c0;
+            if self.vibrance != 0.0 {
+                let low = 1.0 - (c / 0.22).clamp(0.0, 1.0);
+                c *= (1.0 + self.vibrance * low * low * skin * 1.2).max(0.0);
+            }
+            if self.saturation != 0.0 {
+                c *= (1.0 + self.saturation + 0.0).max(0.0);
+            }
+            if c0 > 0.0 {
+                let k = c / c0;
+                lab[1] *= k;
+                lab[2] *= k;
+            }
+        }
+        // (`grade` in two passes of its own, so that the loops above and below stay free of calls)
+        if self.grading.is_some() {
+            for lab in row.iter_mut() {
+                *lab = self.wheels(*lab);
+            }
+        }
+        for p in row.iter_mut() {
+            *p = oklab_to(m, *p);
+        }
+    }
+
+    /// [`Self::apply_lab`] with no local values on a row of OkLab colours, in place, bit for bit: the OkLCh path.
+    // why: Filmlab: in passes over the row, so that the sums between the hue's atan2, sin and cos and the band
+    // weights' cos (still a call per pixel) run over the row at once and vectorise; each pixel's steps and their
+    // order are `apply_lab`'s
+    fn apply_row_lch(&self, row: &mut [[f32; 3]]) {
+        for p in row.iter_mut() {
+            *p = lab_to_lch(*p);
+        }
+        if self.mixer {
+            let weights: Vec<[f32; 8]> = row.iter().map(|p| weights_in(&self.hues, &self.spans, p[2])).collect();
+            for (p, w) in row.iter_mut().zip(&weights) {
+                let [mut l, mut c, mut h] = *p;
+                let (mut dh, mut ds, mut dl) = (0.0, 0.0, 0.0);
+                for i in 0..8 {
+                    dh += w[i] * self.hue[i];
+                    ds += w[i] * self.sat[i];
+                    dl += w[i] * self.lum[i];
+                }
+                let chroma_w = (c / 0.12).min(1.0);
+                h += dh * chroma_w;
+                c *= (1.0 + ds).max(0.0);
+                l += dl * chroma_w * l.max(0.05).sqrt();
+                *p = [l, c, h];
+            }
+        }
+        for p in row.iter_mut() {
+            for k in &self.points {
+                *p = k.apply(*p);
+            }
+        }
+        if self.vibrance != 0.0 {
+            let skin: Vec<f32> = if self.vibrance > 0.0 {
+                row.iter().map(|p| 1.0 - 0.6 * (-(wrap(p[2] - self.skin) / 0.35).powi(2)).exp()).collect()
+            } else {
+                vec![1.0; row.len()]
+            };
+            for (p, skin) in row.iter_mut().zip(skin) {
+                let low = 1.0 - (p[1] / 0.22).clamp(0.0, 1.0);
+                p[1] *= (1.0 + self.vibrance * low * low * skin * 1.2).max(0.0);
+            }
+        }
+        if self.saturation != 0.0 {
+            for p in row.iter_mut() {
+                p[1] *= (1.0 + self.saturation + 0.0).max(0.0);
+            }
+        }
+        for p in row.iter_mut() {
+            p[2] += 0.0;
+        }
+        if let Some(bw) = &self.bw {
+            for p in row.iter_mut() {
+                let [l, c, h] = *p;
+                let w = weights_in(&self.hues, &self.spans, h);
+                let mix: f32 = (0..8).map(|i| w[i] * bw[i]).sum();
+                *p = [(l + mix * (c / 0.2).min(1.0) * 0.25).max(0.0), 0.0, h];
+            }
+        }
+        for p in row.iter_mut() {
+            *p = lch_to_lab(*p);
+        }
+        if self.grading.is_some() {
+            for p in row.iter_mut() {
+                *p = self.wheels(*p);
+            }
+        }
+        for p in row.iter_mut() {
+            *p = oklab_to(&self.ok, *p);
+        }
+    }
+
+    /// [`Self::apply`] from the colour's OkLab.
+    #[inline]
+    fn apply_lab(&self, lab: [f32; 3], local_sat: f32, local_hue: f32) -> [f32; 3] {
         // only chroma changes (vibrance / saturation, maybe grading): scale a, b directly — the same
         // result as the OkLCh round trip without its sin / cos (and atan2 unless vibrance needs the hue)
-        if !self.mixer && self.points.is_empty() && self.bw.is_none() && local_hue == 0.0 {
+        if self.chroma_only && local_hue == 0.0 {
             let mut lab = lab;
             let c0 = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
             let mut c = c0;
             if self.vibrance != 0.0 {
                 let low = 1.0 - (c / 0.22).clamp(0.0, 1.0);
-                let skin = if self.vibrance > 0.0 { 1.0 - 0.6 * (-(wrap(lab[2].atan2(lab[1]) - self.skin) / 0.35).powi(2)).exp() } else { 1.0 };
+                let skin = if self.vibrance > 0.0 { self.skin_weight(lab, c0) } else { 1.0 };
                 c *= (1.0 + self.vibrance * low * low * skin * 1.2).max(0.0);
             }
             if self.saturation != 0.0 || local_sat != 0.0 {
@@ -214,7 +405,7 @@ impl ColorOps {
         }
         let [mut l, mut c, mut h] = lab_to_lch(lab);
         if self.mixer {
-            let w = band_weights(h);
+            let w = weights_in(&self.hues, &self.spans, h);
             let (mut dh, mut ds, mut dl) = (0.0, 0.0, 0.0);
             for i in 0..8 {
                 dh += w[i] * self.hue[i];
@@ -239,7 +430,7 @@ impl ColorOps {
         }
         h += local_hue;
         if let Some(bw) = &self.bw {
-            let w = band_weights(h);
+            let w = weights_in(&self.hues, &self.spans, h);
             let mix: f32 = (0..8).map(|i| w[i] * bw[i]).sum();
             l = (l + mix * (c / 0.2).min(1.0) * 0.25).max(0.0);
             c = 0.0;
@@ -249,7 +440,13 @@ impl ColorOps {
 
     /// Colour grading on OkLab, then back to linear Rec.2020.
     #[inline]
-    fn grade(&self, mut lab: [f32; 3]) -> [f32; 3] {
+    fn grade(&self, lab: [f32; 3]) -> [f32; 3] {
+        oklab_to(&self.ok, self.wheels(lab))
+    }
+
+    /// The colour grading wheels' shifts of an OkLab colour.
+    #[inline]
+    fn wheels(&self, mut lab: [f32; 3]) -> [f32; 3] {
         if let Some((wheels, blending, balance)) = &self.grading {
             let m = 0.5 - balance * 0.25;
             let width = 0.15 + blending * 0.5;
@@ -262,8 +459,65 @@ impl ColorOps {
                 lab[0] += k.lum * wt;
             }
         }
-        oklab_to_2020(lab)
+        lab
     }
+}
+
+#[inline]
+fn mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+/// `oklab_from_2020` with its matrices passed in ([`oklab_matrices`]), bit for bit.
+#[inline]
+fn oklab_from(m: &[[[f32; 3]; 3]; 4], rgb: [f32; 3]) -> [f32; 3] {
+    mul(&m[2], mul(&m[0], rgb).map(f32::cbrt))
+}
+
+/// `oklab_to_2020` with its matrices passed in, bit for bit.
+#[inline]
+fn oklab_to(m: &[[[f32; 3]; 3]; 4], lab: [f32; 3]) -> [f32; 3] {
+    mul(&m[1], mul(&m[3], lab).map(|v| v * v * v))
+}
+
+/// `f32::cbrt` of every value, in place, bit for bit.
+// why: the platform's cbrtf is a call per value; `cbrt_normal` is the same function inline (the compiler
+// vectorises the loop below). Zeros are their own cube root, and a row holding any other value that isn't a
+// normal float (subnormal, infinite, NaN) takes the platform's cbrtf throughout
+fn cbrt_row(v: &mut [f32]) {
+    let special = v.iter().fold(false, |any, x| {
+        let a = x.to_bits() & 0x7fff_ffff;
+        any | (a != 0 && !(0x0080_0000..0x7f80_0000).contains(&a))
+    });
+    if special {
+        for x in v.iter_mut() {
+            *x = x.cbrt();
+        }
+        return;
+    }
+    for x in v.iter_mut() {
+        *x = if *x == 0.0 { *x } else { cbrt_normal(*x) };
+    }
+}
+
+/// The cube root of a normal float: FreeBSD's / musl's `cbrtf` (a 5-bit estimate from the exponent, then two
+/// Halley steps in f64). It is correctly rounded on every normal float (checked exactly over all of them), and
+/// equals macOS's cbrtf and the `libm` crate's (what Rust links on wasm32) on all 2^32 inputs.
+#[inline]
+fn cbrt_normal(x: f32) -> f32 {
+    const B1: u32 = 709_958_130;
+    let ui = x.to_bits();
+    let t = f32::from_bits((ui & 0x8000_0000) | ((ui & 0x7fff_ffff) / 3 + B1)) as f64;
+    let xd = x as f64;
+    let r = t * t * t;
+    let t = t * (xd + xd + r) / (xd + r + r);
+    let r = t * t * t;
+    let t = t * (xd + xd + r) / (xd + r + r);
+    t as f32
 }
 
 /// Hue rotation (OkLCh radians) of a calibration primary at ±100.

@@ -78,6 +78,15 @@ pub struct TextureParams {
     pub halation: Option<HalationParams>,
 }
 
+impl TextureParams {
+    pub fn with_ceiling(mut self, ceiling: f32) -> TextureParams {
+        if let Some(h) = &mut self.halation {
+            h.ceiling = ceiling;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Tap {
     pub(crate) lo: usize,
@@ -234,6 +243,11 @@ fn on_grid(x: f32, table: &[f32]) -> f32 {
     let t = x.clamp(0.0, 1.0) * steps;
     let i = (t as usize).min(table.len() - 2);
     table[i] + (table[i + 1] - table[i]) * (t - i as f32)
+}
+
+/// The tone stage's value for a flat field at code `x`.
+pub(crate) fn flat_tone(x: f32) -> f32 {
+    tone(x, 0.0)
 }
 
 fn tone(q: f32, d: f32) -> f32 {

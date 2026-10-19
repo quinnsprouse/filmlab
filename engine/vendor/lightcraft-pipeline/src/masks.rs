@@ -8,6 +8,7 @@
 
 use lightcraft_develop::{BrushStroke, LocalAdjustments, Mask, MaskOp, MaskShape, SegMask};
 use lightcraft_geom::{Orientation, Point};
+use rayon::prelude::*;
 use lightcraft_raster::{Image, Plane, Rgb32f};
 
 use crate::for_rows;
@@ -105,6 +106,13 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Filmlab: whether `kept` are the masks [`evaluate`] makes of `masks` for a `w × h` render: the visible ones with
+/// components, in order, with the same adjustments, and alphas of that size.
+pub fn same_masks(kept: &[Evaluated], masks: &[Mask], w: usize, h: usize) -> bool {
+    let mut wanted = masks.iter().filter(|m| m.visible && !m.components.is_empty());
+    kept.iter().all(|k| (k.alpha.width, k.alpha.height) == (w, h) && wanted.next().is_some_and(|m| m.id == k.id && m.adjust == k.adjust)) && wanted.next().is_none()
+}
+
 /// The visible masks with components, evaluated in order (`mattes`: the source's, see [`Mattes`]).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(masks: &[Mask], frame: &Frame, w: usize, h: usize, img: &Rgb32f, log_l: &Plane, ev: f32, mattes: Option<&Mattes>) -> Vec<Evaluated> {
@@ -124,20 +132,20 @@ pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, l
     for comp in &m.components {
         let mut c = shape_alpha(&comp.shape, frame, w, h, img, log_l, ev, mattes);
         if comp.invert {
-            c.data.iter_mut().for_each(|v| *v = 1.0 - *v);
+            c.data.par_iter_mut().for_each(|v| *v = 1.0 - *v);
         }
         if first && comp.op != MaskOp::Intersect {
             alpha = c;
             first = false;
             continue;
         }
-        for (a, c) in alpha.data.iter_mut().zip(&c.data) {
+        alpha.data.par_iter_mut().zip(c.data.par_iter()).for_each(|(a, c)| {
             *a = match comp.op {
                 MaskOp::Add => a.max(*c),
                 MaskOp::Subtract => *a * (1.0 - c),
                 MaskOp::Intersect => *a * c,
             };
-        }
+        });
         first = false;
     }
     if m.refine > 0.0 {
@@ -146,16 +154,14 @@ pub fn evaluate_one(m: &Mask, frame: &Frame, w: usize, h: usize, img: &Rgb32f, l
         let k = (m.refine / 100.0).clamp(0.0, 1.0) as f32;
         let sigma = (0.04 * frame.output_long(w, h) as f32 * k).max(1.0);
         let refined = guided_cross(log_l, &alpha, sigma, 0.02);
-        for (a, r) in alpha.data.iter_mut().zip(&refined.data) {
-            *a += (r - *a) * k.sqrt();
-        }
+        alpha.data.par_iter_mut().zip(refined.data.par_iter()).for_each(|(a, r)| *a += (r - *a) * k.sqrt());
     }
     if m.invert {
-        alpha.data.iter_mut().for_each(|v| *v = 1.0 - *v);
+        alpha.data.par_iter_mut().for_each(|v| *v = 1.0 - *v);
     }
     let amt = (m.adjust.amount / 100.0) as f32;
     if (amt - 1.0).abs() > 1e-6 {
-        alpha.data.iter_mut().for_each(|v| *v *= amt);
+        alpha.data.par_iter_mut().for_each(|v| *v *= amt);
     }
     alpha
 }
@@ -210,29 +216,30 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
         MaskShape::Brush { strokes } => rasterize_brush(strokes, frame, w, h, img, log_l, &mut out),
         MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather } => {
             let (lo, hi, lf, hf) = (*lo as f32, *hi as f32, (*lo_feather as f32).max(1e-3), (*hi_feather as f32).max(1e-3));
-            for (v, l) in out.data.iter_mut().zip(&log_l.data) {
+            out.data.par_iter_mut().zip(log_l.data.par_iter()).for_each(|(v, l)| {
                 // map log luminance to a 0..1 perceptual scale (−8..+4 EV)
                 let y = ((l + ev + 8.0) / 12.0).clamp(0.0, 1.0);
                 *v = smooth(lo - lf, lo, y) * (1.0 - smooth(hi, hi + hf, y));
-            }
+            });
         }
         MaskShape::ColorRange { samples, refine } => {
             let tol = color_range_tolerance(*refine);
             let samples: Vec<[f32; 3]> = samples.iter().map(|s| [s[0] as f32, s[1] as f32, s[2] as f32]).collect();
-            for (v, c) in out.data.iter_mut().zip(&img.data) {
+            // why: Filmlab: pixel by pixel as before, the rows in parallel (one core took 20 ms at fit, ~170 at full size)
+            out.data.par_iter_mut().zip(img.data.par_iter()).with_min_len(4096).for_each(|(v, c)| {
                 let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c.map(|v| v * gain)));
                 let d = samples
                     .iter()
                     .map(|s| ((lab[1] - s[1]).powi(2) + (lab[2] - s[2]).powi(2) + 0.25 * (lab[0] - s[0]).powi(2)).sqrt())
                     .fold(f32::MAX, f32::min);
                 *v = 1.0 - smooth(tol * 0.5, tol, d);
-            }
+            });
         }
         MaskShape::Sky => {
             // Classical sky heuristic until the segmenter lands (M12): bright, smooth, blue-ish or
             // unsaturated, and connected to the top of the frame.
             let m = frame.out_to_norm(w, h);
-            for (i, v) in out.data.iter_mut().enumerate() {
+            out.data.par_iter_mut().enumerate().with_min_len(4096).for_each(|(i, v)| {
                 let (x, y) = (i % w, i / w);
                 let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
                 let c = img.data[i].map(|v| v * gain);
@@ -240,7 +247,7 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
                 let blue = (c[2] - c[0]).max(0.0) / (c[2] + 1e-4);
                 let top = 1.0 - smooth(0.25, 0.7, n.y as f32);
                 *v = top * smooth(-3.5, -1.0, l) * (0.4 + 0.6 * smooth(0.0, 0.3, blue).max(smooth(0.0, 1.5, l)));
-            }
+            });
             smooth_plane(&mut out, 0.01 * frame_px(frame, w));
         }
         MaskShape::Object { seg, detail, edge, .. } | MaskShape::Prompt { seg, detail, edge, .. } if seg.is_some() || !detail.is_empty() => {
@@ -260,13 +267,13 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             // Saliency heuristic: centre-weighted local contrast (replaced by the segmenter in M12).
             let m = frame.out_to_norm(w, h);
             let blur = lightcraft_raster::blur::gaussian(log_l, 0.03 * frame_px(frame, w));
-            for (i, v) in out.data.iter_mut().enumerate() {
+            out.data.par_iter_mut().enumerate().with_min_len(4096).for_each(|(i, v)| {
                 let (x, y) = (i % w, i / w);
                 let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
                 let d = (((n.x - 0.5) / 0.35).powi(2) + ((n.y - 0.55) / 0.4).powi(2)).sqrt() as f32;
                 let contrast = (log_l.data[i] - blur.data[i]).abs();
                 *v = (1.0 - smooth(0.6, 1.0, d)) * (0.5 + 0.5 * smooth(0.05, 0.6, contrast));
-            }
+            });
             smooth_plane(&mut out, 0.015 * frame_px(frame, w));
         }
         MaskShape::Background => {
@@ -624,17 +631,16 @@ pub fn guided_cross(guide: &Plane, p: &Plane, sigma: f32, eps: f32) -> Plane {
     let cii = gaussian(&guide.map(|a| a * a), sigma);
     let mut a = Plane::new(p.width, p.height);
     let mut b = Plane::new(p.width, p.height);
-    for i in 0..p.data.len() {
+    // (pixel by pixel as before, in parallel)
+    a.data.par_iter_mut().zip(b.data.par_iter_mut()).enumerate().for_each(|(i, (a, b))| {
         let var = (cii.data[i] - mi.data[i] * mi.data[i]).max(0.0);
         let k = (cip.data[i] - mi.data[i] * mp.data[i]) / (var + eps);
-        a.data[i] = k;
-        b.data[i] = mp.data[i] - k * mi.data[i];
-    }
+        *a = k;
+        *b = mp.data[i] - k * mi.data[i];
+    });
     let (ma, mb) = (gaussian(&a, sigma), gaussian(&b, sigma));
     let mut q = Plane::new(p.width, p.height);
-    for i in 0..q.data.len() {
-        q.data[i] = (ma.data[i] * guide.data[i] + mb.data[i]).clamp(0.0, 1.0);
-    }
+    q.data.par_iter_mut().enumerate().for_each(|(i, q)| *q = (ma.data[i] * guide.data[i] + mb.data[i]).clamp(0.0, 1.0));
     q
 }
 
@@ -680,9 +686,7 @@ fn rasterize_brush(strokes: &[BrushStroke], frame: &Frame, w: usize, h: usize, i
             // the refinement fills gaps along edges; it never takes paint away
             stroke_alpha = stroke_alpha.zip_map(&q, f32::max);
         }
-        for (o, a) in out.data.iter_mut().zip(&stroke_alpha.data) {
-            *o = if erase { *o * (1.0 - a) } else { o.max(*a) };
-        }
+        out.data.par_iter_mut().zip(stroke_alpha.data.par_iter()).for_each(|(o, a)| *o = if erase { *o * (1.0 - a) } else { o.max(*a) });
     }
 }
 

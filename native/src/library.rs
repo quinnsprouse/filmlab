@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -7,6 +7,7 @@ use gpui_kit::{App, AppContext, Context, Entity, RenderImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::cache;
 use crate::film::{FilmSettings, render_film};
 use crate::stocks;
 
@@ -26,7 +27,7 @@ pub struct PhotoFile {
     pub sidecar: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Probed {
     pub facts: Value,
@@ -74,6 +75,19 @@ pub struct Library {
     pub saving: Saving,
     pub save_error: Option<String>,
     generation: usize,
+    // why: one sidecar write at a time per file, with only the newest waiting behind it, so two quick saves of a
+    // photo can't land on disk out of order
+    writing: HashMap<PathBuf, Option<Write>>,
+    /// Photos whose last write failed.
+    failed: HashSet<String>,
+}
+
+struct Write {
+    id: String,
+    target: PathBuf,
+    facts: String,
+    state: PhotoState,
+    refresh: bool,
 }
 
 fn extension(name: &str) -> String {
@@ -162,9 +176,23 @@ pub fn image_of(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Arc<Render
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
+fn look_of(settings: &Value, film: Option<&FilmSettings>) -> u64 {
+    let film = film.map(|f| f.to_value().to_string()).unwrap_or_default();
+    cache::look(&settings.to_string(), &film, THUMBNAIL_EDGE, THUMBNAIL_SOURCE)
+}
+
+fn cached_image(pixels: cache::Pixels) -> Option<Arc<RenderImage>> {
+    let cache::Pixels { width, height, mut rgba } = pixels;
+    rgba.chunks_exact_mut(4).for_each(|px| px.swap(0, 2));
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
 // why: the engine is locked here, outside the thumbnail pool, and only its decode and render run in the pool; a pool
-// thread that waited on a lock held by a render it is helping would deadlock the pool
-fn thumbnail(slot: usize, facts: &Value, bytes: &[u8], settings: &Value, film: Option<&FilmSettings>) -> Result<Arc<RenderImage>, String> {
+// thread that waited on a lock held by a render it is helping would deadlock the pool. A folder's first index is
+// what the user is waiting on, so it runs user-initiated on every core (edits, user-interactive, still come first);
+// a refresh after an edit runs at utility QoS on the efficiency cores so it never slows the next edit
+fn thumbnail(slot: usize, facts: &Value, bytes: &[u8], settings: &Value, film: Option<&FilmSettings>, key: Option<&cache::Key>, waited_on: bool) -> Result<Arc<RenderImage>, String> {
     let mut engine = INDEX_ENGINES[slot % INDEXERS].lock().map_err(|e| e.to_string())?;
     let engine = &mut *engine;
     ensure_luts(engine, film)?;
@@ -172,13 +200,20 @@ fn thumbnail(slot: usize, facts: &Value, bytes: &[u8], settings: &Value, film: O
     if let Some(f) = film {
         view["film"] = f.to_value();
     }
-    let frame = crate::perf::background(|| {
+    let work = || {
         engine.load("scratch", &facts.to_string(), bytes, THUMBNAIL_SOURCE)?;
         engine.render("scratch", &settings.to_string(), &view.to_string())
-    });
+    };
+    let frame = if waited_on { crate::perf::initiated(work) } else { crate::perf::background(work) };
     engine.release("scratch");
     let mut frame = frame?;
-    image_of(frame.width, frame.height, frame.take_rgba()).ok_or_else(|| "the thumbnail has no pixels".to_string())
+    let rgba = frame.take_rgba();
+    if let Some(key) = key
+        && let Some(jpeg) = cache::encode(frame.width, frame.height, &rgba)
+    {
+        cache::store_thumbnail(key, look_of(settings, film), &jpeg);
+    }
+    image_of(frame.width, frame.height, rgba).ok_or_else(|| "the thumbnail has no pixels".to_string())
 }
 
 struct Indexed {
@@ -187,19 +222,54 @@ struct Indexed {
     thumbnail: Arc<RenderImage>,
 }
 
+/// A photo whose probe and thumbnail were both found in the cache.
+struct Warm {
+    id: String,
+    probed: Probed,
+    state: PhotoState,
+    thumbnail: Arc<RenderImage>,
+}
+
+fn cached_probe(key: Option<&cache::Key>) -> Option<Probed> {
+    serde_json::from_str(&cache::probe(key?)?).ok()
+}
+
+fn sidecar_text(file: &PhotoFile) -> Option<String> {
+    file.sidecar.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+}
+
+fn warm(file: &PhotoFile) -> Option<Warm> {
+    let key = cache::key(&file.path)?;
+    let probed = cached_probe(Some(&key))?;
+    let state = state_of(&probed, sidecar_text(file).as_deref()).ok()?;
+    let film = render_film(state.film().as_ref());
+    let pixels = cache::thumbnail(&key, look_of(&state.settings, film.as_ref()))?;
+    Some(Warm { id: file.id.clone(), probed, state, thumbnail: cached_image(pixels)? })
+}
+
 fn index(slot: usize, file: &PhotoFile) -> Result<Indexed, String> {
+    let key = cache::key(&file.path);
     let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
-    let sidecar = file.sidecar.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
-    let probed: Probed = serde_json::from_str(&core::probe(&file.name, &bytes)?).map_err(|e| e.to_string())?;
+    let sidecar = sidecar_text(file);
+    let probed = match cached_probe(key.as_ref()) {
+        Some(probed) => probed,
+        None => {
+            let json = core::probe(&file.name, &bytes)?;
+            if let Some(key) = &key {
+                cache::store_probe(key, &json);
+            }
+            serde_json::from_str(&json).map_err(|e| e.to_string())?
+        }
+    };
     let state = state_of(&probed, sidecar.as_deref())?;
     let film = render_film(state.film().as_ref());
-    let thumbnail = thumbnail(slot, &probed.facts, &bytes, &state.settings, film.as_ref())?;
+    let thumbnail = thumbnail(slot, &probed.facts, &bytes, &state.settings, film.as_ref(), key.as_ref(), true)?;
     Ok(Indexed { probed, state, thumbnail })
 }
 
 impl Library {
     pub fn new() -> Library {
-        Library { folder: None, photos: Vec::new(), saving: Saving::Idle, save_error: None, generation: 0 }
+        Library { folder: None, photos: Vec::new(), saving: Saving::Idle, save_error: None, generation: 0, writing: HashMap::new(), failed: HashSet::new() }
     }
 
     pub fn record(&self, id: &str) -> Option<&PhotoRecord> {
@@ -223,7 +293,42 @@ impl Library {
         self.photos = photos_in(&folder).into_iter().map(|file| PhotoRecord { file, refreshes: 0, probed: None, state: None, thumbnail: None, error: None }).collect();
         self.folder = Some(folder);
         self.saving = Saving::Idle;
+        self.failed.clear();
+        cache::prune();
         let files: Vec<PhotoFile> = self.photos.iter().map(|r| r.file.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let looked = cx
+                .background_spawn(async move {
+                    use rayon::prelude::*;
+                    files.par_iter().map(|file| (file.clone(), warm(file))).collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |library, cx| {
+                if library.generation != run {
+                    return;
+                }
+                let mut missed = Vec::new();
+                for (file, hit) in looked {
+                    match hit {
+                        Some(hit) => {
+                            if let Some(record) = library.record_mut(&hit.id) {
+                                record.probed = Some(hit.probed);
+                                record.state = Some(hit.state);
+                                record.thumbnail = Some(hit.thumbnail);
+                            }
+                        }
+                        None => missed.push(file),
+                    }
+                }
+                cx.notify();
+                library.index_all(missed, run, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn index_all(&mut self, files: Vec<PhotoFile>, run: usize, cx: &mut Context<Library>) {
         let queue = Arc::new(Mutex::new(files.into_iter().collect::<std::collections::VecDeque<_>>()));
         let working = Arc::new(std::sync::atomic::AtomicUsize::new(INDEXERS));
         for slot in 0..INDEXERS {
@@ -266,7 +371,6 @@ impl Library {
             })
             .detach();
         }
-        cx.notify();
     }
 
     pub fn refresh_thumbnail(&mut self, id: &str, cx: &mut Context<Library>) {
@@ -280,7 +384,7 @@ impl Library {
             let made = cx
                 .background_spawn(async move {
                     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    thumbnail(0, &probed.facts, &bytes, &state.settings, render_film(state.film().as_ref()).as_ref())
+                    thumbnail(0, &probed.facts, &bytes, &state.settings, render_film(state.film().as_ref()).as_ref(), cache::key(&path).as_ref(), false)
                 })
                 .await;
             if let Ok(image) = made {
@@ -334,42 +438,76 @@ impl Library {
         cx.notify();
     }
 
+    /// Where `id`'s edits are written: its sidecar, or a new one beside the photo.
+    fn target(&self, id: &str) -> Option<PathBuf> {
+        let record = self.record(id)?;
+        let name = record.file.sidecar.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| format!("{}.xmp", record.file.stem));
+        Some(self.folder.as_ref()?.join(name))
+    }
+
+    /// Whether `id`'s latest state is on disk, being written, or failed to write.
+    pub fn saved(&self, id: &str) -> Saving {
+        match self.target(id) {
+            None => Saving::Idle,
+            Some(target) if self.writing.contains_key(&target) => Saving::Saving,
+            Some(_) if self.failed.contains(id) => Saving::Failed,
+            Some(_) => Saving::Saved,
+        }
+    }
+
     fn write(&mut self, id: &str, state: PhotoState, refresh: bool, cx: &mut Context<Library>) {
-        let Some(folder) = self.folder.clone() else { return };
+        let Some(target) = self.target(id) else { return };
         let Some(record) = self.record_mut(id) else { return };
         record.state = Some(state.clone());
-        let Some(probed) = record.probed.clone() else { return };
-        let name = record.file.sidecar.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| format!("{}.xmp", record.file.stem));
-        let target = folder.join(name);
+        let Some(probed) = record.probed.as_ref() else { return };
+        let write = Write { id: id.to_string(), target, facts: probed.facts.to_string(), state, refresh };
         self.saving = Saving::Saving;
-        let id = id.to_string();
+        if let Some(queued) = self.writing.get_mut(&write.target) {
+            let refresh = write.refresh || queued.as_ref().is_some_and(|q| q.refresh);
+            *queued = Some(Write { refresh, ..write });
+            return;
+        }
+        self.writing.insert(write.target.clone(), None);
+        self.start_write(write, cx);
+    }
+
+    fn start_write(&mut self, write: Write, cx: &mut Context<Library>) {
         cx.spawn(async move |this, cx| {
             let written = {
-                let target = target.clone();
+                let (target, facts, state) = (write.target.clone(), write.facts.clone(), write.state.clone());
                 cx.background_spawn(async move {
                     let existing = std::fs::read_to_string(&target).ok();
                     let state = serde_json::to_string(&state).map_err(|e| e.to_string())?;
-                    let text = core::write_sidecar(&probed.facts.to_string(), &state, existing)?;
+                    let text = core::write_sidecar(&facts, &state, existing)?;
                     std::fs::write(&target, text).map_err(|e| e.to_string())
                 })
                 .await
             };
             let _ = this.update(cx, |library, cx| {
+                let here = library.folder.as_deref() == write.target.parent();
                 match written {
                     Ok(()) => {
-                        library.saving = Saving::Saved;
                         library.save_error = None;
-                        if let Some(record) = library.record_mut(&id) {
-                            record.file.sidecar = Some(target);
+                        library.failed.remove(&write.id);
+                        if here && let Some(record) = library.record_mut(&write.id) {
+                            record.file.sidecar = Some(write.target.clone());
                         }
                     }
                     Err(e) => {
-                        library.saving = Saving::Failed;
                         library.save_error = Some(e);
+                        library.failed.insert(write.id.clone());
                     }
                 }
-                if refresh {
-                    library.refresh_thumbnail(&id, cx);
+                if write.refresh && here {
+                    library.refresh_thumbnail(&write.id, cx);
+                }
+                match library.writing.remove(&write.target).flatten() {
+                    Some(next) => {
+                        library.writing.insert(next.target.clone(), None);
+                        library.start_write(next, cx);
+                    }
+                    None if library.writing.is_empty() => library.saving = if library.save_error.is_some() { Saving::Failed } else { Saving::Saved },
+                    None => {}
                 }
                 cx.notify();
             });

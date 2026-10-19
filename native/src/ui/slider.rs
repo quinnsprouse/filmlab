@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -12,6 +13,17 @@ type OnChange = Rc<dyn Fn(f64, &mut Window, &mut App)>;
 struct DragValue(ElementId);
 
 pub struct Nothing;
+
+/// Runs when any slider is let go; the app uses it to draw the full frame straight after a drag's drafts.
+pub struct OnRelease(pub Rc<dyn Fn(&mut App)>);
+
+impl Global for OnRelease {}
+
+fn released(cx: &mut App) {
+    if let Some(f) = cx.try_global::<OnRelease>().map(|g| g.0.clone()) {
+        f(cx);
+    }
+}
 
 impl Render for Nothing {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -31,12 +43,13 @@ pub struct ParamSlider {
     decimals: usize,
     shown: Option<SharedString>,
     disabled: bool,
+    agent: bool,
     on_change: Option<OnChange>,
 }
 
 impl ParamSlider {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>, value: f64, min: f64, max: f64) -> Self {
-        ParamSlider { id: id.into(), label: label.into(), value, min, max, step: 1.0, fallback: 0.0, decimals: 0, shown: None, disabled: false, on_change: None }
+        ParamSlider { id: id.into(), label: label.into(), value, min, max, step: 1.0, fallback: 0.0, decimals: 0, shown: None, disabled: false, agent: false, on_change: None }
     }
 
     pub fn step(mut self, step: f64) -> Self {
@@ -62,6 +75,12 @@ impl ParamSlider {
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// An agent set this value and nobody has changed it since: the fill and handle turn amber.
+    pub fn agent(mut self, agent: bool) -> Self {
+        self.agent = agent;
         self
     }
 
@@ -91,11 +110,52 @@ fn value_at(x: Pixels, bounds: Bounds<Pixels>, min: f64, max: f64, step: f64) ->
     snap(min + t * (max - min), min, max, step)
 }
 
+/// How long a slider takes to turn amber when an agent sets it, or back to gray when you take it over.
+const MORPH: Duration = Duration::from_millis(240);
+
 #[derive(Default)]
 struct Interaction {
     bounds: Bounds<Pixels>,
     hovered: bool,
     dragging: bool,
+    /// The amber state last drawn (none before the first paint), and the morph toward it: where it started and when.
+    agent: Option<bool>,
+    from: f32,
+    goal: f32,
+    since: Option<Instant>,
+}
+
+impl Interaction {
+    /// How amber the slider is now (0 gray, 1 amber) and whether it's still changing.
+    fn amber(&self) -> (f32, bool) {
+        let Some(since) = self.since else { return (self.goal, false) };
+        let p = (since.elapsed().as_secs_f32() / MORPH.as_secs_f32()).min(1.0);
+        (self.from + (self.goal - self.from) * super::motion::emphasized()(p), p < 1.0)
+    }
+
+    // why: the first paint shows the state as it is; later changes morph from wherever the last one had got to, so a
+    // quick take-over and agent edit never jump
+    fn morph(&mut self, agent: bool, calm: bool) -> (f32, bool) {
+        let goal = if agent { 1.0 } else { 0.0 };
+        match self.agent {
+            None => {
+                (self.from, self.goal, self.since) = (goal, goal, None);
+            }
+            Some(was) if was != agent => {
+                self.from = self.amber().0;
+                self.goal = goal;
+                self.since = (!calm).then(Instant::now);
+            }
+            _ => {}
+        }
+        self.agent = Some(agent);
+        self.amber()
+    }
+}
+
+fn blend(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let (a, b, t) = (Rgba::from(a), Rgba::from(b), t.clamp(0.0, 1.0));
+    Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: a.a + (b.a - a.a) * t }.into()
 }
 
 // why: DialKit's slider is the whole row: label and value sit inside a soft bar whose fill and thin handle
@@ -113,6 +173,13 @@ impl RenderOnce for ParamSlider {
         };
         let active = !self.disabled && self.on_change.is_some();
         let lit = active && (hovered || dragging);
+        let (amber, morphing) = state.update(cx, |s, _| s.morph(self.agent, super::motion::reduced()));
+        if morphing {
+            window.request_animation_frame();
+        }
+        let gray_fill = if lit { theme::fill_active() } else { theme::fill() };
+        let fill = blend(gray_fill, if lit { rgba(0xFFB34033).into() } else { rgba(0xFFB34024).into() }, amber);
+        let handle = blend(theme::handle(), theme::accent(), amber);
         let centre = (min < 0.0 && max > 0.0).then(|| (-min / (max - min)) as f32);
         let (record, hover, press, release, end) = (state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
         let (on_press, on_drag, on_reset) = (self.on_change.clone(), self.on_change.clone(), self.on_change.clone());
@@ -138,10 +205,10 @@ impl RenderOnce for ParamSlider {
                     .w(relative(at))
                     .rounded_l(px(theme::RADIUS))
                     .when(at > 0.98, |d| d.rounded_r(px(theme::RADIUS)))
-                    .bg(if lit { theme::fill_active() } else { theme::fill() }),
+                    .bg(fill),
             )
             .when_some(centre.filter(|_| lit), |d, c| d.child(div().absolute().top(px(14.)).h(px(8.)).w(px(1.)).left(relative(c)).rounded_full().bg(theme::hashmark())))
-            .child(div().absolute().top(px(8.)).h(px(20.)).w(px(3.)).ml(px(-1.5)).left(relative(at.clamp(0.012, 0.988))).rounded_full().bg(theme::handle()))
+            .child(div().absolute().top(px(8.)).h(px(20.)).w(px(3.)).ml(px(-1.5)).left(relative(at.clamp(0.012, 0.988))).rounded_full().bg(handle))
             .child(
                 div()
                     .absolute()
@@ -184,13 +251,15 @@ impl RenderOnce for ParamSlider {
                         release.update(cx, |s, cx| {
                             s.dragging = false;
                             cx.notify();
-                        })
+                        });
+                        released(cx);
                     })
                     .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
                         end.update(cx, |s, cx| {
                             s.dragging = false;
                             cx.notify();
-                        })
+                        });
+                        released(cx);
                     })
                     .on_drag(DragValue(drag_id.clone()), |_, _, _, cx| cx.new(|_| Nothing))
                     .on_drag_move(move |event: &DragMoveEvent<DragValue>, window, cx| {

@@ -39,12 +39,19 @@ interface ProgramCopy {
   offset: number;
 }
 
+interface ProgramKeep {
+  buffer: string;
+  id: string;
+  need: boolean;
+}
+
 export interface GpuProgram {
   buffers: ProgramBuffer[];
   copies: ProgramCopy[];
   writes: ProgramWrite[];
   passes: ProgramPass[];
   reads: ProgramRead[];
+  keep: ProgramKeep[];
 }
 
 export type GpuMessage =

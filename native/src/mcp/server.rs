@@ -16,7 +16,9 @@ use super::{Call, prompts, tools, url};
 
 const INSTRUCTIONS: &str = "Filmlab is the photo editor open on this Mac; these tools drive it live. Loop: status → open_folder → \
 list_photos → open_photo → change (set_controls, set_film, command) → look (preview, analyze) → repeat. Control ids, \
-commands and stocks come from catalog. Every change is one undo step and is saved to the photo's XMP sidecar.";
+commands and stocks come from catalog. Every change is one undo step and is saved to the photo's XMP sidecar. Editing \
+and look tools take an optional photo (an id) to work on any photo without opening it; calls on different photos run \
+at once, so several agents can each take their own.";
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -47,14 +49,16 @@ impl ServerHandler for Filmlab {
         prompts::get(&request.name, &args).map(Into::into).ok_or_else(|| ErrorData::invalid_params(format!("unknown prompt {}", request.name), None))
     }
 
-    async fn call_tool(&self, request: CallToolRequestParams, _: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+    async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         if !tools::exists(&name) {
             return Err(ErrorData::invalid_params(format!("unknown tool {name}"), None));
         }
         let args = request.arguments.map_or(Value::Object(Default::default()), Value::Object);
         let (reply, answer) = oneshot::channel();
-        self.calls.unbounded_send(Call { name, args, reply }).map_err(|_| ErrorData::internal_error("Filmlab is closing", None))?;
+        // why: a request without client info reports rmcp's own default name, which isn't the agent
+        let client = context.client_info().map(|i| i.title.clone().unwrap_or_else(|| i.name.clone())).filter(|n| n != "rmcp");
+        self.calls.unbounded_send(Call { name, args, client, reply }).map_err(|_| ErrorData::internal_error("Filmlab is closing", None))?;
         let output = match tokio::time::timeout(CALL_TIMEOUT, answer).await {
             Ok(Ok(output)) => output,
             Ok(Err(_)) => return Err(ErrorData::internal_error("Filmlab dropped the call", None)),

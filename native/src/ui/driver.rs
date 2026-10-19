@@ -81,7 +81,7 @@ impl Driver {
         self.wait(cx, 60, move |a, cx| {
             let d = a.develop.read(cx);
             let frame = if detail { d.detail.is_some() } else { d.fit.is_some() };
-            frame && d.idle_for(Duration::from_millis(500)) && d.shown_plan(detail).is_some_and(|p| p.revision == d.planned_revision())
+            frame && !d.drafting() && d.idle_for(Duration::from_millis(500)) && d.shown_plan(detail).is_some_and(|p| p.revision == d.planned_revision())
         })
         .await
     }

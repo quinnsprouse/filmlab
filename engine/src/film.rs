@@ -261,7 +261,7 @@ impl FilmRequest {
         let d = self.dust;
         let dust = d.on.then(|| DustParams { size: d.size, softness: d.softness, rows: DustParams::rows_of(native) });
         let h = self.halation;
-        let halation = (h.on && h.amount > 0.0).then_some(HalationParams { amount: h.amount, hue: h.hue, sat: h.sat, radius: h.radius, highlights_only: h.highlights_only });
+        let halation = (h.on && h.amount > 0.0).then_some(HalationParams { amount: h.amount, hue: h.hue, sat: h.sat, radius: h.radius, highlights_only: h.highlights_only, ceiling: 1.0 });
         self.texture.then_some(TextureParams { film_blur: self.blur, grain, dust, halation })
     }
 
@@ -437,6 +437,39 @@ impl FilmChain {
         self.utility_of(self.log_of(self.contrast(scene, contrast)))
     }
 
+    // why: where the frame's highlights top out for the halation (halation::Headroom): its brightest 0.05%, so a few
+    // hot pixels don't set it, and never under three stops over grey, so an overcast or dim frame's brightest parts
+    // don't start to glow
+    pub fn ceiling(&self, scene: &Scene, contrast: f32) -> f32 {
+        const SAMPLES: usize = 200_000;
+        let top = |c: [f32; 3]| {
+            let k = self.code_of(c, contrast);
+            k[0].max(k[1]).max(k[2])
+        };
+        let step = (scene.rgb.len() / SAMPLES).max(1);
+        let mut codes: Vec<f32> = scene.rgb.par_iter().step_by(step).map(|&c| top(c)).collect();
+        if codes.is_empty() {
+            return 1.0;
+        }
+        let at = ((codes.len() - 1) as f64 * 0.9995) as usize;
+        // why: the value at `at` is the `keep`-th largest, which is the `keep`-th largest of every part's `keep`
+        // largest too: those are picked from the parts in parallel, and it from them
+        let keep = codes.len() - at;
+        let mut tops: Vec<f32> = codes
+            .par_chunks_mut(16_384)
+            .flat_map_iter(|part| {
+                let n = part.len();
+                if n > keep {
+                    part.select_nth_unstable_by(n - keep, f32::total_cmp);
+                }
+                part[n.saturating_sub(keep)..].to_vec()
+            })
+            .collect();
+        let rank = tops.len() - keep;
+        let (_, brightest, _) = tops.select_nth_unstable_by(rank, f32::total_cmp);
+        brightest.max(top([0.18 * 8.0; 3])).min(1.0)
+    }
+
     pub fn display_of(&self, code: [f32; 3]) -> [f32; 3] {
         self.print_display(self.negative.apply(code.map(|v| v.clamp(0.0, 1.0))))
     }
@@ -457,9 +490,8 @@ impl FilmChain {
 
 }
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use lightcraft_engine::pipeline::film_hook::{Pixel, ToneHook};
+use lightcraft_engine::pipeline::masks::Evaluated;
 use rayon::prelude::*;
 
 use crate::dust::DustParams;
@@ -469,50 +501,76 @@ use crate::texture::{self, Plane, Region, Size, TextureParams};
 
 pub struct Capture {
     region: Region,
-    data: Vec<[AtomicU32; 3]>,
-    frame: std::sync::OnceLock<[f32; 2]>,
+    captured: std::sync::OnceLock<Captured>,
+    masks: std::sync::OnceLock<Arc<Vec<Evaluated>>>,
+}
+
+#[derive(Clone)]
+struct Captured {
+    rgb: Vec<[f32; 3]>,
+    width: usize,
+    origin: [usize; 2],
+    frame: [f32; 2],
 }
 
 impl Capture {
     pub fn new(region: Region) -> Capture {
-        let data = (0..region.w * region.h).into_par_iter().map(|_| [0, 0, 0].map(AtomicU32::new)).collect();
-        Capture { region, data, frame: std::sync::OnceLock::new() }
+        Capture { region, captured: std::sync::OnceLock::new(), masks: std::sync::OnceLock::new() }
     }
 
-    fn frame(&self) -> Size {
-        let frame = self.frame.get().copied().unwrap_or([self.region.w as f32, self.region.h as f32]);
-        Size { w: frame[0] as usize, h: frame[1] as usize }
-    }
-
-    // why: a full-resolution capture is hundreds of MB; converting the atomics in place keeps it
-    // from being held twice
+    // why: the pass hands over its scene in one buffer, which is the region's scene itself unless spots grew the
+    // rendered window; then the region is cut from it (zero where nothing was drawn, as an untouched pixel was)
     pub fn into_scene(self) -> Scene {
-        let frame = self.frame();
-        let rgb = self.data.into_iter().map(|c| c.map(|v| f32::from_bits(v.into_inner()))).collect();
-        Scene { id: next_id(), region: self.region, frame, rgb }
+        let r = self.region;
+        let masks = self.masks.into_inner();
+        let Some(c) = self.captured.into_inner().filter(|c| !c.rgb.is_empty()) else {
+            return Scene { id: next_id(), region: r, frame: Size { w: r.w, h: r.h }, rgb: vec![[0.0; 3]; r.w * r.h], masks };
+        };
+        let frame = Size { w: c.frame[0] as usize, h: c.frame[1] as usize };
+        let height = c.rgb.len() / c.width;
+        let [ox, oy] = c.origin;
+        let rgb = if [ox, oy] == [r.x, r.y] && (c.width, height) == (r.w, r.h) {
+            c.rgb
+        } else {
+            let mut rgb = vec![[0.0f32; 3]; r.w * r.h];
+            rgb.par_chunks_mut(r.w.max(1)).enumerate().for_each(|(j, row)| {
+                let y = r.y + j;
+                if y < oy || y >= oy + height {
+                    return;
+                }
+                let drawn = &c.rgb[(y - oy) * c.width..][..c.width];
+                for (k, px) in row.iter_mut().enumerate() {
+                    let x = r.x + k;
+                    if x >= ox && x < ox + c.width {
+                        *px = drawn[x - ox];
+                    }
+                }
+            });
+            rgb
+        };
+        Scene { id: next_id(), region: r, frame, rgb, masks }
     }
 
     pub fn scene(&self) -> Scene {
-        let rgb = self.data.par_iter().map(|c| [0, 1, 2].map(|k| f32::from_bits(c[k].load(Ordering::Relaxed)))).collect();
-        Scene { id: next_id(), region: self.region, frame: self.frame(), rgb }
+        Capture { region: self.region, captured: self.captured.clone(), masks: self.masks.clone() }.into_scene()
     }
 }
 
 impl ToneHook for Capture {
-    fn tone(&self, scene: [f32; 3], at: Pixel) -> [f32; 3] {
-        self.frame.get_or_init(|| at.frame);
-        let (x, y) = (at.x as usize, at.y as usize);
-        let r = self.region;
-        if x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h {
-            for (cell, v) in self.data[(y - r.y) * r.w + x - r.x].iter().zip(scene) {
-                cell.store(v.to_bits(), Ordering::Relaxed);
-            }
-        }
+    fn tone(&self, scene: [f32; 3], _: Pixel) -> [f32; 3] {
         scene
     }
 
     fn capture_only(&self) -> bool {
         true
+    }
+
+    fn capture(&self, scene: Vec<[f32; 3]>, width: usize, origin: [f32; 2], frame: [f32; 2]) {
+        let _ = self.captured.set(Captured { rgb: scene, width, origin: origin.map(|v| v as usize), frame });
+    }
+
+    fn captured_masks(&self, masks: Arc<Vec<Evaluated>>) {
+        let _ = self.masks.set(masks);
     }
 }
 
@@ -521,6 +579,8 @@ pub struct Scene {
     pub(crate) region: Region,
     pub(crate) frame: Size,
     pub(crate) rgb: Vec<[f32; 3]>,
+    /// The masks the capture's pass evaluated (their alphas), for the final pass of the same render.
+    pub(crate) masks: Option<Arc<Vec<Evaluated>>>,
 }
 
 impl Drop for Scene {
@@ -536,8 +596,17 @@ impl Scene {
 
     pub fn part(&self, region: Region) -> Scene {
         let r = self.region;
-        let rgb = (region.y..region.y + region.h).flat_map(|y| &self.rgb[(y - r.y) * r.w + region.x - r.x..][..region.w]).copied().collect();
-        Scene { id: next_id(), region, frame: self.frame, rgb }
+        // why: a part as wide as the scene (an export band) is one run of it, copied in parallel; otherwise row slices
+        // are copied into a buffer sized up front (collecting a flat_map grew the vector pixel by pixel)
+        if (region.x, region.w) == (r.x, r.w) {
+            let rgb = self.rgb[(region.y - r.y) * r.w..][..region.w * region.h].par_iter().copied().collect();
+            return Scene { id: next_id(), region, frame: self.frame, rgb, masks: None };
+        }
+        let mut rgb = Vec::with_capacity(region.w * region.h);
+        for y in region.y..region.y + region.h {
+            rgb.extend_from_slice(&self.rgb[(y - r.y) * r.w + region.x - r.x..][..region.w]);
+        }
+        Scene { id: next_id(), region, frame: self.frame, rgb, masks: None }
     }
 }
 
@@ -583,6 +652,15 @@ impl Developer {
         self.textured_on_cpu(scene, out)
     }
 
+    // why: an export band takes its scan from the whole frame, so it reads nothing back and the GPU runs on while
+    // the next band is prepared
+    pub fn band(&self, scene: &Scene, out: Region) -> Textured {
+        match crate::gpu::textured(self, scene, out, false) {
+            Some((t, _)) => t,
+            None => self.textured_on_cpu(scene, out),
+        }
+    }
+
     pub fn textured_on_cpu(&self, scene: &Scene, out: Region) -> Textured {
         let code = Plane { region: scene.region, data: scene.rgb.par_iter().map(|c| self.chain.code_of(*c, self.light.contrast)).collect() };
         let rgb = match &self.texture {
@@ -612,14 +690,34 @@ impl Developer {
         if textured.gpu {
             return crate::gpu::finish(self, textured, scan);
         }
-        let rgb = textured.rgb.par_iter().map(|c| self.chain.to_working(scan.linear(self.chain.display_of(*c)))).collect();
-        Some(Toned { region: textured.region, rgb })
+        let rgb = textured.rgb.par_iter().map(|c| self.toned(*c, scan)).collect();
+        Some(Toned { region: textured.region, rgb, masks: None, band: false })
+    }
+
+    /// [`Developer::finish`] into `out`, the region's pixels row by row (an export band's rows of the frame).
+    pub fn finish_into(&self, textured: &Textured, scan: &Scan, out: &mut [[f32; 3]]) -> bool {
+        if textured.gpu {
+            return crate::gpu::finish_into(self, textured, scan, out);
+        }
+        if out.len() != textured.rgb.len() {
+            return false;
+        }
+        out.par_iter_mut().zip(textured.rgb.par_iter()).for_each(|(o, c)| *o = self.toned(*c, scan));
+        true
+    }
+
+    fn toned(&self, code: [f32; 3], scan: &Scan) -> [f32; 3] {
+        self.chain.to_working(scan.linear(self.chain.display_of(code)))
     }
 }
 
 pub struct Toned {
     pub(crate) region: Region,
     pub(crate) rgb: Vec<[f32; 3]>,
+    /// The masks the scene's capture evaluated, handed to the final pass ([`ToneHook::masks`]).
+    pub(crate) masks: Option<Arc<Vec<Evaluated>>>,
+    /// The region is a band of the frame's rows, and the final pass makes only those ([`ToneHook::rows`]).
+    pub(crate) band: bool,
 }
 
 impl ToneHook for Toned {
@@ -632,5 +730,28 @@ impl ToneHook for Toned {
 
     fn precomputed(&self) -> bool {
         true
+    }
+
+    fn masks(&self) -> Option<Arc<Vec<Evaluated>>> {
+        self.masks.clone()
+    }
+
+    fn rows(&self) -> Option<std::ops::Range<usize>> {
+        self.band.then(|| self.region.y..self.region.y + self.region.h)
+    }
+
+    // why: `tone` along a row: pixels left of the region repeat its first, those past it its last, the rest are the
+    // row's own, copied at once
+    fn tone_row(&self, at: Pixel, len: usize, out: &mut Vec<[f32; 3]>) {
+        let r = self.region;
+        let y = (at.y as usize).clamp(r.y, r.y + r.h - 1) - r.y;
+        let row = &self.rgb[y * r.w..][..r.w];
+        let x = at.x as usize;
+        let before = r.x.saturating_sub(x).min(len);
+        let from = (x + before).saturating_sub(r.x).min(r.w);
+        let inside = (len - before).min(r.w - from);
+        out.extend(std::iter::repeat_n(row[0], before));
+        out.extend_from_slice(&row[from..from + inside]);
+        out.extend(std::iter::repeat_n(row[r.w - 1], len - before - inside));
     }
 }

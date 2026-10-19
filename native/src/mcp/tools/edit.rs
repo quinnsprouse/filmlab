@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,12 +12,12 @@ use serde_json::{Map, Value, json};
 use super::app::strip;
 use super::{Answer, Output, args, look};
 use crate::film::{Dust, FilmSettings, GAUGES, Gauge, Halation, STOCK_DUST};
+use crate::mcp::session::{Edit, Held, Hub, NO_PHOTO};
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
 use crate::ui::driver::Driver;
 use crate::ui::rail::store::{self, LOOK_GROUPS, PER_PHOTO_GROUPS};
 
 const GONE: &str = "Filmlab's window is gone";
-const NO_PHOTO: &str = "no photo is open; open_photo first";
 
 #[derive(Deserialize)]
 struct Spec {
@@ -204,7 +205,7 @@ fn mask_summary(settings: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn describe(settings: &Value, before: Option<&Value>, facts: Option<&Value>, film: Option<&FilmSettings>, values: &HashMap<String, f64>, all: bool) -> Value {
+fn summarize(settings: &Value, before: Option<&Value>, facts: Option<&Value>, film: Option<&FilmSettings>, values: &HashMap<String, f64>, all: bool) -> Value {
     let controls: Map<String, Value> = specs()
         .iter()
         .filter(|s| !["wb.temp", "wb.tint", "crop.angle"].contains(&s.id.as_str()))
@@ -228,31 +229,28 @@ fn describe(settings: &Value, before: Option<&Value>, facts: Option<&Value>, fil
     }))
 }
 
-/// The open photo's edit, compact: non-default controls, film, crop, masks, spots (`all`: every control).
-pub fn summary(driver: &Driver, cx: &mut AsyncApp, all: bool) -> Option<Value> {
-    driver
-        .read(cx, |a, cx| {
-            let d = a.develop.read(cx);
-            let settings = d.settings.as_ref()?;
-            Some(describe(settings, d.before.as_ref(), d.facts.as_ref(), d.film.as_ref(), &d.control_values(), all))
-        })
-        .flatten()
+/// A photo's edit, compact: non-default controls, film, crop, masks, spots (`all`: every control).
+pub fn describe(e: &Edit<'_>, all: bool) -> Value {
+    summarize(e.settings, e.before, e.facts, e.film, &e.values(), all)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GetEdit {
+    photo: Option<String>,
     all: Option<bool>,
 }
 
-pub fn get_edit(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub fn get_edit(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: GetEdit = args(value)?;
-    summary(driver, cx, p.all.unwrap_or(false)).map(Output::json).ok_or_else(|| NO_PHOTO.into())
+    let all = p.all.unwrap_or(false);
+    hub.peek(driver, cx, p.photo.as_deref(), |e| describe(&e, all)).map(Output::json)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetControls {
+    photo: Option<String>,
     values: Map<String, Value>,
     label: Option<String>,
     preview: Option<Value>,
@@ -290,22 +288,19 @@ fn sentence(title: &str) -> String {
         .join(" ")
 }
 
-pub async fn set_controls(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn set_controls(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: SetControls = args(value)?;
     if p.values.is_empty() {
         return Err("values is empty; give e.g. {\"light.exposure\": 0.3}".into());
     }
-    let read = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| {
-        let d = a.develop.read(cx);
-        let settings = d.settings.as_ref()?;
-        Some((d.control_values(), d.facts.as_ref().and_then(|f| white_balance(f, settings)), d.facts.as_ref().map(Value::to_string).unwrap_or_default()))
-    };
-    let (values, wb, facts) = driver.read(cx, read).flatten().ok_or(NO_PHOTO)?;
     let unknown: Vec<&String> = p.values.keys().filter(|id| spec(id).is_none()).collect();
     if !unknown.is_empty() {
         let hints: Vec<String> = unknown.iter().map(|id| format!("{id} (close: {})", close(id, specs().iter().map(|s| s.id.as_str())))).collect();
         return Err(format!("unknown control {}; catalog controls lists ids", hints.join("; ")));
     }
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let read = |e: Edit<'_>| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)), e.facts.map(Value::to_string).unwrap_or_default());
+    let (values, wb, facts) = held.read(driver, cx, read).ok_or(NO_PHOTO)?;
     let relative_wb = wb.as_ref().is_some_and(|w| !w.kelvin);
     let mut targets = Map::new();
     let mut clamped = Vec::new();
@@ -335,11 +330,11 @@ pub async fn set_controls(driver: &Driver, cx: &mut AsyncApp, value: Value) -> A
     let ids: Vec<String> = targets.keys().cloned().collect();
     let label = p.label.unwrap_or_else(|| controls_label(&ids));
     let key = next_key("controls");
-    driver.develop(cx, |d, cx| d.try_command("develop.set", json!({"values": targets}), &label, &key, cx)).ok_or(GONE)??;
-    let (values, wb, _) = driver.read(cx, read).flatten().ok_or(NO_PHOTO)?;
+    held.command(driver, cx, "develop.set", json!({"values": targets}), &label, &key).await?;
+    let (values, wb, _) = held.read(driver, cx, read).ok_or(NO_PHOTO)?;
     let set: Map<String, Value> = ids.iter().filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
-    let output = Output::json(strip(json!({"set": set, "clamped": clamped})));
-    look::attach(driver, cx, output, p.preview.as_ref()).await
+    let output = Output::json(strip(json!({"photo": held.id(driver, cx), "set": set, "clamped": clamped})));
+    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -373,6 +368,7 @@ struct DustArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetFilm {
+    photo: Option<String>,
     #[serde(rename = "negative")]
     _negative: Option<Value>,
     #[serde(rename = "print")]
@@ -433,15 +429,13 @@ fn stock_field(raw: Option<&Value>, stocks: &[Stock], kind: StockKind) -> Result
     }
 }
 
-pub async fn set_film(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn set_film(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     // why: serde reads a null as an absent field, and null here means "no stock"
     let stock_args = ["negative", "print", "utility"].map(|k| value.get(k).cloned());
     let p: SetFilm = args(value)?;
-    let read = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| {
-        let d = a.develop.read(cx);
-        d.settings.as_ref().map(|_| (d.film.clone(), a.stocks.clone()))
-    };
-    let (film, stocks) = driver.read(cx, read).flatten().ok_or(NO_PHOTO)?;
+    let stocks = driver.read(cx, |a, _| a.stocks.clone()).ok_or(GONE)?;
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let film = held.read(driver, cx, |e| e.film.cloned()).ok_or(NO_PHOTO)?;
     let [negative, print, utility] = stock_args;
     let negative = stock_field(negative.as_ref(), &stocks, StockKind::Negative)?;
     let print = stock_field(print.as_ref(), &stocks, StockKind::Print)?;
@@ -554,11 +548,10 @@ pub async fn set_film(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answe
     }
     let label = if off { "Film off".to_string() } else if parts.is_empty() { "Film look".to_string() } else { named(&parts) };
     let key = next_key("film");
-    let next = f.clone();
-    driver.develop(cx, move |d, cx| d.edit_film(next, &label, &key, cx)).ok_or(GONE)?;
+    held.set_film(driver, cx, f.clone(), &label, &key).await?;
     let note = (!off && !f.is_on()).then(|| format!("film is off: no default stocks are installed in {}", crate::stocks::folder().display()));
-    let output = Output::json(strip(json!({"film": film_summary(Some(&f)), "clamped": clamped, "note": note})));
-    look::attach(driver, cx, output, p.preview.as_ref()).await
+    let output = Output::json(strip(json!({"photo": held.id(driver, cx), "film": film_summary(Some(&f)), "clamped": clamped, "note": note})));
+    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
 }
 
 const EDITING: [&str; 8] = ["develop.", "crop.", "mask.", "spot.", "redeye.", "pointColor.", "geometry.", "curve."];
@@ -599,12 +592,13 @@ fn refuse(name: &str) -> Option<String> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Command {
+    photo: Option<String>,
     name: String,
     params: Option<Value>,
     preview: Option<Value>,
 }
 
-pub async fn command(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn command(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Command = args(value)?;
     let name = p.name.trim().to_string();
     let catalog = driver.read(cx, |a, cx| a.develop.read(cx).command_catalog()).ok_or(GONE)?;
@@ -617,10 +611,9 @@ pub async fn command(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer
     let params = p.params.unwrap_or_else(|| json!({}));
     let label = driver.read(cx, |a, cx| a.develop.read(cx).command_label(&name)).flatten().map_or_else(|| name.clone(), sentence);
     let key = next_key("command");
-    let sent = params.clone();
-    let command = name.clone();
-    let (result, _) = driver.develop(cx, move |d, cx| d.try_command(&command, sent, &label, &key, cx)).ok_or(GONE)??;
-    if name.starts_with("mask.") {
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let (result, _) = held.command(driver, cx, &name, params.clone(), &label, &key).await?;
+    if held.is_ui() && name.starts_with("mask.") {
         let active = if name == "mask.select" { Some(params["id"].as_u64()) } else { result.get("activeMask").map(Value::as_u64) };
         if let Some(active) = active {
             driver.act(cx, |a, cx| {
@@ -633,8 +626,8 @@ pub async fn command(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer
             });
         }
     }
-    let output = Output::json(json!({"result": result}));
-    look::attach(driver, cx, output, p.preview.as_ref()).await
+    let output = Output::json(json!({"photo": held.id(driver, cx), "result": result}));
+    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
 }
 
 #[derive(Deserialize)]
@@ -719,32 +712,27 @@ pub fn catalog(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct History {
+    photo: Option<String>,
     action: String,
     step: Option<usize>,
 }
 
-fn history_at(driver: &Driver, cx: &mut AsyncApp) -> Option<(usize, usize, String)> {
-    driver
-        .read(cx, |a, cx| {
-            let d = a.develop.read(cx);
-            d.settings.as_ref()?;
-            Some((d.cursor, d.history.len(), d.history.get(d.cursor).map(|s| s.label.clone()).unwrap_or_default()))
-        })
-        .flatten()
+fn history_at(held: &Held, driver: &Driver, cx: &mut AsyncApp) -> Option<(usize, usize, String)> {
+    held.read(driver, cx, |e| (e.cursor, e.history.len(), e.history.get(e.cursor).map(|s| s.label.clone()).unwrap_or_default()))
 }
 
-pub async fn history(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn history(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: History = args(value)?;
-    let (step, steps, _) = history_at(driver, cx).ok_or(NO_PHOTO)?;
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let (step, steps, _) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
     let target = match p.action.as_str() {
         "list" => {
-            let list = driver
-                .read(cx, |a, cx| {
-                    let d = a.develop.read(cx);
-                    let from = d.history.len().saturating_sub(30);
-                    d.history.iter().enumerate().skip(from).map(|(i, s)| json!([i, s.label])).collect::<Vec<_>>()
+            let list = held
+                .read(driver, cx, |e| {
+                    let from = e.history.len().saturating_sub(30);
+                    e.history.iter().enumerate().skip(from).map(|(i, s)| json!([i, s.label])).collect::<Vec<_>>()
                 })
-                .ok_or(GONE)?;
+                .ok_or(NO_PHOTO)?;
             return Ok(Output::json(json!({"step": step, "steps": steps, "list": list})));
         }
         "undo" if step == 0 => return Err("nothing to undo: at step 0 (as opened)".into()),
@@ -760,14 +748,15 @@ pub async fn history(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer
         }
         other => return Err(format!("unknown action {other}; list, undo, redo, go_to")),
     };
-    driver.develop(cx, |d, cx| d.go_to(target, cx)).ok_or(GONE)?;
-    let (step, steps, label) = history_at(driver, cx).ok_or(NO_PHOTO)?;
-    Ok(Output::json(json!({"step": step, "steps": steps, "label": label})))
+    held.go_to(driver, cx, target).await?;
+    let (step, steps, label) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
+    Ok(Output::json(json!({"photo": held.id(driver, cx), "step": step, "steps": steps, "label": label})))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Profiles {
+    photo: Option<String>,
     action: String,
     id: Option<String>,
     name: Option<String>,
@@ -788,7 +777,7 @@ fn find_profile(profiles: &[store::Profile], id: Option<&str>, name: Option<&str
         .ok_or_else(|| if profiles.is_empty() { "no profiles are saved; save one first".into() } else { format!("no profile {wanted}; saved: {}", profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")) })
 }
 
-pub async fn profiles(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn profiles(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Profiles = args(value)?;
     match p.action.as_str() {
         "list" => {
@@ -810,11 +799,10 @@ pub async fn profiles(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answe
                 return Err(format!("unknown group {bad}; groups: {}", known.join(", ")));
             }
             let groups: Vec<String> = known.iter().filter(|g| groups.iter().any(|x| x == *g)).map(|g| (*g).to_string()).collect();
+            let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+            let (settings, film) = held.read(driver, cx, |e| (e.settings.clone(), e.film.map(|f| f.normalized().to_value()))).ok_or(NO_PHOTO)?;
             let saved = driver
                 .act(cx, |a, cx| {
-                    let d = a.develop.read(cx);
-                    let settings = d.settings.clone().ok_or(NO_PHOTO)?;
-                    let film = d.film.as_ref().map(|f| f.normalized().to_value());
                     let profile = store::build(&name, &settings, groups, film).ok_or("the edit couldn't be saved as a profile")?;
                     let list = store::shown(&mut a.rail);
                     let replaced = list.iter().position(|x| x.name.eq_ignore_ascii_case(&name)).map(|i| list.remove(i)).is_some();
@@ -829,23 +817,17 @@ pub async fn profiles(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answe
         }
         "apply" => {
             let amount = p.amount.unwrap_or(100.0).clamp(0.0, 200.0);
-            let applied = driver
-                .act(cx, |a, cx| {
-                    if a.develop.read(cx).settings.is_none() {
-                        return Err(NO_PHOTO.to_string());
-                    }
+            let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+            held.read(driver, cx, |_| ()).ok_or(NO_PHOTO)?;
+            let profile = driver
+                .act(cx, |a, _| {
                     let list = store::shown(&mut a.rail);
-                    let profile = list[find_profile(list, p.id.as_deref(), p.name.as_deref())?].clone();
-                    store::set_amount(&mut a.rail, amount);
-                    let film = profile.film.as_ref().and_then(FilmSettings::of);
-                    let label = format!("Profile {}", profile.name);
-                    a.develop.update(cx, |d, cx| d.apply_profile(&profile.id, &profile.partial, amount / 100.0, &label, film, cx));
-                    cx.notify();
-                    Ok(profile.name)
+                    find_profile(list, p.id.as_deref(), p.name.as_deref()).map(|i| list[i].clone())
                 })
                 .ok_or(GONE)??;
-            let edit = summary(driver, cx, false).unwrap_or_default();
-            Ok(Output::json(json!({"applied": applied, "amount": num(amount, 1), "edit": edit})))
+            held.apply_profile(driver, cx, &profile, amount / 100.0).await?;
+            let edit = held.read(driver, cx, |e| describe(&e, false)).unwrap_or_default();
+            Ok(Output::json(json!({"photo": held.id(driver, cx), "applied": profile.name, "amount": num(amount, 1), "edit": edit})))
         }
         "delete" => {
             let deleted = driver
@@ -892,6 +874,7 @@ fn write_snapshots(all: &BTreeMap<String, Vec<Snapshot>>) -> Result<(), String> 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshots {
+    photo: Option<String>,
     action: String,
     name: Option<String>,
 }
@@ -900,16 +883,12 @@ fn snapshot_list(list: &[Snapshot]) -> Vec<Value> {
     list.iter().map(|s| json!([s.name, s.at.chars().take(19).collect::<String>()])).collect()
 }
 
-pub async fn snapshots(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn snapshots(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Snapshots = args(value)?;
-    let read = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| {
-        let d = a.develop.read(cx);
-        let id = d.photo_id.as_ref()?;
-        let path = a.library.read(cx).record(id)?.file.path.clone();
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        Some((path.to_string_lossy().to_string(), d.settings.clone()?, d.film.clone()))
-    };
-    let (photo, settings, film) = driver.read(cx, read).flatten().ok_or(NO_PHOTO)?;
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    let (id, settings, film) = held.read(driver, cx, |e| (e.id.to_string(), e.settings.clone(), e.film.cloned())).ok_or(NO_PHOTO)?;
+    let path = driver.read(cx, |a, cx| a.library.read(cx).record(&id).map(|r| r.file.path.clone())).flatten().ok_or(NO_PHOTO)?;
+    let photo = std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().to_string();
     let mut all = load_snapshots();
     let name = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
     let list = all.entry(photo.clone()).or_default();
@@ -929,9 +908,9 @@ pub async fn snapshots(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answ
             let film = snap.film.as_ref().and_then(FilmSettings::of);
             let label = format!("Snapshot {name}");
             let key = next_key("snapshot");
-            driver.develop(cx, move |d, cx| d.restore(snap.settings, film, &label, &key, cx)).ok_or(GONE)??;
-            let (step, _, _) = history_at(driver, cx).ok_or(NO_PHOTO)?;
-            Ok(Output::json(json!({"restored": name, "step": step})))
+            held.restore(driver, cx, snap.settings, film, &label, &key).await?;
+            let (step, _, _) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
+            Ok(Output::json(json!({"photo": id, "restored": name, "step": step})))
         }
         "delete" => {
             let name = name.ok_or("delete needs a name")?;

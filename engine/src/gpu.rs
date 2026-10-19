@@ -30,6 +30,9 @@ const CANDIDATE: u32 = 8;
 const HIGHLIGHTS: u32 = 16;
 const VERTICAL: u32 = 32;
 const ACCUMULATE: u32 = 64;
+const LUMA: u32 = 128;
+const ADD: u32 = 256;
+const SINGLE: u32 = 512;
 const SAMPLES: usize = 60_000;
 const GROUP: usize = 16;
 
@@ -83,6 +86,15 @@ struct Copy {
     offset: usize,
 }
 
+// why: a buffer the runner keeps between programs, named for its contents: a program that needs it fails unless the
+// buffer still holds `id`, and one that makes it marks it so once it has run
+#[derive(Serialize)]
+struct Keep {
+    buffer: &'static str,
+    id: String,
+    need: bool,
+}
+
 #[derive(Default, Serialize)]
 struct Program {
     buffers: Vec<Buffer>,
@@ -90,6 +102,7 @@ struct Program {
     writes: Vec<Write>,
     passes: Vec<Pass>,
     reads: Vec<Read>,
+    keep: Vec<Keep>,
 }
 
 impl Program {
@@ -221,7 +234,35 @@ const CONSTS: [f32; 10] = [GAIN_LOW, GAIN_HIGH, BEND2, BEND3, 0.01, CHROMA, KNEE
 const TRANSFER_AT: usize = 29068;
 const DWG_AT: usize = 37069;
 const MASK_AT: usize = 37087;
-const TABLE_WORDS: usize = 37108;
+const BUCKETS: u32 = 4096;
+const INDEX_WORDS: usize = 3 + 2 * BUCKETS as usize;
+const DOMAIN_INDEX_AT: usize = 37108;
+const BASE_INDEX_AT: usize = DOMAIN_INDEX_AT + INDEX_WORDS;
+const TRANSFER_INDEX_AT: usize = BASE_INDEX_AT + INDEX_WORDS;
+const TABLE_WORDS: usize = TRANSFER_INDEX_AT + INDEX_WORDS;
+
+// why: the shader's binary searches (grain inverse, tone, halation untransfer) start from the bucket of u's bits: a
+// header (the first positive entry, the shift, the bucket count) then per bucket the counts of entries in lower
+// buckets and in this one or lower, between which the partition point of any u in it lies. The tables are sorted and
+// the bucket grows with u, so the search ends where the whole one does
+fn index(table: &[f32]) -> Vec<f32> {
+    let base = table.iter().find(|v| **v > 0.0).map_or(0, |v| v.to_bits());
+    let span = table[table.len() - 1].to_bits().saturating_sub(base);
+    let shift = (0..32).find(|s| span >> s < BUCKETS).unwrap_or(31);
+    let count = (span >> shift) + 1;
+    let bucket = |v: f32| (if v == 0.0 { 0 } else { v.to_bits() }).max(base).saturating_sub(base) >> shift;
+    let mut out = vec![f32::from_bits(base), shift as f32, count as f32];
+    for b in 0..count {
+        out.push(table.partition_point(|&t| bucket(t) < b) as f32);
+        out.push(table.partition_point(|&t| bucket(t) <= b) as f32);
+    }
+    out
+}
+
+fn indexes() -> &'static [Vec<f32>; 3] {
+    static INDEXES: std::sync::OnceLock<[Vec<f32>; 3]> = std::sync::OnceLock::new();
+    INDEXES.get_or_init(|| [index(&DOMAIN), index(&BASE), index(&F_GRID)])
+}
 
 fn tables(program: &mut Program, dev: &Developer, scan: Option<&Scan>, weights: &[f32]) {
     program.buffer("tables", TABLE_WORDS + weights.len().max(1));
@@ -241,6 +282,10 @@ fn tables(program: &mut Program, dev: &Developer, scan: Option<&Scan>, weights: 
     put(TRANSFER_AT, "transfer", &F_GRID);
     put(DWG_AT, "dwg", DWG.as_flattened());
     put(MASK_AT, "mask", &MASK);
+    let [domain, base, transfer] = indexes();
+    put(DOMAIN_INDEX_AT, "domain index", domain);
+    put(BASE_INDEX_AT, "base index", base);
+    put(TRANSFER_INDEX_AT, "transfer index", transfer);
     if !weights.is_empty() {
         put(TABLE_WORDS, "weights", weights);
     }
@@ -294,6 +339,7 @@ struct Plan<'a> {
     dust: &'a [u32],
 }
 
+#[derive(Clone, Copy)]
 struct Blur {
     level: usize,
     at: u32,
@@ -344,6 +390,9 @@ impl Weights {
             w.data.extend(h.weights.as_flattened());
             let total = at(&w);
             w.data.extend((0..3).map(|j| h.weights[0][j] + h.weights[1][j] + h.weights[2][j]));
+            // halation::Headroom, after the totals: on, knee, span, range, most
+            let r = h.headroom;
+            w.data.extend([f32::from(u8::from(r.is_some())), r.map_or(0.0, |r| r.knee), r.map_or(1.0, |r| r.span), r.map_or(1.0, |r| r.range), r.map_or(0.0, |r| r.most)]);
             w.halation = Some(HalationAt { octaves, mask, weights, total, reach: h.reach() });
         }
         let Some(g) = p.grain else { return w };
@@ -366,30 +415,55 @@ fn local(w: usize, h: usize) -> Region {
     Region { x: 0, y: 0, w, h }
 }
 
-fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &str, tex: &str, taps: &[u32], weights: &Weights) {
+const KEPT: &str = "keep:detail";
+
+#[allow(clippy::too_many_arguments)]
+fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &str, tex: &str, taps: &[u32], weights: &Weights, keep: Option<(String, bool)>) {
     let Some(p) = plan.texture else { return };
     let frame = plan.frame;
     let (region, out) = (plan.region, plan.out);
     let rd = weights.defocus[1] as usize;
     let after = p.grain.is_some() && (rd > 0 || weights.grain.is_some());
     let wide = if after { out.grown(rd, frame) } else { out };
-    let detailed = if after { "tmp:detail" } else { tex };
+    let detailed = if !after { tex } else if keep.is_some() { KEPT } else { "tmp:detail" };
+    let base = base_frame(dev, plan);
+    if let Some((id, need)) = keep.filter(|_| after) {
+        program.keep.push(Keep { buffer: KEPT, id, need });
+        if need {
+            program.buffer(detailed, wide.w * wide.h * 3);
+            let focused = if rd == 0 { detailed } else { defocus_passes(program, base, weights, wide, out, detailed, tex) };
+            grain_passes(program, base, weights, frame, out, focused, tex);
+            return;
+        }
+    }
     let n = region.w * region.h;
-    let base = Frame { flags: 0, radius: 0, count: 0, src: region, dst: region, bounds: [frame.w as u32, frame.h as u32, 0, 0], taps: [0; 4], aux: [0; 4], scale: 0.0, dev };
-    if weights.blur > 0 {
+    // why: the blur's second pass writes the luma plane as it goes, and the dust pass the luma of the pixels it marks,
+    // instead of a pass reading the frame again
+    let blurred = weights.blur > 0;
+    program.buffer("tmp:luma", n);
+    if blurred {
         program.buffer("tmp:blur", n * 3);
         let radius = (weights.blur / 2) as u32;
         program.passes.push(Pass { entry: "blurVertical", params: Frame { radius, ..base }.words(), bind: vec![(1, code.into()), (2, "tmp:blur".into()), (4, "tables".into())], groups: groups(region) });
-        program.passes.push(Pass { entry: "blurHorizontal", params: Frame { radius, ..base }.words(), bind: vec![(1, "tmp:blur".into()), (2, code.into()), (4, "tables".into())], groups: groups(region) });
+        let bind = vec![(1, "tmp:blur".into()), (2, code.into()), (4, "tables".into()), (7, "tmp:luma".into())];
+        program.passes.push(Pass { entry: "blurHorizontal", params: Frame { radius, flags: LUMA, ..base }.words(), bind, groups: groups(region) });
     }
     if !plan.dust.is_empty() {
         let count = plan.dust.len() / 2;
         program.buffer("tmp:dust", plan.dust.len());
         program.writes.push(Write { buffer: "tmp:dust", offset: 0, block: Block::of("dust".into(), plan.dust) });
-        program.passes.push(Pass { entry: "dust", params: Frame { count: count as u32, ..base }.words(), bind: vec![(5, "tmp:dust".into()), (2, code.into())], groups: [count.div_ceil(256), 1] });
+        let mut bind = vec![(5, "tmp:dust".into()), (2, code.into())];
+        let flags = if blurred {
+            bind.push((7, "tmp:luma".into()));
+            LUMA
+        } else {
+            0
+        };
+        program.passes.push(Pass { entry: "dust", params: Frame { count: count as u32, flags, ..base }.words(), bind, groups: [count.div_ceil(256), 1] });
     }
-    program.buffer("tmp:luma", n);
-    program.passes.push(Pass { entry: "lumaPlane", params: base.words(), bind: vec![(1, code.into()), (7, "tmp:luma".into())], groups: groups(region) });
+    if !blurred {
+        program.passes.push(Pass { entry: "lumaPlane", params: base.words(), bind: vec![(1, code.into()), (7, "tmp:luma".into())], groups: groups(region) });
+    }
     let guide = Guide::new(frame);
     let reach = weights.halation.as_ref().map_or(0, |h| h.reach);
     let hwide = wide.grown(reach, frame);
@@ -432,8 +506,13 @@ fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &st
     if !after {
         return;
     }
-    let focused = if rd == 0 { detailed } else { defocus_passes(program, base, weights, wide, out, tex) };
+    let focused = if rd == 0 { detailed } else { defocus_passes(program, base, weights, wide, out, detailed, tex) };
     grain_passes(program, base, weights, frame, out, focused, tex);
+}
+
+fn base_frame<'a>(dev: &'a Developer, plan: &Plan) -> Frame<'a> {
+    let (region, frame) = (plan.region, plan.frame);
+    Frame { flags: 0, radius: 0, count: 0, src: region, dst: region, bounds: [frame.w as u32, frame.h as u32, 0, 0], taps: [0; 4], aux: [0; 4], scale: 0.0, dev }
 }
 
 type Grid = (Span, Span);
@@ -450,7 +529,13 @@ struct Planner<'a> {
     program: &'a mut Program,
     base: Frame<'a>,
     next: usize,
+    weights: &'a [f32],
+    single: bool,
+    reduced: Vec<(String, Blur, (String, Grid))>,
 }
+
+// an octave's sum so far (halation::apply's add_into): the octave's weights and the running sum, if any
+type Sum<'s> = (u32, Option<&'s (String, Grid)>);
 
 impl Planner<'_> {
     fn name(&mut self) -> String {
@@ -459,62 +544,69 @@ impl Planner<'_> {
     }
 
     // why: one axis of the decimation, the level blur or the interpolation, with the spans halation::apply gives the
-    // same step; `scale` is the octave's decimation factor
+    // same step; `scale` is the octave's decimation factor. An octave's last axis also weighs its samples into the
+    // running sum over the samples both hold, as halation::apply's add_into, rather than in a pass of its own; the
+    // highlight mask (`single`) holds one channel
     #[allow(clippy::too_many_arguments)]
-    fn axis(&mut self, entry: &'static str, from: &(String, Grid), to: Grid, vertical: bool, at: u32, radius: u32, scale: usize) -> (String, Grid) {
+    fn axis(&mut self, entry: &'static str, from: &(String, Grid), to: Grid, vertical: bool, at: u32, radius: u32, scale: usize, sum: Option<Sum>) -> (String, Grid) {
         let name = self.name();
-        self.program.buffer(&name, to.0.len() * to.1.len() * 3);
-        let flags = if vertical { VERTICAL } else { 0 };
+        let acc = sum.and_then(|s| s.1);
+        let to = acc.map_or(to, |a| (to.0.meet(a.1.0), to.1.meet(a.1.1)));
+        let channels = if self.single { 1 } else { 3 };
+        self.program.buffer(&name, to.0.len() * to.1.len() * channels);
+        let mut flags = if vertical { VERTICAL } else { 0 };
+        flags |= if self.single { SINGLE } else { 0 } | if sum.is_some() { ADD } else { 0 } | if acc.is_some() { ACCUMULATE } else { 0 };
         let src = from.1;
-        let frame = Frame { flags, radius, count: scale as u32, src: region_of(src), dst: region_of(to), bounds: [src.0.n as u32, src.1.n as u32, 0, 0], aux: [0, 0, at, 0], ..self.base };
-        self.program.passes.push(Pass { entry, params: frame.words(), bind: vec![(1, from.0.clone()), (2, name.clone()), (4, "tables".into())], groups: grid_groups(to) });
-        (name, to)
-    }
-
-    fn reduce(&mut self, from: &(String, Grid), b: &Blur) -> (String, Grid) {
-        let (s, r) = (1 << b.level, b.down_radius as usize);
-        let across = self.axis("pyramidReduce", from, (from.1.0.down(s, r), from.1.1), false, b.down, b.down_radius, s);
-        self.axis("pyramidReduce", &across, (across.1.0, across.1.1.down(s, r)), true, b.down, b.down_radius, s)
-    }
-
-    fn blur(&mut self, from: &(String, Grid), b: &Blur) -> (String, Grid) {
-        let r = b.radius as usize;
-        let across = self.axis("pyramidBlur", from, (from.1.0.blur(r), from.1.1), false, b.at, b.radius, 1);
-        self.axis("pyramidBlur", &across, (across.1.0, across.1.1.blur(r)), true, b.at, b.radius, 1)
-    }
-
-    fn expand(&mut self, from: &(String, Grid), b: &Blur, frame: Size) -> (String, Grid) {
-        let s = 1 << b.level;
-        let across = self.axis("pyramidExpand", from, (from.1.0.up(s, frame.w), from.1.1), false, b.up, 0, s);
-        self.axis("pyramidExpand", &across, (across.1.0, across.1.1.up(s, frame.h)), true, b.up, 0, s)
-    }
-
-    // why: the same steps as halation::Octave::blurred
-    fn octave(&mut self, from: &(String, Grid), b: &Blur, frame: Size) -> (String, Grid) {
-        if b.level == 0 {
-            return self.blur(from, b);
-        }
-        let level = self.reduce(from, b);
-        let level = self.blur(&level, b);
-        self.expand(&level, b, frame)
-    }
-
-    fn add(&mut self, blurred: &(String, Grid), acc: Option<&(String, Grid)>, weights: u32) -> (String, Grid) {
-        let to = match acc {
-            Some(a) => (blurred.1.0.meet(a.1.0), blurred.1.1.meet(a.1.1)),
-            None => blurred.1,
-        };
-        let name = self.name();
-        self.program.buffer(&name, to.0.len() * to.1.len() * 3);
-        let flags = if acc.is_some() { ACCUMULATE } else { 0 };
+        let aux = [0, 0, at, sum.map_or(0, |s| s.0)];
         let taps = acc.map_or([0; 4], |a| grid_words(a.1));
-        let frame = Frame { flags, src: region_of(blurred.1), dst: region_of(to), taps, aux: [0, 0, 0, weights], ..self.base };
-        let mut bind = vec![(1, blurred.0.clone()), (2, name.clone()), (4, "tables".to_string())];
+        let frame = Frame { flags, radius, count: scale as u32, src: region_of(src), dst: region_of(to), bounds: [src.0.n as u32, src.1.n as u32, 0, 0], taps, aux, ..self.base };
+        let mut bind = if self.single { vec![(6, from.0.clone()), (7, name.clone())] } else { vec![(1, from.0.clone()), (2, name.clone())] };
+        bind.push((4, "tables".into()));
         if let Some(a) = acc {
             bind.push((6, a.0.clone()));
         }
-        self.program.passes.push(Pass { entry: "pyramidAdd", params: frame.words(), bind, groups: grid_groups(to) });
+        self.program.passes.push(Pass { entry, params: frame.words(), bind, groups: grid_groups(to) });
         (name, to)
+    }
+
+    fn taps(&self, at: u32, radius: u32) -> &[f32] {
+        let at = at as usize - TABLE_WORDS;
+        &self.weights[at..at + 2 * radius as usize + 1]
+    }
+
+    // why: octaves on one level decimate their source with the same taps, so the level is made once
+    fn reduce(&mut self, from: &(String, Grid), b: &Blur) -> (String, Grid) {
+        let same = |r: &&(String, Blur, (String, Grid))| r.0 == from.0 && r.1.level == b.level && r.1.down_radius == b.down_radius && self.taps(r.1.down, r.1.down_radius) == self.taps(b.down, b.down_radius);
+        if let Some(r) = self.reduced.iter().find(same) {
+            return r.2.clone();
+        }
+        let (s, r) = (1 << b.level, b.down_radius as usize);
+        let across = self.axis("pyramidReduce", from, (from.1.0.down(s, r), from.1.1), false, b.down, b.down_radius, s, None);
+        let level = self.axis("pyramidReduce", &across, (across.1.0, across.1.1.down(s, r)), true, b.down, b.down_radius, s, None);
+        self.reduced.push((from.0.clone(), *b, level.clone()));
+        level
+    }
+
+    fn blur(&mut self, from: &(String, Grid), b: &Blur, sum: Option<Sum>) -> (String, Grid) {
+        let r = b.radius as usize;
+        let across = self.axis("pyramidBlur", from, (from.1.0.blur(r), from.1.1), false, b.at, b.radius, 1, None);
+        self.axis("pyramidBlur", &across, (across.1.0, across.1.1.blur(r)), true, b.at, b.radius, 1, sum)
+    }
+
+    fn expand(&mut self, from: &(String, Grid), b: &Blur, frame: Size, sum: Option<Sum>) -> (String, Grid) {
+        let s = 1 << b.level;
+        let across = self.axis("pyramidExpand", from, (from.1.0.up(s, frame.w), from.1.1), false, b.up, 0, s, None);
+        self.axis("pyramidExpand", &across, (across.1.0, across.1.1.up(s, frame.h)), true, b.up, 0, s, sum)
+    }
+
+    // why: the same steps as halation::Octave::blurred
+    fn octave(&mut self, from: &(String, Grid), b: &Blur, frame: Size, sum: Option<Sum>) -> (String, Grid) {
+        if b.level == 0 {
+            return self.blur(from, b, sum);
+        }
+        let level = self.reduce(from, b);
+        let level = self.blur(&level, b, None);
+        self.expand(&level, b, frame, sum)
     }
 }
 
@@ -533,18 +625,18 @@ fn halation_passes(program: &mut Program, base: Frame, weights: &Weights, frame:
     program.buffer("tmp:hu", hwide.w * hwide.h * 3);
     let mut layers = vec![(1, "tmp:cand".to_string()), (2, "tmp:hu".to_string()), (4, "tables".to_string())];
     if highlights {
-        program.buffer("tmp:hm", hwide.w * hwide.h * 3);
+        program.buffer("tmp:hm", hwide.w * hwide.h);
         layers.push((7, "tmp:hm".into()));
     }
-    program.passes.push(Pass { entry: "halationLayers", params: Frame { flags, src: hwide, dst: hwide, ..base }.words(), bind: layers, groups: groups(hwide) });
-    let mut plan = Planner { program, base, next: 0 };
+    program.passes.push(Pass { entry: "halationLayers", params: Frame { flags, src: hwide, dst: hwide, count: h.total, ..base }.words(), bind: layers, groups: groups(hwide) });
+    let mut plan = Planner { program, base, next: 0, weights: &weights.data, single: false, reduced: Vec::new() };
     let mut sum: Option<(String, Grid)> = None;
     for (k, o) in h.octaves.iter().enumerate() {
-        let blurred = plan.octave(&("tmp:hu".to_string(), start), o, frame);
-        sum = Some(plan.add(&blurred, sum.as_ref(), h.weights + 3 * k as u32));
+        sum = Some(plan.octave(&("tmp:hu".to_string(), start), o, frame, Some((h.weights + 3 * k as u32, sum.as_ref()))));
     }
     let Some(sum) = sum else { return };
-    let mask = h.mask.as_ref().map(|o| plan.octave(&("tmp:hm".to_string(), start), o, frame));
+    plan.single = true;
+    let mask = h.mask.as_ref().map(|o| plan.octave(&("tmp:hm".to_string(), start), o, frame, None));
     let combine = Frame {
         flags,
         src: hwide,
@@ -561,7 +653,7 @@ fn halation_passes(program: &mut Program, base: Frame, weights: &Weights, frame:
     plan.program.passes.push(Pass { entry: "pyramidCombine", params: combine.words(), bind, groups: groups(wide) });
 }
 
-fn defocus_passes<'a>(program: &mut Program, base: Frame, weights: &Weights, wide: Region, out: Region, tex: &'a str) -> &'a str {
+fn defocus_passes<'a>(program: &mut Program, base: Frame, weights: &Weights, wide: Region, out: Region, detailed: &str, tex: &'a str) -> &'a str {
     let band = Region { x: wide.x, y: out.y, w: wide.w, h: out.h };
     program.buffer("tmp:band", band.w * band.h * 3);
     let target = if weights.grain.is_some() { "tmp:focus" } else { tex };
@@ -571,7 +663,7 @@ fn defocus_passes<'a>(program: &mut Program, base: Frame, weights: &Weights, wid
     let [at, radius] = weights.defocus;
     let aux = [0, 0, at, 0];
     let vertical = Frame { src: wide, dst: band, radius, aux, ..base };
-    program.passes.push(Pass { entry: "defocusVertical", params: vertical.words(), bind: vec![(1, "tmp:detail".into()), (2, "tmp:band".into()), (4, "tables".into())], groups: groups(band) });
+    program.passes.push(Pass { entry: "defocusVertical", params: vertical.words(), bind: vec![(1, detailed.into()), (2, "tmp:band".into()), (4, "tables".into())], groups: groups(band) });
     let horizontal = Frame { src: band, dst: out, radius, aux, ..base };
     program.passes.push(Pass { entry: "defocusHorizontal", params: horizontal.words(), bind: vec![(1, "tmp:band".into()), (2, target.into()), (4, "tables".into())], groups: groups(out) });
     target
@@ -627,25 +719,74 @@ fn sample_count(r: Region) -> usize {
     len.div_ceil((len / SAMPLES).max(1))
 }
 
+// what the image before the grain (the detail and halation over the frame grown by the defocus) depends on
+fn kept_key(dev: &Developer, scene: &Scene, out: Region, weights: &Weights) -> Option<String> {
+    let p = dev.texture?;
+    let rd = weights.defocus[1] as usize;
+    (p.grain.is_some() && (rd > 0 || weights.grain.is_some())).then(|| {
+        let utility = dev.chain.utility.as_ref().map(|u| u.id);
+        format!("{}:{:?}:{}:{:?}:{:?}:{utility:?}:{}", scene.id, out.grown(rd, scene.frame), p.film_blur, p.dust, p.halation, dev.light.contrast)
+    })
+}
+
+static KEPT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn key_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish().max(1)
+}
+
+// why: a grain slider changes only the grain, so the image before it stays on the GPU under a key of all it depends
+// on, and a run with the same key grains it again instead of redoing the frame; a run the runner can't serve (the
+// image was trimmed or another frame took the buffer) is redone in full
 pub fn textured(dev: &Developer, scene: &Scene, out: Region, lumas: bool) -> Option<(Textured, Option<Vec<f32>>)> {
     let region = scene.region;
     if region.w * region.h == 0 || scene.rgb.len() != region.w * region.h {
         return None;
     }
-    let dust: Vec<u32> = dev.texture.and_then(|p| p.dust).map_or_else(Vec::new, |d| dust::strength(scene.frame, region, &d).into_iter().flat_map(|(k, s)| [k as u32, s.to_bits()]).collect());
+    let weights = Weights::new(dev, scene.frame);
+    let key = lumas.then(|| kept_key(dev, scene, out, &weights)).flatten();
+    let held = key.as_deref().map(key_hash);
+    let order = std::sync::atomic::Ordering::Relaxed;
+    if let Some(key) = key.clone().filter(|_| held == Some(KEPT_KEY.load(order)))
+        && let Some(done) = texture_run(dev, scene, out, lumas, &weights, Some((key, true)))
+    {
+        return Some(done);
+    }
+    let done = texture_run(dev, scene, out, lumas, &weights, key.map(|k| (k, false)))?;
+    if let Some(h) = held {
+        KEPT_KEY.store(h, order);
+    }
+    Some(done)
+}
+
+fn texture_run(dev: &Developer, scene: &Scene, out: Region, lumas: bool, weights: &Weights, keep: Option<(String, bool)>) -> Option<(Textured, Option<Vec<f32>>)> {
+    let region = scene.region;
+    let reuse = keep.as_ref().is_some_and(|k| k.1);
+    let dust: Vec<u32> = match dev.texture.and_then(|p| p.dust) {
+        Some(d) if !reuse => dust::strength(scene.frame, region, &d).into_iter().flat_map(|(k, s)| [k as u32, s.to_bits()]).collect(),
+        _ => Vec::new(),
+    };
     let plan = Plan { frame: scene.frame, region, out, texture: dev.texture, dust: &dust };
     let mut program = Program::default();
-    let weights = Weights::new(dev, scene.frame);
     tables(&mut program, dev, None, &weights.data);
     let luts = luts(&mut program, dev);
-    let scene_buffer = program.upload(scene_name(scene), &scene.rgb, false);
     let id = next_id();
     let tex = format!("tex:{id}");
     let code = if dev.texture.is_some() { "tmp:code".to_string() } else { tex.clone() };
-    program.buffer(&code, region.w * region.h * 3);
     if dev.texture.is_some() {
         program.buffer(&tex, out.w * out.h * 3);
     }
+    let mut samples = vec![0.0f32; if lumas { sample_count(out) } else { 0 }];
+    if reuse {
+        texture_passes(&mut program, dev, &plan, &code, &tex, &[], weights, keep);
+        sample_pass(&mut program, dev, &tex, &luts, out, &mut samples);
+        return program.run().then(|| (Textured { id, region: out, rgb: Vec::new(), gpu: true, lumas: None }, lumas.then_some(samples)));
+    }
+    let scene_buffer = program.upload(scene_name(scene), &scene.rgb, false);
+    program.buffer(&code, region.w * region.h * 3);
     let mut flags = 0;
     if dev.light.contrast != 0.0 {
         flags |= CONTRAST;
@@ -663,8 +804,7 @@ pub fn textured(dev: &Developer, scene: &Scene, out: Region, lumas: bool) -> Opt
         }
         None => Vec::new(),
     };
-    texture_passes(&mut program, dev, &plan, &code, &tex, &taps, &weights);
-    let mut samples = vec![0.0f32; if lumas { sample_count(out) } else { 0 }];
+    texture_passes(&mut program, dev, &plan, &code, &tex, &taps, weights, keep);
     if lumas {
         sample_pass(&mut program, dev, &tex, &luts, out, &mut samples);
     }
@@ -688,6 +828,16 @@ pub fn finish(dev: &Developer, textured: &Textured, scan: &Scan) -> Option<Toned
         return None;
     }
     let r = textured.region;
+    let mut rgb = vec![[0.0f32; 3]; r.w * r.h];
+    finish_into(dev, textured, scan, &mut rgb).then_some(Toned { region: r, rgb, masks: None, band: false })
+}
+
+/// [`finish`] read back straight into `out` (the region's pixels, row by row).
+pub fn finish_into(dev: &Developer, textured: &Textured, scan: &Scan, out: &mut [[f32; 3]]) -> bool {
+    let r = textured.region;
+    if !textured.gpu || out.len() != r.w * r.h {
+        return false;
+    }
     let mut program = Program::default();
     tables(&mut program, dev, Some(scan), &[]);
     let luts = luts(&mut program, dev);
@@ -699,9 +849,8 @@ pub fn finish(dev: &Developer, textured: &Textured, scan: &Scan) -> Option<Toned
         bind: vec![(1, format!("tex:{}", textured.id)), (3, luts), (4, "tables".into()), (2, "tmp:toned".into())],
         groups: groups(r),
     });
-    let mut rgb = vec![[0.0f32; 3]; r.w * r.h];
-    program.reads.push(Read { buffer: "tmp:toned".into(), at: rgb.as_mut_ptr() as usize, len: r.w * r.h * 3 });
-    program.run().then_some(Toned { region: r, rgb })
+    program.reads.push(Read { buffer: "tmp:toned".into(), at: out.as_mut_ptr() as usize, len: r.w * r.h * 3 });
+    program.run()
 }
 
 #[cfg(target_arch = "wasm32")]

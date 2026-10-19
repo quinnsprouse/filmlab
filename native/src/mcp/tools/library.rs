@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui_kit::AsyncApp;
 use serde::Deserialize;
@@ -7,6 +8,7 @@ use serde_json::{Value, json};
 use super::app::strip;
 use super::{Answer, Output, args, edit};
 use crate::library::PhotoRecord;
+use crate::mcp::session::Hub;
 use crate::ui::driver::Driver;
 
 /// A photo's capture facts in one short object: date, camera, lens, exposure, size.
@@ -42,12 +44,14 @@ struct OpenFolder {
     wait: Option<bool>,
 }
 
-pub async fn open_folder(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn open_folder(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: OpenFolder = args(value)?;
     let folder = expand(&p.path);
     if !folder.is_dir() {
         return Err(format!("{} isn't a folder", folder.display()));
     }
+    let _window = hub.window().await;
+    hub.close_all(cx).await;
     let target = folder.clone();
     driver.act(cx, move |a, cx| a.open_folder(target, cx)).ok_or("Filmlab's window is gone")?;
     let indexed = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| a.library.read(cx).photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some());
@@ -78,20 +82,24 @@ struct OpenPhoto {
     id: String,
 }
 
-pub async fn open_photo(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+pub async fn open_photo(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: OpenPhoto = args(value)?;
     let known = driver.read(cx, |a, cx| a.library.read(cx).record(&p.id).is_some()).unwrap_or(false);
     if !known {
         return Err(format!("no photo {} in the open folder; list_photos gives the ids", p.id));
     }
+    let _window = hub.window().await;
+    // why: an agent's running call on this photo finishes, and is saved, before Develop reads the library
+    let _photo = hub.photo(&p.id).await;
     let id = p.id.clone();
     driver.act(cx, move |a, cx| a.open_photo(&id, cx));
+    hub.hand_over(driver, cx, &p.id);
     if !driver.settled(cx, false).await {
         let error = driver.read(cx, |a, cx| a.develop.read(cx).error.clone()).flatten();
         return Err(error.unwrap_or_else(|| "the photo didn't render within 60 s".into()));
     }
     let facts = driver.read(cx, |a, cx| a.library.read(cx).record(&p.id).map(facts_of)).flatten().unwrap_or_default();
-    let edit = edit::summary(driver, cx, false).unwrap_or_default();
+    let edit = hub.peek(driver, cx, None, |e| edit::describe(&e, false)).unwrap_or_default();
     Ok(Output::json(json!({"id": p.id, "facts": facts, "edit": edit})))
 }
 

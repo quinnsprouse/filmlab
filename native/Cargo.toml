@@ -43,8 +43,25 @@ wgpu = "30.0.1"
 debug = "line-tables-only"
 codegen-units = 16
 
+# why: what ships: whole-program optimisation (fat LTO, one codegen unit) for speed, and no symbols for size
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = "symbols"
+
+# why: the shipped build with its symbols, for measuring what takes space (cargo bloat --profile bloat)
+[profile.bloat]
+inherits = "dist"
+strip = false
+
 [profile.dev.package."*"]
 opt-level = 3
 
 [patch."https://github.com/storytold/lightcraft"]
 lightcraft-pipeline = { path = "../engine/vendor/lightcraft-pipeline" }
+# why: raw, raster and codecs carry Filmlab's faster decode (parallel lossless JPEG, banded preview JPEG, parallel orientation), bit-identical to f34c7a8
+lightcraft-raw = { path = "../engine/vendor/lightcraft-raw" }
+lightcraft-raster = { path = "../engine/vendor/lightcraft-raster" }
+lightcraft-codecs = { path = "../engine/vendor/lightcraft-codecs" }

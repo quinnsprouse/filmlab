@@ -5,7 +5,7 @@ use crate::halation_tables::{
     SIGMA0, TO_DWG, UP_SD,
 };
 use crate::pyramid::{Level, Span};
-use crate::texture::{Curves, Plane, Region, Size};
+use crate::texture::{Curves, Plane, Region, Size, flat_tone};
 
 // why: Resolve blurs an octave on the deepest level n ≤ LEVEL_MAX where (sigma/2^n)² ≥ LEVEL_SWITCH (scratchpad
 // flc/hal/pyr_cf.py, at the noise floor on levels 1–3, interior and borders). The level is decimated straight from
@@ -29,6 +29,74 @@ pub struct HalationParams {
     pub sat: f32,
     pub radius: f32,
     pub highlights_only: bool,
+    /// Where the photo's highlights top out, in the Texture node's code values (`Headroom`); 1 leaves Film Look
+    /// Creator's halation exactly as Resolve renders it.
+    pub ceiling: f32,
+}
+
+/// A stop of LogC3 (EI 800) code: 0.247190 log10(2).
+pub const STOP: f32 = 0.074_412;
+
+// why: Film Look Creator's halation is tuned for a cinema camera's log, whose clipped highlights reach the top of the
+// code range eight stops over grey; a stills raw tops out three or four stops over grey, where the highlight mask and
+// the glow's transfer barely respond, so on a photo it showed nothing. For the halation alone, the photo's top stop is
+// spread up to where a cinema camera clips, easing just past it rather than on to the top of the range, where the
+// transfer runs away; the halated values are then brought back down the same curve, so clipped highlights glow and
+// nothing else in the frame moves
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Headroom {
+    pub(crate) knee: f32,
+    /// the photo's top stop, knee to ceiling, and what it spreads over, knee to a cinema camera's clip
+    pub(crate) span: f32,
+    pub(crate) range: f32,
+    /// how far past the clip the brightest candidate (1) eases; the glow brings nothing back down from further
+    pub(crate) most: f32,
+}
+
+/// How far past a cinema camera's clip the brightest values could ease, as a share of the spread stop.
+const EASE: f32 = 0.1;
+
+impl Headroom {
+    pub(crate) fn of(ceiling: f32) -> Option<Headroom> {
+        if !(ceiling < 1.0) {
+            return None;
+        }
+        let (knee, top, ceil) = (flat_tone(ceiling - STOP), flat_tone(1.0), flat_tone(ceiling));
+        if !(ceil > knee && top > ceil) {
+            return None;
+        }
+        let (span, range) = (ceil - knee, top - knee);
+        let e = (1.0 - knee) / span - 1.0;
+        Some(Headroom { knee, span, range, most: (EASE * e) / (EASE + e) })
+    }
+
+    pub(crate) fn lift(self, v: f32) -> f32 {
+        if !(v > self.knee) {
+            return v;
+        }
+        let t = (v - self.knee) / self.span;
+        let g = if t > 1.0 {
+            let e = t - 1.0;
+            1.0 + (EASE * e) / (EASE + e)
+        } else {
+            t
+        };
+        self.knee + self.range * g
+    }
+
+    pub(crate) fn lower(self, u: f32) -> f32 {
+        if !(u > self.knee) {
+            return u;
+        }
+        let g = (u - self.knee) / self.range;
+        let t = if g > 1.0 {
+            let e = (g - 1.0).min(self.most);
+            1.0 + (EASE * e) / (EASE - e)
+        } else {
+            g
+        };
+        self.knee + self.span * t
+    }
 }
 
 pub(crate) struct Octave {
@@ -89,6 +157,7 @@ pub(crate) struct Halation {
     pub(crate) weights: [[f32; 3]; 3],
     pub(crate) octaves: [Octave; 3],
     pub(crate) mask: Option<Octave>,
+    pub(crate) headroom: Option<Headroom>,
 }
 
 // why: a sampled Gaussian normalised in f64; Resolve's level-0 halation fits any support of 4σ or more equally
@@ -132,7 +201,7 @@ impl Halation {
         let weights = std::array::from_fn(|k| std::array::from_fn(|j| per_layer[j][k] as f32));
         let octaves = std::array::from_fn(|k| Octave::of(s0 * f64::from(1u32 << k), KERNEL_TRUNCATE));
         let mask = p.highlights_only.then(|| Octave::of(MASK_SIGMA * s0, MASK_TRUNCATE));
-        Some(Halation { weights, octaves, mask })
+        Some(Halation { weights, octaves, mask, headroom: Headroom::of(p.ceiling) })
     }
 
     pub(crate) fn reach(&self) -> usize {
@@ -197,14 +266,15 @@ pub(crate) fn apply(cand: &Plane<[f32; 3]>, frame: Size, out: Region, h: &Halati
     let region = cand.region;
     let span = |lo: usize, len: usize, n: usize| Span { lo, hi: lo + len, n };
     let (x0, y0) = (span(region.x, region.w, frame.w), span(region.y, region.h, frame.h));
-    let u = Level { x: x0, y: y0, data: cand.data.par_iter().map(|&c| layers(c, curves)).collect() };
+    let lifted = |c: [f32; 3]| h.headroom.map_or(c, |r| c.map(|v| r.lift(v)));
+    let u = Level { x: x0, y: y0, data: cand.data.par_iter().map(|&c| layers(lifted(c), curves)).collect() };
     let mut sum: Option<Level> = None;
     for (k, o) in h.octaves.iter().enumerate() {
         sum = Some(o.blurred(&u, frame).add_into(h.weights[k], sum.as_ref()));
     }
     let Some(sum) = sum else { return cand.data.clone() };
     let mask = h.mask.as_ref().map(|o| {
-        let m0 = Level { x: x0, y: y0, data: cand.data.par_iter().map(|&c| [weight(c, curves), 0.0, 0.0]).collect() };
+        let m0 = Level { x: x0, y: y0, data: cand.data.par_iter().map(|&c| [weight(lifted(c), curves), 0.0, 0.0]).collect() };
         o.blurred(&m0, frame)
     });
     let total: [f32; 3] = std::array::from_fn(|j| h.weights[0][j] + h.weights[1][j] + h.weights[2][j]);
@@ -215,7 +285,8 @@ pub(crate) fn apply(cand: &Plane<[f32; 3]>, frame: Size, out: Region, h: &Halati
             let base = u.at(x, y);
             let s = sum.at(x, y);
             let m = mask.as_ref().map_or(1.0, |m| m.at(x, y)[0].min(1.0));
-            *v = back(std::array::from_fn(|c| base[c] + m * (s[c] - total[c] * base[c])), curves);
+            let halated = back(std::array::from_fn(|c| base[c] + m * (s[c] - total[c] * base[c])), curves);
+            *v = h.headroom.map_or(halated, |r| halated.map(|v| r.lower(v)));
         }
     });
     result
@@ -243,11 +314,46 @@ mod tests {
         }
     }
 
+    // the headroom's curve comes back down as it went up, to within a hundredth of an 8-bit level where it eases past
+    // the clip, and leaves everything under its knee alone
+    #[test]
+    fn headroom_lowers_what_it_lifts() {
+        let r = Headroom::of(0.64).expect("headroom");
+        for i in 0..=1000 {
+            let v = i as f32 / 1000.0;
+            assert!((r.lower(r.lift(v)) - v).abs() < 1e-4, "{v}");
+            if v <= r.knee {
+                assert_eq!(r.lift(v), v);
+            }
+        }
+        assert!(r.lift(1.0) < r.knee + r.range * (1.0 + EASE));
+        assert!(Headroom::of(1.0).is_none());
+    }
+
+    // a clipped highlight beside a dark edge glows into it once the photo's top is lifted, and a flat field doesn't move
+    #[test]
+    fn clipped_highlights_glow() {
+        let curves = Curves { log2: crate::film::log2_table(), exp2: crate::film::exp2_table() };
+        let edge = |x: usize| if x < 60 { [0.62, 0.6, 0.55] } else { [0.25, 0.25, 0.25] };
+        let frame = Size { w: 160, h: 160 };
+        let whole = Region::whole(frame.w, frame.h);
+        let plane = Plane { region: whole, data: (0..frame.h).flat_map(|_| (0..frame.w).map(edge)).collect() };
+        let at = |ceiling: f32| {
+            let p = HalationParams { amount: 0.5, hue: 0.45, sat: 1.0, radius: 40.0, highlights_only: true, ceiling };
+            apply(&plane, frame, whole, &Halation::new(frame, &p).expect("halation"), &curves)
+        };
+        let (plain, lifted) = (at(1.0), at(0.64));
+        let beside = 40 * frame.w + 62;
+        assert!(lifted[beside][0] - 0.25 > 10.0 * (plain[beside][0] - 0.25).abs(), "{:?} {:?}", plain[beside], lifted[beside]);
+        let far = 40 * frame.w + 150;
+        assert!((lifted[far][0] - plain[far][0]).abs() < 1e-3);
+    }
+
     // a window halates exactly as the whole frame does over the same pixels
     #[test]
     fn windows_match_the_whole_frame() {
         let frame = Size { w: 300, h: 200 };
-        let p = HalationParams { amount: 0.8, hue: 0.45, sat: 1.0, radius: 24.0, highlights_only: true };
+        let p = HalationParams { amount: 0.8, hue: 0.45, sat: 1.0, radius: 24.0, highlights_only: true, ceiling: 1.0 };
         let h = Halation::new(frame, &p).expect("halation");
         assert!(h.octaves.iter().any(|o| o.level >= 2));
         let curves = Curves { log2: crate::film::log2_table(), exp2: crate::film::exp2_table() };

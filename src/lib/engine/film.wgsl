@@ -47,6 +47,7 @@ const utilityFlag = 2u;
 const coefficientsFlag = 4u;
 const candidateFlag = 8u;
 const highlightsFlag = 16u;
+const lumaFlag = 128u;
 
 const log2At = 0u;
 const exp2At = 4097u;
@@ -61,7 +62,10 @@ const transferAt = 29068u;
 const transferSteps = 8000u;
 const dwgAt = 37069u;
 const maskAt = 37087u;
-const weightsAt = 37108u;
+const domainIndexAt = 37108u;
+const baseIndexAt = 45303u;
+const transferIndexAt = 53498u;
+const weightsAt = 61693u;
 const domainLast = 6250u;
 const gridSteps = 1000u;
 
@@ -153,6 +157,29 @@ fn row(m: vec4f, c: vec3f) -> f32 {
 
 fn luma(c: vec3f) -> f32 {
   return add(add(mul(luma709.x, c.x), mul(luma709.y, c.y)), mul(luma709.z, c.z));
+}
+
+// why: the partition point of u in the sorted table at..=at + steps, the binary search starting from the bucket of
+// u's bits (engine/src/gpu.rs index); it ends where the search over the whole table would
+fn ranked(at: u32, steps: u32, index: u32, u: f32) -> u32 {
+  var lo = 0u;
+  var hi = steps + 1u;
+  if (u >= tables[at] && u <= tables[at + steps]) {
+    let base = bitcast<u32>(tables[index]);
+    let bits = max(select(bitcast<u32>(u), 0u, u == 0.0), base) - base;
+    let b = 2u * min(bits >> u32(tables[index + 1u]), u32(tables[index + 2u]) - 1u);
+    lo = u32(tables[index + 3u + b]);
+    hi = u32(tables[index + 4u + b]);
+  }
+  while (lo < hi) {
+    let mid = (lo + hi) / 2u;
+    if (tables[at + mid] <= u) {
+      lo = mid + 1u;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
 
 fn tableAt(at: u32, steps: u32, t: f32) -> f32 {
@@ -271,17 +298,7 @@ fn tone(q: f32, d: f32) -> f32 {
   } else if (u < 0.0) {
     out = add(tables[toneAt], mul(low, u));
   } else {
-    var lo = 0u;
-    var hi = gridSteps + 1u;
-    while (lo < hi) {
-      let mid = (lo + hi) / 2u;
-      if (tables[baseAt + mid] <= u) {
-        lo = mid + 1u;
-      } else {
-        hi = mid;
-      }
-    }
-    let i = clamp(lo, 1u, gridSteps) - 1u;
+    let i = clamp(ranked(baseAt, gridSteps, baseIndexAt, u), 1u, gridSteps) - 1u;
     let f = div(sub(u, tables[baseAt + i]), sub(tables[baseAt + i + 1u], tables[baseAt + i]));
     out = add(tables[toneAt + i], mul(sub(tables[toneAt + i + 1u], tables[toneAt + i]), f));
   }
@@ -396,7 +413,11 @@ fn blurHorizontal(@builtin(global_invocation_id) id: vec3u) {
     let w = tables[weightsAt + u32(k + r)];
     sum = vec3f(add(sum.x, mul(w, s.x)), add(sum.y, mul(w, s.y)), add(sum.z, mul(w, s.z)));
   }
-  write3(id.y * params.dst.z + id.x, sum);
+  let i = id.y * params.dst.z + id.x;
+  write3(i, sum);
+  if ((params.flags & lumaFlag) != 0u) {
+    dst1[i] = luma(sum);
+  }
 }
 
 @compute @workgroup_size(16, 16)
@@ -497,11 +518,16 @@ fn dust(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= params.count) {
     return;
   }
-  let at = taps[2u * id.x] * 3u;
+  let k = taps[2u * id.x];
   let s = bitcast<f32>(taps[2u * id.x + 1u]);
+  var v = vec3f(0.0);
   for (var c = 0u; c < 3u; c++) {
-    let x = dst3[at + c];
-    dst3[at + c] = exact(x + exact(s * exact(1.0 - x)));
+    let x = dst3[3u * k + c];
+    v[c] = exact(x + exact(s * exact(1.0 - x)));
+    dst3[3u * k + c] = v[c];
+  }
+  if ((params.flags & lumaFlag) != 0u) {
+    dst1[k] = luma(v);
   }
 }
 
@@ -536,17 +562,7 @@ fn inverse(u: f32) -> f32 {
   if (u >= tables[domainAt + domainLast]) {
     return 1.25;
   }
-  var lo = 0u;
-  var hi = domainLast + 1u;
-  while (lo < hi) {
-    let mid = (lo + hi) / 2u;
-    if (tables[domainAt + mid] <= u) {
-      lo = mid + 1u;
-    } else {
-      hi = mid;
-    }
-  }
-  let i = clamp(lo, 1u, domainLast) - 1u;
+  let i = clamp(ranked(domainAt, domainLast, domainIndexAt, u), 1u, domainLast) - 1u;
   let f = div(sub(u, tables[domainAt + i]), sub(tables[domainAt + i + 1u], tables[domainAt + i]));
   return div(add(f32(i), f), 5000.0);
 }
@@ -631,14 +647,11 @@ fn grainVertical(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
   let taps = 2u * params.radius + 1u;
+  let at = params.aux.z + taps;
   var v = vec3f(0.0);
-  for (var k = 0u; k < 3u; k++) {
-    let at = params.aux.z + (2u * k + 1u) * taps;
-    var sum = 0.0;
-    for (var t = 0u; t < taps; t++) {
-      sum = add(sum, mul(tables[at + t], src1[(id.y + t) * params.src.z + id.x]));
-    }
-    v[k] = sum;
+  for (var t = 0u; t < taps; t++) {
+    let n = src1[(id.y + t) * params.src.z + id.x];
+    v = vec3f(add(v.x, mul(tables[at + t], n)), add(v.y, mul(tables[at + 2u * taps + t], n)), add(v.z, mul(tables[at + 4u * taps + t], n)));
   }
   write3(id.y * params.dst.z + id.x, v);
 }
@@ -649,16 +662,13 @@ fn grainHorizontal(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
   let taps = 2u * params.radius + 1u;
-  var z = 0.0;
-  for (var k = 0u; k < 3u; k++) {
-    let at = params.aux.z + 2u * k * taps;
-    var sum = 0.0;
-    for (var t = 0u; t < taps; t++) {
-      sum = add(sum, mul(tables[at + t], src3[(id.y * params.src.z + id.x + t) * 3u + k]));
-    }
-    z = add(z, sum);
+  let at = params.aux.z;
+  var sum = vec3f(0.0);
+  for (var t = 0u; t < taps; t++) {
+    let c = read3(id.y * params.src.z + id.x + t);
+    sum = vec3f(add(sum.x, mul(tables[at + t], c.x)), add(sum.y, mul(tables[at + 2u * taps + t], c.y)), add(sum.z, mul(tables[at + 4u * taps + t], c.z)));
   }
-  dst1[id.y * params.dst.z + id.x] = flatten(z);
+  dst1[id.y * params.dst.z + id.x] = flatten(add(add(add(0.0, sum.x), sum.y), sum.z));
 }
 
 @compute @workgroup_size(16, 16)
@@ -709,20 +719,44 @@ fn untransfer(u: f32) -> f32 {
   if (u < first) {
     return div(sub(u, first), tables[maskAt + 1u]);
   }
-  var lo = 0u;
-  var hi = transferSteps + 1u;
-  while (lo < hi) {
-    let mid = (lo + hi) / 2u;
-    if (tables[transferAt + mid] <= u) {
-      lo = mid + 1u;
-    } else {
-      hi = mid;
-    }
-  }
-  let i = clamp(lo, 1u, transferSteps) - 1u;
+  let i = clamp(ranked(transferAt, transferSteps, transferIndexAt, u), 1u, transferSteps) - 1u;
   let a = tables[transferAt + i];
   let f = div(sub(u, a), sub(tables[transferAt + i + 1u], a));
   return div(add(f32(i), f), f32(transferSteps));
+}
+
+// halation::Headroom: the photo's top stop spread toward a cinema camera's clip for the halation, easing just past
+// it, and brought back down the same curve; on, knee, span, range and most sit after the weight totals (params.count)
+const headroomEase = 0.1;
+
+fn lifted(v: f32) -> f32 {
+  let at = params.count + 3u;
+  let knee = tables[at + 1u];
+  if (tables[at] == 0.0 || !(v > knee)) {
+    return v;
+  }
+  let t = div(sub(v, knee), tables[at + 2u]);
+  var g = t;
+  if (t > 1.0) {
+    let e = sub(t, 1.0);
+    g = add(1.0, div(mul(headroomEase, e), add(headroomEase, e)));
+  }
+  return add(knee, mul(tables[at + 3u], g));
+}
+
+fn lowered(u: f32) -> f32 {
+  let at = params.count + 3u;
+  let knee = tables[at + 1u];
+  if (tables[at] == 0.0 || !(u > knee)) {
+    return u;
+  }
+  let g = div(sub(u, knee), tables[at + 3u]);
+  var t = g;
+  if (g > 1.0) {
+    let e = min(sub(g, 1.0), tables[at + 4u]);
+    t = add(1.0, div(mul(headroomEase, e), sub(headroomEase, e)));
+  }
+  return add(knee, mul(tables[at + 2u], t));
 }
 
 fn times(at: u32, v: vec3f) -> vec3f {
@@ -734,10 +768,6 @@ fn times(at: u32, v: vec3f) -> vec3f {
   return out;
 }
 
-fn layers(c: vec3f) -> vec3f {
-  let d = times(dwgAt, vec3f(toLinear(c.x), toLinear(c.y), toLinear(c.z)));
-  return vec3f(transfer(toCode(d.x)), transfer(toCode(d.y)), transfer(toCode(d.z)));
-}
 
 fn gray(w: vec3f) -> f32 {
   let mean = div(add(add(w.x, w.y), w.z), 3.0);
@@ -764,10 +794,29 @@ fn gray(w: vec3f) -> f32 {
   return clamp(g, min(min(w.x, w.y), w.z), max(max(w.x, w.y), w.z));
 }
 
-fn highlight(c: vec3f) -> f32 {
-  let l = clamp(c, vec3f(0.0), vec3f(1.0));
-  let d = max(times(dwgAt, vec3f(toLinear(l.x), toLinear(l.y), toLinear(l.z))), vec3f(0.0));
-  let w = clamp(vec3f(toCode(d.x), toCode(d.y), toCode(d.z)), vec3f(0.0), vec3f(1.0));
+// why: the highlight weight decodes c clamped to [0, 1] and encodes its DWG values floored at 0; where c is already
+// in (0, 1] and a DWG value positive, those are the layers' own linear values and codes, so they're reused
+fn highlight(c: vec3f, lin: vec3f, d: vec3f, code: vec3f) -> f32 {
+  var l = lin;
+  var same = true;
+  for (var k = 0u; k < 3u; k++) {
+    if (!(c[k] > 0.0 && c[k] <= 1.0)) {
+      l[k] = toLinear(clamp(c[k], 0.0, 1.0));
+      same = false;
+    }
+  }
+  var e = d;
+  if (!same) {
+    e = times(dwgAt, l);
+  }
+  let floored = max(e, vec3f(0.0));
+  var w = code;
+  for (var k = 0u; k < 3u; k++) {
+    if (!(same && e[k] > 0.0)) {
+      w[k] = toCode(floored[k]);
+    }
+  }
+  w = clamp(w, vec3f(0.0), vec3f(1.0));
   let v = mul(tables[maskAt], sub(transfer(gray(w)), tables[transferAt]));
   return mul(v, clamp(v, 0.0, 1.0));
 }
@@ -778,12 +827,14 @@ fn halationLayers(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
   let i = id.y * params.dst.z + id.x;
-  let c = read3(i);
-  write3(i, layers(c));
+  let read = read3(i);
+  let c = vec3f(lifted(read.x), lifted(read.y), lifted(read.z));
+  let lin = vec3f(toLinear(c.x), toLinear(c.y), toLinear(c.z));
+  let d = times(dwgAt, lin);
+  let code = vec3f(toCode(d.x), toCode(d.y), toCode(d.z));
+  write3(i, vec3f(transfer(code.x), transfer(code.y), transfer(code.z)));
   if ((params.flags & highlightsFlag) != 0u) {
-    dst1[3u * i] = highlight(c);
-    dst1[3u * i + 1u] = 0.0;
-    dst1[3u * i + 2u] = 0.0;
+    dst1[i] = highlight(c, lin, d, code);
   }
 }
 
@@ -794,6 +845,8 @@ fn halationLayers(@builtin(global_invocation_id) id: vec3u) {
 
 const verticalFlag = 32u;
 const accumulateFlag = 64u;
+const addFlag = 256u;
+const singleFlag = 512u;
 
 fn fma3(w: f32, v: vec3f, acc: vec3f) -> vec3f {
   return vec3f(fma(w, v.x, acc.x), fma(w, v.y, acc.y), fma(w, v.z, acc.z));
@@ -814,6 +867,35 @@ fn lengthOf() -> i32 {
   return i32(select(params.bounds.x, params.bounds.y, (params.flags & verticalFlag) != 0u));
 }
 
+// the highlight mask (singleFlag) holds one channel, read from src1 and written to dst1
+fn readAlong(i: u32) -> vec3f {
+  if ((params.flags & singleFlag) != 0u) {
+    return vec3f(src1[i], 0.0, 0.0);
+  }
+  return read3(i);
+}
+
+// an octave's last axis weighs its samples into the running sum at src1 (addFlag, accumulateFlag), as
+// halation::apply's add_into, the weights at aux.w
+fn writeAlong(id: vec3u, p: vec2i, v: vec3f) {
+  let i = id.y * params.dst.z + id.x;
+  if ((params.flags & singleFlag) != 0u) {
+    dst1[i] = v.x;
+    return;
+  }
+  if ((params.flags & addFlag) == 0u) {
+    write3(i, v);
+    return;
+  }
+  var base = vec3f(0.0);
+  if ((params.flags & accumulateFlag) != 0u) {
+    let at = 3u * inside(params.taps, p.x, p.y);
+    base = vec3f(src1[at], src1[at + 1u], src1[at + 2u]);
+  }
+  let w = params.aux.w;
+  write3(i, vec3f(fma(tables[w], v.x, base.x), fma(tables[w + 1u], v.y, base.y), fma(tables[w + 2u], v.z, base.z)));
+}
+
 @compute @workgroup_size(16, 16)
 fn pyramidReduce(@builtin(global_invocation_id) id: vec3u) {
   if (outside(id)) {
@@ -826,9 +908,9 @@ fn pyramidReduce(@builtin(global_invocation_id) id: vec3u) {
   let r = i32(params.radius);
   var acc = vec3f(0.0);
   for (var t = 0; t <= 2 * r; t++) {
-    acc = fma3(tables[params.aux.z + u32(t)], read3(along(p, mirror(s * m + t - r, n))), acc);
+    acc = fma3(tables[params.aux.z + u32(t)], readAlong(along(p, mirror(s * m + t - r, n))), acc);
   }
-  write3(id.y * params.dst.z + id.x, acc);
+  writeAlong(id, p, acc);
 }
 
 @compute @workgroup_size(16, 16)
@@ -842,9 +924,9 @@ fn pyramidBlur(@builtin(global_invocation_id) id: vec3u) {
   let r = i32(params.radius);
   var acc = vec3f(0.0);
   for (var t = 0; t <= 2 * r; t++) {
-    acc = fma3(tables[params.aux.z + u32(t)], read3(along(p, mirror(m + t - r, n))), acc);
+    acc = fma3(tables[params.aux.z + u32(t)], readAlong(along(p, mirror(m + t - r, n))), acc);
   }
-  write3(id.y * params.dst.z + id.x, acc);
+  writeAlong(id, p, acc);
 }
 
 @compute @workgroup_size(16, 16)
@@ -860,25 +942,9 @@ fn pyramidExpand(@builtin(global_invocation_id) id: vec3u) {
   let phase = u32(q - m0 * s);
   var acc = vec3f(0.0);
   for (var k = 0; k < 4; k++) {
-    acc = fma3(tables[params.aux.z + 4u * phase + u32(k)], read3(along(p, mirror(m0 + k - 1, n))), acc);
+    acc = fma3(tables[params.aux.z + 4u * phase + u32(k)], readAlong(along(p, mirror(m0 + k - 1, n))), acc);
   }
-  write3(id.y * params.dst.z + id.x, acc);
-}
-
-@compute @workgroup_size(16, 16)
-fn pyramidAdd(@builtin(global_invocation_id) id: vec3u) {
-  if (outside(id)) {
-    return;
-  }
-  let p = place(id);
-  let v = read3(inside(params.src, p.x, p.y));
-  var base = vec3f(0.0);
-  if ((params.flags & accumulateFlag) != 0u) {
-    let at = 3u * inside(params.taps, p.x, p.y);
-    base = vec3f(src1[at], src1[at + 1u], src1[at + 2u]);
-  }
-  let w = params.aux.w;
-  write3(id.y * params.dst.z + id.x, vec3f(fma(tables[w], v.x, base.x), fma(tables[w + 1u], v.y, base.y), fma(tables[w + 2u], v.z, base.z)));
+  writeAlong(id, p, acc);
 }
 
 @compute @workgroup_size(16, 16)
@@ -892,7 +958,7 @@ fn pyramidCombine(@builtin(global_invocation_id) id: vec3u) {
   let s = read3(inside(params.aux, p.x, p.y));
   var m = 1.0;
   if ((params.flags & highlightsFlag) != 0u) {
-    m = min(bitcast<f32>(taps[3u * inside(params.taps, p.x, p.y)]), 1.0);
+    m = min(bitcast<f32>(taps[inside(params.taps, p.x, p.y)]), 1.0);
   }
   let total = vec3f(tables[params.count], tables[params.count + 1u], tables[params.count + 2u]);
   var acc = vec3f(0.0);
@@ -900,5 +966,5 @@ fn pyramidCombine(@builtin(global_invocation_id) id: vec3u) {
     acc[c] = add(base[c], mul(m, sub(s[c], mul(total[c], base[c]))));
   }
   let lin = times(dwgAt + 9u, vec3f(toLinear(untransfer(acc.x)), toLinear(untransfer(acc.y)), toLinear(untransfer(acc.z))));
-  write3(id.y * params.dst.z + id.x, saturatedFree(vec3f(toCode(lin.x), toCode(lin.y), toCode(lin.z))));
+  write3(id.y * params.dst.z + id.x, saturatedFree(vec3f(lowered(toCode(lin.x)), lowered(toCode(lin.y)), lowered(toCode(lin.z)))));
 }

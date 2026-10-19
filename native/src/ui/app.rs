@@ -35,6 +35,7 @@ const PINCH_SPEED: f64 = 1.0;
 const WHEEL_SPEED: f64 = 0.01;
 const CLICK_SLOP: f32 = 4.0;
 const UNLOAD_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+const REST_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -73,6 +74,7 @@ pub struct FilmlabApp {
     drag: Option<Drag>,
     reopen: Option<String>,
     unload: Option<Task<()>>,
+    rest: Option<Task<()>>,
 }
 
 fn state_file() -> Option<PathBuf> {
@@ -138,7 +140,20 @@ impl FilmlabApp {
             drag: None,
             reopen: None,
             unload: None,
+            rest: None,
         };
+        cx.observe_window_activation(window, |app, window, cx| app.set_active(window.is_window_active(), cx)).detach();
+        if !window.is_window_active() {
+            app.set_active(false, cx);
+        }
+        // why: the stage size otherwise arrives with the first paint, and a window that isn't drawing (screen locked,
+        // hidden, minimised) never paints, so an agent's open_photo would wait for a frame that never comes
+        let (stage, _) = app.device_stage(window);
+        app.develop.update(cx, |d, _| d.viewport = Size { width: stage.width, height: stage.height });
+        let develop = app.develop.downgrade();
+        cx.set_global(super::slider::OnRelease(Rc::new(move |cx| {
+            let _ = develop.update(cx, |d, cx| d.release(cx));
+        })));
         if let Some((folder, photo)) = last_session() {
             app.open_folder(folder, cx);
             app.reopen = photo;
@@ -162,6 +177,30 @@ impl FilmlabApp {
             }));
         }
         cx.notify();
+    }
+
+    // why: the full-size source that makes zoom instant (about 300 MB for a 24 MP raw) earns its memory while someone
+    // is at the window; while it's in the background it goes after two quiet minutes, and coming back to the window
+    // decodes it again
+    fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active {
+            self.rest = None;
+            self.develop.update(cx, |d, cx| d.wake(cx));
+            return;
+        }
+        self.rest = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REST_AFTER / 4).await;
+                let alive = this.update(cx, |app, cx| {
+                    if app.mode == Mode::Develop {
+                        app.develop.update(cx, |d, cx| d.rest(REST_AFTER, cx));
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     pub fn open_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
@@ -232,7 +271,9 @@ impl FilmlabApp {
         let (stage, s) = self.device_stage(window);
         let r = crate::camera::rect_of(d.camera, frame.region, d.native, Size { width: stage.width, height: stage.height });
         let origin = point(px(((stage.x + r.x) / s) as f32), px(((stage.y + r.y) / s) as f32));
-        let size = size(px((f64::from(frame.width) / s) as f32), px((f64::from(frame.height) / s) as f32));
+        // why: a draft drawn mid-drag has half the pixels but fills the same box
+        let (w, h) = if d.drafting() { (r.width, r.height) } else { (f64::from(frame.width), f64::from(frame.height)) };
+        let size = size(px((w / s) as f32), px((h / s) as f32));
         Some((Bounds::new(origin, size), (frame.width, frame.height)))
     }
 
@@ -421,12 +462,7 @@ impl FilmlabApp {
         let can_undo = develop.cursor > 0;
         let can_redo = develop.cursor + 1 < develop.history.len();
         let before = develop.compare == Compare::Before;
-        let saving = match library.saving {
-            crate::library::Saving::Saving => "Saving…",
-            crate::library::Saving::Saved => "Saved",
-            crate::library::Saving::Failed => "Couldn't save",
-            crate::library::Saving::Idle => "",
-        };
+        let failed = library.saving == crate::library::Saving::Failed;
         self.glass
             .pane("top", 20.0)
             .occlude()
@@ -440,10 +476,21 @@ impl FilmlabApp {
             .items_center()
             .gap(px(10.))
             .child(div().flex().p(px(2.)).rounded_full().bg(theme::track()).child(tab("Library", Mode::Browse, me.clone())).child(tab("Develop", Mode::Develop, me.clone())))
-            .child(div().flex_1().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::primary()).truncate().child(title))
-            .when(mode == Mode::Browse && library.folder.is_some(), |d| d.child(self.browse_toolbar(cx)))
-            .when_some(crate::mcp::presence(), |d, presence| d.child(super::agent::pill(&presence)))
-            .child(div().text_size(px(11.)).text_color(theme::tertiary()).child(saving))
+            // why: the agent and a failed save share the title's stretch, taking room from the title alone, so the
+            // toolbar and buttons never move when they come and go; saving itself is shown in History
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().flex_1().min_w_0().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::primary()).truncate().child(title))
+                    .when(failed, |d| d.child(div().flex_none().text_size(px(12.)).text_color(theme::danger()).child("Couldn't save")))
+                    .when_some(crate::mcp::presence(), |d, presence| d.child(super::agent::pill(presence))),
+            )
+            .when(mode == Mode::Browse && library.folder.is_some(), |d| d.child(div().flex_none().child(self.browse_toolbar(cx))))
             .child(button("open", "folder-open", true, Box::new(|app, window, cx| app.prompt_folder(&OpenFolder, window, cx)), me.clone()))
             .child(button("export", "download04", true, Box::new(|app, window, cx| export::open(app, window, cx)), me.clone()))
             .when(mode == Mode::Develop, |d| {
@@ -595,7 +642,7 @@ impl FilmlabApp {
         };
         let stage = self.stage(window);
         let seen = Bounds::new(point(px(stage.x as f32), px(stage.y as f32)), size(px(stage.width as f32), px(stage.height as f32)));
-        let outline = crate::mcp::presence().zip(self.fit_frame(window, cx)).map(|(presence, (frame, _))| super::agent::outline(&presence, frame.intersect(&seen)));
+        let outline = self.fit_frame(window, cx).map(|(frame, _)| super::agent::outline(frame.intersect(&seen)));
         div()
             .id("stage")
             .absolute()

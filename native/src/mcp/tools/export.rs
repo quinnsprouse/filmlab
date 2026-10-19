@@ -50,7 +50,7 @@ pub async fn export(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer 
                 return Err("no photo is open or selected; give ids".to_string());
             }
             a.develop.update(cx, |d, cx| d.flush(cx));
-            Ok(run::jobs_for(a.library.read(cx), &ids))
+            Ok(run::jobs_for(a.library.read(cx), a.develop.read(cx), &ids, &choices))
         })
         .ok_or(gone)??;
     let (files, errors) = cx
@@ -65,7 +65,11 @@ pub async fn export(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer 
                     }
                     job
                 });
-                match job.and_then(|job| crate::perf::initiated(|| run::export_one(&mut engine, &job, &choices, folder.as_deref()))) {
+                let exported = job.and_then(|job| {
+                    let decoded = job.loupe().and_then(run::Loupe::decoded);
+                    crate::perf::initiated(|| run::export_one(&mut engine, &job, &choices, folder.as_deref(), decoded))
+                });
+                match exported {
                     Ok(path) => files.push(path.display().to_string()),
                     Err(e) => errors.push(format!("{id}: {e}")),
                 }

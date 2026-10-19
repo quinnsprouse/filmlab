@@ -267,7 +267,11 @@ impl Frame {
             out
         };
         match (plan.mode, self.warp.as_ref()) {
-            (SampleMode::Copy, _) => base.into_owned(),
+            // why: Filmlab: a borrowed source is copied row-parallel (`Cow::into_owned` cloned it on one core)
+            (SampleMode::Copy, _) => match base {
+                std::borrow::Cow::Owned(img) => img,
+                std::borrow::Cow::Borrowed(img) => img.par_copy(),
+            },
             (SampleMode::Warp(o2t), Some(warp)) => sample_warped(&base, plan.sx, plan.sy, warp, o2t, w, h),
             // `sample_plan` plans a warp only when there is one; without it the same mapping is affine
             (SampleMode::Warp(o2t), None) => affine(Affine::scale(plan.sx, plan.sy) * o2t),

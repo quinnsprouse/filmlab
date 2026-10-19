@@ -40,7 +40,7 @@ fn match_look(args: &Map<String, Value>) -> String {
     let targets = arg(args, "targets").map_or("the other photos in the folder".to_string(), |t| format!("photos {t}"));
     format!(
         "Carry the look of {source} to {targets}. Save its look as a profile (profiles action=save, default look groups), \
-         apply it to each target (open_photo, profiles action=apply), then fix each one's own exposure and white balance so \
+         apply it to each target (profiles action=apply photo=<id>; no need to open it), then fix each one's own exposure and white balance so \
          they sit together, checking every photo with preview and analyze against the source. Report what differed."
     )
 }

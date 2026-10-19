@@ -52,3 +52,7 @@ miniz_oxide = { opt-level = 3 }
 
 [patch."https://github.com/storytold/lightcraft"]
 lightcraft-pipeline = { path = "vendor/lightcraft-pipeline" }
+# why: raw, raster and codecs carry Filmlab's faster decode (parallel lossless JPEG, banded preview JPEG, parallel orientation), bit-identical to f34c7a8
+lightcraft-raw = { path = "vendor/lightcraft-raw" }
+lightcraft-raster = { path = "vendor/lightcraft-raster" }
+lightcraft-codecs = { path = "vendor/lightcraft-codecs" }
