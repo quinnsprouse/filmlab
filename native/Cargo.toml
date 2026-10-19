@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 rmcp = { version = "3.5", default-features = false, features = [
   "server",
   "transport-streamable-http-server",
