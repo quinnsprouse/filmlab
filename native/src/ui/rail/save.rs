@@ -175,8 +175,8 @@ pub fn form(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
                 .flex_none()
                 .flex()
                 .gap(px(theme::GAP))
-                .child(button("save-cancel", "Cancel", true, move |_, cx| cancel.update(cx, |app, cx| close(app, cx))))
-                .child(button("save-confirm", "Save profile", can_save, move |_, cx| save.update(cx, |app, cx| submit(app, cx)))),
+                .child(button("save-cancel", "Cancel", true, move |_, cx| cancel.update(cx, close)))
+                .child(button("save-confirm", "Save profile", can_save, move |_, cx| save.update(cx, submit))),
         )
         .into_any_element()
 }

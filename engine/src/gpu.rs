@@ -853,38 +853,12 @@ pub fn finish_into(dev: &Developer, textured: &Textured, scan: &Scan, out: &mut 
     program.run()
 }
 
-#[cfg(target_arch = "wasm32")]
-mod bridge {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(catch, js_namespace = globalThis, js_name = filmlabGpuRun)]
-        fn program(memory: &JsValue, program: &str) -> Result<u32, JsValue>;
-
-        #[wasm_bindgen(catch, js_namespace = globalThis, js_name = filmlabGpuUpload)]
-        fn prefetch(memory: &JsValue, block: &str) -> Result<(), JsValue>;
-    }
-
-    pub fn run(json: &str) -> bool {
-        program(&wasm_bindgen::memory(), json).is_ok_and(|done| done == 1)
-    }
-
-    pub fn upload(block: &str) {
-        let _ = prefetch(&wasm_bindgen::memory(), block);
-    }
-
-    pub fn forget(_name: &str) {}
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 pub use bridge::{Runner, install};
 
-#[cfg(not(target_arch = "wasm32"))]
 mod bridge {
     use std::sync::OnceLock;
 
-    // why: programs name engine memory by address and length, as in the browser; a native runner reads
+    // why: programs name engine memory by address and length; the runner reads
     // those addresses during the call, while the engine keeps the blocks alive
     pub trait Runner: Send + Sync {
         fn run(&self, program: &str) -> bool;

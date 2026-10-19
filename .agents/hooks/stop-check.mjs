@@ -1,32 +1,15 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, extname, join, resolve } from "node:path";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 
-const require = createRequire(import.meta.url);
 const projectRoot =
   process.env.CLAUDE_PROJECT_DIR ?? resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const stateFile = join(projectRoot, "node_modules", ".cache", "rodeo", "stop-check.json");
-const checkableExtensions = new Set([
-  ".cjs",
-  ".css",
-  ".cts",
-  ".html",
-  ".js",
-  ".json",
-  ".jsonc",
-  ".jsx",
-  ".md",
-  ".mjs",
-  ".mts",
-  ".ts",
-  ".tsx",
-  ".yaml",
-  ".yml",
-]);
+const dependents = { engine: ["engine", "native"], native: ["native"] };
+const buildInput = /\.(?:rs|toml|lock|wgsl)$/;
+const diagnostic = /^(\S+?):\d+:\d+: (warning|error)\b/;
 const outputLimit = 3_500;
 
 function git(args) {
@@ -69,9 +52,13 @@ function fingerprint(base, files) {
   return hash.digest("hex");
 }
 
+function stateFile() {
+  return resolve(projectRoot, git(["rev-parse", "--git-path", "filmlab-stop-check.json"]).trim());
+}
+
 function readState() {
   try {
-    const value = JSON.parse(readFileSync(stateFile, "utf8"));
+    const value = JSON.parse(readFileSync(stateFile(), "utf8"));
     return typeof value === "object" && value !== null ? value : {};
   } catch {
     return {};
@@ -79,42 +66,40 @@ function readState() {
 }
 
 function writeState(state) {
-  mkdirSync(dirname(stateFile), { recursive: true });
-  writeFileSync(stateFile, `${JSON.stringify(state)}\n`);
+  writeFileSync(stateFile(), `${JSON.stringify(state)}\n`);
 }
 
-function packageBinary(packageName, binaryName) {
-  const packagePath = require.resolve(`${packageName}/package.json`);
-  const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
-  const binary =
-    typeof packageJson.bin === "string" ? packageJson.bin : packageJson.bin?.[binaryName];
-  if (!binary) throw new Error(`${packageName} does not expose ${binaryName}`);
-  return resolve(dirname(packagePath), binary);
+function cratesFor(files) {
+  const crates = new Set();
+  for (const path of files.filter((file) => buildInput.test(file))) {
+    for (const crate of dependents[path.split("/")[0]] ?? []) crates.add(crate);
+  }
+  return [...crates];
 }
 
-function run(label, binary, args) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(process.execPath, [binary, ...args], {
-      cwd: projectRoot,
-      env: { ...process.env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" },
-    });
-    let output = "";
-    child.stdout.on("data", (chunk) => (output += chunk));
-    child.stderr.on("data", (chunk) => (output += chunk));
-    child.on("error", (error) => resolvePromise({ label, ok: false, output: String(error) }));
-    child.on("close", (code) => resolvePromise({ label, ok: code === 0, output }));
+function clippy(crate, changed) {
+  const crateDir = join(projectRoot, crate);
+  const result = spawnSync("cargo", ["clippy", "--all-targets", "--message-format", "short"], {
+    cwd: crateDir,
+    encoding: "utf8",
+    maxBuffer: 64 << 20,
+    env: { ...process.env, CARGO_TERM_COLOR: "never" },
   });
-}
-
-function clean(text) {
-  return stripVTControlCharacters(text)
-    .split("\n")
-    .filter((line) => !line.startsWith("note: You are running `vp"))
-    .join("\n");
+  if (result.error) return { label: `cargo clippy (${crate})`, output: String(result.error) };
+  const output = stripVTControlCharacters(`${result.stdout}${result.stderr}`);
+  const blocking = lines(output).filter((line) => {
+    const match = diagnostic.exec(line);
+    if (!match) return false;
+    const path = relative(projectRoot, resolve(crateDir, match[1]));
+    return match[2] === "error" || changed.has(path);
+  });
+  if (blocking.length > 0) return { label: `cargo clippy (${crate})`, output: blocking.join("\n") };
+  if (result.status !== 0) return { label: `cargo clippy (${crate})`, output };
+  return null;
 }
 
 function tail(text, limit) {
-  const trimmed = clean(text).trim();
+  const trimmed = text.trim();
   return trimmed.length > limit ? `...${trimmed.slice(-limit)}` : trimmed;
 }
 
@@ -126,13 +111,12 @@ function respond(output) {
 try {
   const input = JSON.parse(readFileSync(0, "utf8"));
   if (input.hook_event_name !== "Stop") process.exit(0);
-  if (!existsSync(join(projectRoot, ".git")) || !existsSync(join(projectRoot, "node_modules"))) {
-    process.exit(0);
-  }
+  if (!existsSync(join(projectRoot, ".git"))) process.exit(0);
 
   const base = baseRevision();
   const files = changedFiles(base);
-  if (files.length === 0) process.exit(0);
+  const crates = cratesFor(files);
+  if (crates.length === 0) process.exit(0);
 
   const state = readState();
   const current = fingerprint(base, files);
@@ -142,30 +126,12 @@ try {
   if (retriedWithoutChanges) {
     respond({
       systemMessage:
-        "The stop check still fails on the current changes. Run `npm run check` to see the errors.",
+        "The stop check still fails on the current changes. Run `scripts/check.sh` to see the errors.",
     });
   }
 
-  const vp = packageBinary("vite-plus", "vp");
-  const checkable = files.filter((path) => checkableExtensions.has(extname(path).toLowerCase()));
-  const results = await Promise.all([
-    checkable.length > 0
-      ? run("vp check (changed files)", vp, [
-          "check",
-          "--no-error-on-unmatched-pattern",
-          ...checkable,
-        ])
-      : { label: "vp check", ok: true, output: "" },
-    run("tsc -b", packageBinary("typescript", "tsc"), ["-b", "--pretty", "false"]),
-    run("vp test run --changed", vp, [
-      "test",
-      "run",
-      ...(base === "HEAD" ? ["--changed"] : []),
-      "--passWithNoTests",
-    ]),
-  ]);
-
-  const failures = results.filter((result) => !result.ok);
+  const changed = new Set(files);
+  const failures = crates.map((crate) => clippy(crate, changed)).filter(Boolean);
   if (failures.length === 0) {
     writeState({ ...state, passed: current });
     process.exit(0);
@@ -176,7 +142,7 @@ try {
   respond({
     decision: "block",
     reason: [
-      "The stop check found problems in the files you changed. Fix them before you finish.",
+      "The stop check found problems in the Rust files you changed. Fix them before you finish.",
       ...failures.map((failure) => `${failure.label} failed:\n${tail(failure.output, perFailure)}`),
     ].join("\n\n"),
   });

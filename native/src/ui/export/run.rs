@@ -135,7 +135,6 @@ pub fn jobs_for(library: &Library, develop: &Develop, ids: &[String], choices: &
     ids.iter().map(|id| (id.clone(), job(id))).collect()
 }
 
-// why: the web app overwrites; the native app keeps earlier exports by numbering the new file instead
 fn create_unique(folder: &Path, stem: &str, extension: &str) -> Result<(PathBuf, std::fs::File), String> {
     std::fs::create_dir_all(folder).map_err(|e| format!("Couldn't create {}: {e}", folder.display()))?;
     for n in 1..1000 {

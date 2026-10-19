@@ -1929,7 +1929,6 @@ dependencies = [
 name = "filmlab-engine"
 version = "0.1.0"
 dependencies = [
- "console_error_panic_hook",
  "lightcraft-engine",
  "lightcraft-geom",
  "lightcraft-meta",
@@ -1937,7 +1936,6 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "wasm-bindgen",
 ]
 
 [[package]]

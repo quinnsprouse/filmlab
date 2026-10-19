@@ -40,13 +40,13 @@ fn look(frame: &DisplayFrame) -> Look {
 
 fn look_of(width: u32, height: u32, rgba: &[u8]) -> Look {
     let hash = rgba.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
-    let luma: Vec<f64> = rgba.chunks_exact(4).map(|p| (0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])) / 255.0).collect();
+    let luma: Vec<f64> = rgba.as_chunks::<4>().0.iter().map(|p| (0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])) / 255.0).collect();
     let n = luma.len().max(1) as f64;
     let mean = luma.iter().sum::<f64>() / n;
     let spread = (luma.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
     let rows = rgba.chunks_exact(width as usize * 4);
     let total = rows.len().max(1) as f64;
-    let flat = rgba.chunks_exact(width as usize * 4).filter(|row| row.chunks_exact(4).all(|p| p == &row[..4])).count() as f64;
+    let flat = rgba.chunks_exact(width as usize * 4).filter(|row| row.as_chunks::<4>().0.iter().all(|p| p == &row[..4])).count() as f64;
     Look { hash, mean, spread, flat_rows: flat / total, size: (width, height) }
 }
 

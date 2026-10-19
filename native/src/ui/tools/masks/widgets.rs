@@ -6,6 +6,7 @@ use gpui_kit::*;
 
 use crate::menu::{self, Entry};
 use crate::ui::app::FilmlabApp;
+use crate::ui::controls::OnPick;
 use crate::ui::theme;
 
 pub fn glyph(name: &str, size: f32, color: Hsla) -> Svg {
@@ -64,7 +65,7 @@ pub struct MenuButton {
     content: AnyElement,
     entries: Vec<String>,
     wide: bool,
-    on_pick: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    on_pick: OnPick,
 }
 
 impl MenuButton {

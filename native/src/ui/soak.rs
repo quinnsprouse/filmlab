@@ -84,7 +84,7 @@ pub fn start(app: &Entity<FilmlabApp>, cx: &mut App) {
         if std::env::var_os("FILMLAB_SOAK_HOLD").is_some() {
             cx.background_executor().timer(Duration::from_secs(30)).await;
         }
-        let _ = cx.update(|cx| cx.quit());
+        cx.update(|cx| cx.quit());
     })
     .detach();
 }

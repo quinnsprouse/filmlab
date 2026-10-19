@@ -253,7 +253,7 @@ pub fn panel(app: &mut FilmlabApp, _window: &mut Window, cx: &mut Context<Filmla
                         }
                     })
                 }))
-                .child(button("heal-dust", "Find dust", true, move |_, cx| dust.update(cx, |app, cx| spots::find_dust(app, cx)))),
+                .child(button("heal-dust", "Find dust", true, move |_, cx| dust.update(cx, spots::find_dust))),
         )
         .children(app.tools.heal.message.clone().map(|m| div().text_size(px(13.)).text_color(theme::label()).child(m)))
         .child(div().mt(px(6.)).child(spot_list(&spots, selected, &me)))

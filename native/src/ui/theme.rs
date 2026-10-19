@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use gpui_kit::{FontFeatures, Hsla, Rgba, rgba};
+use gpui_kit::{FontFeatures, Hsla, rgba};
 
 fn c(hex: u32) -> Hsla {
-    Hsla::from(Rgba::from(rgba(hex)))
+    Hsla::from(rgba(hex))
 }
 
 fn white(alpha: f32) -> Hsla {

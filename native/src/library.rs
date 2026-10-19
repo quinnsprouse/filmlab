@@ -169,7 +169,7 @@ fn state_of(probed: &Probed, sidecar: Option<&str>) -> Result<PhotoState, String
 }
 
 pub fn image_of(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Arc<RenderImage>> {
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
@@ -183,7 +183,7 @@ fn look_of(settings: &Value, film: Option<&FilmSettings>) -> u64 {
 
 fn cached_image(pixels: cache::Pixels) -> Option<Arc<RenderImage>> {
     let cache::Pixels { width, height, mut rgba } = pixels;
-    rgba.chunks_exact_mut(4).for_each(|px| px.swap(0, 2));
+    rgba.as_chunks_mut::<4>().0.iter_mut().for_each(|px| px.swap(0, 2));
     let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }

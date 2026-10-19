@@ -1,7 +1,9 @@
 version: 2
 updates:
-  - package-ecosystem: npm
-    directory: /
+  - package-ecosystem: cargo
+    directories:
+      - /engine
+      - /native
     schedule:
       interval: weekly
       day: monday
@@ -11,13 +13,6 @@ updates:
         update-types:
           - minor
           - patch
-        exclude-patterns:
-          - vite-plus
-          - "@oxlint/plugins"
-      vite-plus-toolchain:
-        patterns:
-          - vite-plus
-          - "@oxlint/plugins"
     commit-message:
       prefix: chore
       include: scope

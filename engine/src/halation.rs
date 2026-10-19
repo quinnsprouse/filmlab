@@ -58,7 +58,7 @@ const EASE: f32 = 0.1;
 
 impl Headroom {
     pub(crate) fn of(ceiling: f32) -> Option<Headroom> {
-        if !(ceiling < 1.0) {
+        if ceiling.is_nan() || ceiling >= 1.0 {
             return None;
         }
         let (knee, top, ceil) = (flat_tone(ceiling - STOP), flat_tone(1.0), flat_tone(ceiling));
@@ -71,7 +71,7 @@ impl Headroom {
     }
 
     pub(crate) fn lift(self, v: f32) -> f32 {
-        if !(v > self.knee) {
+        if v.is_nan() || v <= self.knee {
             return v;
         }
         let t = (v - self.knee) / self.span;
@@ -85,7 +85,7 @@ impl Headroom {
     }
 
     pub(crate) fn lower(self, u: f32) -> f32 {
-        if !(u > self.knee) {
+        if u.is_nan() || u <= self.knee {
             return u;
         }
         let g = (u - self.knee) / self.range;
@@ -359,7 +359,7 @@ mod tests {
         let curves = Curves { log2: crate::film::log2_table(), exp2: crate::film::exp2_table() };
         let pixel = |x: usize, y: usize| {
             let v = ((x * 7 + y * 13) % 29) as f32 / 29.0;
-            if (x / 17 + y / 11) % 5 == 0 { [1.0, 0.95, 0.9] } else { [v, v * 0.8, 0.3] }
+            if (x / 17 + y / 11).is_multiple_of(5) { [1.0, 0.95, 0.9] } else { [v, v * 0.8, 0.3] }
         };
         let whole = Region::whole(frame.w, frame.h);
         let plane = |r: Region| Plane { region: r, data: (0..r.h).flat_map(|j| (0..r.w).map(move |i| pixel(r.x + i, r.y + j))).collect() };

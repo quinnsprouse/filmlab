@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use super::model::Pt;
 
 /// Maps between normalized image points and the overlay box (window points), through the engine's own
-/// geometry, the same way the web `viewSpace` does.
+/// geometry.
 #[derive(Clone)]
 pub struct ViewSpace {
     facts: String,

@@ -120,7 +120,7 @@ fn footer(app: &FilmlabApp, count: usize, cx: &mut Context<FilmlabApp>) -> Div {
     let row = div().mt(px(18.)).flex().justify_end().gap(px(theme::GAP));
     match app.export.phase {
         Phase::Idle => row
-            .child(button("export-cancel", "Cancel", false, true, cx, |app, window, cx| close(app, window, cx)))
+            .child(button("export-cancel", "Cancel", false, true, cx, close))
             .child(button("export-go", format!("Export {}", plural(count)), true, count > 0, cx, |app, _, cx| start(app, cx))),
         Phase::Running => row.child(button("export-stop", "Cancel", false, !app.export.stopped(), cx, |app, _, cx| {
             app.export.cancel.store(true, Ordering::Relaxed);
@@ -131,7 +131,7 @@ fn footer(app: &FilmlabApp, count: usize, cx: &mut Context<FilmlabApp>) -> Div {
             let failed = !app.export.errors.is_empty();
             row.when(failed, |r| r.child(button("export-back", "Back", false, true, cx, |app, _, cx| back(app, cx))))
                 .when_some(first, |r, folder| r.child(button("export-reveal", "Show in Finder", false, true, cx, move |_, _, cx| cx.reveal_path(&folder))))
-                .child(button("export-done", "Done", true, true, cx, |app, window, cx| close(app, window, cx)))
+                .child(button("export-done", "Done", true, true, cx, close))
         }
     }
 }

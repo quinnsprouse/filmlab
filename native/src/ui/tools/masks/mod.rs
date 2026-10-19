@@ -1,4 +1,4 @@
-// Port of the web masks tool (src/components/darkroom/develop/masks): the panel lists, creates and adjusts
+// The masks tool: the panel lists, creates and adjusts
 // LightCraft masks through `mask.*` commands; the overlay edits their shapes on the photo.
 mod adjust;
 mod brush_panel;

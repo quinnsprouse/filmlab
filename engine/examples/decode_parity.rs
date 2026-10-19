@@ -21,12 +21,12 @@ impl Fnv {
 impl Hasher for Fnv {
     fn write(&mut self, bytes: &[u8]) {
         // (word at a time: a full-size decode is ~300 MB of floats)
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.0 = (self.0 ^ u64::from_le_bytes(c.try_into().unwrap_or_default())).wrapping_mul(0x100_0000_01b3);
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.0 = (self.0 ^ u64::from_le_bytes(*word)).wrapping_mul(0x100_0000_01b3);
             self.0 ^= self.0 >> 29;
         }
-        for b in chunks.remainder() {
+        for b in rest {
             self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
         }
     }

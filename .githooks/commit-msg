@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+header=$(sed -n '/^[^#]/{p;q;}' "$1")
+types='build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test'
+
+case "$header" in
+  Merge\ * | Revert\ * | fixup!\ * | squash!\ * | amend!\ *) exit 0 ;;
+esac
+
+if ! printf '%s\n' "$header" | grep -Eq "^($types)(\([a-z0-9._/-]+\))?!?: [^ ](.*[^.])?$"; then
+  echo "commit-msg: use Conventional Commits, type(scope): description" >&2
+  echo "  types: $(echo "$types" | tr '|' ' ')" >&2
+  echo "  got:   $header" >&2
+  exit 1
+fi
+
+if [ "${#header}" -gt 100 ]; then
+  echo "commit-msg: keep the header to 100 characters (it has ${#header})" >&2
+  exit 1
+fi
+
+if grep -iq '^co-authored-by:' "$1"; then
+  echo "commit-msg: drop the Co-Authored-By trailer" >&2
+  exit 1
+fi

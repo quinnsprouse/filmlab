@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use wgpu::util::DeviceExt;
 
-const SHADER: &str = include_str!("../../src/lib/engine/film.wgsl");
+const SHADER: &str = include_str!("film.wgsl");
 const PARAMS_SLOT: u64 = 512;
 const SPARE: usize = 4;
 // uploads smaller than this (the tables, dust and taps) go through queue.write_buffer
@@ -498,7 +498,7 @@ fn mark(store: &mut Store, program: &Program) {
     }
 }
 
-// why: naga can't evaluate bitcast in a const expression, which the browser's compiler can; each one is a
+// why: naga can't evaluate bitcast in a const expression; each one is a
 // finite f32 written by its bits, so it becomes a decimal literal that parses back to the same bits
 fn shader() -> String {
     const OPEN: &str = "bitcast<f32>(0x";

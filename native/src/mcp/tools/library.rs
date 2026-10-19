@@ -141,10 +141,7 @@ pub fn list_photos(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
                 .map(|r| {
                     let facts = facts_of(r);
                     let taken = facts["taken"].as_str().map_or(String::new(), |t| t.chars().skip(5).collect());
-                    let flag = match r.state.as_ref().map(|s| s.flag.as_str()) {
-                        Some(f @ ("pick" | "reject")) => f,
-                        _ => "",
-                    };
+                    let flag = r.state.as_ref().map(|s| s.flag.as_str()).filter(|f| matches!(*f, "pick" | "reject")).unwrap_or_default();
                     let film = r.state.as_ref().and_then(|s| s.film()).and_then(|f| f.negative).map(|id| a.stocks.iter().find(|s| s.id == id).map_or(id, |s| s.name.clone()));
                     let mut row = vec![json!(r.file.id), json!(taken), json!(flag), json!(r.state.as_ref().map_or(0, |s| s.rating)), json!(edited(r).unwrap_or(false)), json!(film.unwrap_or_default())];
                     if detail {

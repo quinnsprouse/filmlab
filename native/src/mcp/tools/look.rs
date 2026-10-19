@@ -68,7 +68,7 @@ pub async fn render(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: u
 }
 
 pub fn jpeg(shot: &Shot, quality: u8) -> Result<Vec<u8>, String> {
-    let rgb: Vec<u8> = shot.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<u8> = shot.rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
     let mut out = Cursor::new(Vec::new());
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
         .encode(&rgb, shot.width, shot.height, image::ExtendedColorType::Rgb8)
@@ -76,7 +76,7 @@ pub fn jpeg(shot: &Shot, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out.into_inner())
 }
 
-fn luma(p: &[u8]) -> f64 {
+fn luma(p: &[u8; 4]) -> f64 {
     (0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])) / 255.0
 }
 
@@ -95,11 +95,11 @@ fn round(v: f64, places: i32) -> f64 {
 
 /// The few numbers that tell whether an edit worked: tones, clipping.
 fn brief(shot: &Shot) -> Value {
-    let mut l: Vec<f64> = shot.rgba.chunks_exact(4).map(luma).collect();
+    let mut l: Vec<f64> = shot.rgba.as_chunks::<4>().0.iter().map(luma).collect();
     l.sort_by(f64::total_cmp);
     let n = l.len().max(1) as f64;
-    let white = shot.rgba.chunks_exact(4).filter(|p| p[..3].iter().any(|&c| c >= 254)).count() as f64 / n;
-    let black = shot.rgba.chunks_exact(4).filter(|p| p[..3].iter().all(|&c| c <= 1)).count() as f64 / n;
+    let white = shot.rgba.as_chunks::<4>().0.iter().filter(|p| p[..3].iter().any(|&c| c >= 254)).count() as f64 / n;
+    let black = shot.rgba.as_chunks::<4>().0.iter().filter(|p| p[..3].iter().all(|&c| c <= 1)).count() as f64 / n;
     json!({"size": [shot.width, shot.height], "luma": {"p1": percentile(&l, 0.01), "p50": percentile(&l, 0.5), "p99": percentile(&l, 0.99)}, "clip%": {"white": round(white * 100.0, 2), "black": round(black * 100.0, 2)}})
 }
 
@@ -108,7 +108,7 @@ fn linear(c: u8) -> f64 {
     if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
 
-fn lab(p: &[u8]) -> [f64; 3] {
+fn lab(p: &[u8; 4]) -> [f64; 3] {
     let (r, g, b) = (linear(p[0]), linear(p[1]), linear(p[2]));
     let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
     let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -120,15 +120,15 @@ fn lab(p: &[u8]) -> [f64; 3] {
 
 /// Tones, clipping, colour and the cast of near-neutral pixels, from display-referred sRGB.
 fn measure(shot: &Shot) -> Value {
-    let px: Vec<&[u8]> = shot.rgba.chunks_exact(4).collect();
+    let px: &[[u8; 4]] = shot.rgba.as_chunks::<4>().0;
     let n = px.len().max(1) as f64;
-    let mut l: Vec<f64> = px.iter().map(|p| luma(p)).collect();
+    let mut l: Vec<f64> = px.iter().map(luma).collect();
     l.sort_by(f64::total_cmp);
     let mut bins = [0usize; 16];
     for v in &l {
         bins[((v * 16.0) as usize).min(15)] += 1;
     }
-    let labs: Vec<[f64; 3]> = px.iter().map(|p| lab(p)).collect();
+    let labs: Vec<[f64; 3]> = px.iter().map(lab).collect();
     let mut chroma: Vec<f64> = labs.iter().map(|c| c[1].hypot(c[2])).collect();
     chroma.sort_by(f64::total_cmp);
     let mean = |i: usize| labs.iter().map(|c| c[i]).sum::<f64>() / n;

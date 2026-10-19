@@ -98,8 +98,7 @@ pub fn open(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabA
     cx.notify();
 }
 
-// why: the web app exports the open photo in Develop and the selection in Browse, or every photo when none is
-// selected
+// why: Develop exports the open photo and Browse the selection, or every photo when none is selected
 fn ids(app: &FilmlabApp, cx: &gpui_kit::App) -> Vec<String> {
     if app.mode == Mode::Develop {
         let open = app.develop.read(cx).photo_id.clone();

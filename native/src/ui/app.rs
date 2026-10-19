@@ -43,6 +43,8 @@ pub enum Mode {
     Develop,
 }
 
+type Action = Box<dyn Fn(&mut FilmlabApp, &mut Window, &mut Context<FilmlabApp>)>;
+
 #[derive(Default)]
 struct Pushed {
     fit: Option<usize>,
@@ -446,7 +448,7 @@ impl FilmlabApp {
                 })
                 .child(label)
         };
-        let button = |id: &'static str, glyph: &'static str, enabled: bool, action: Box<dyn Fn(&mut FilmlabApp, &mut Window, &mut Context<FilmlabApp>)>, me: Entity<FilmlabApp>| {
+        let button = |id: &'static str, glyph: &'static str, enabled: bool, action: Action, me: Entity<FilmlabApp>| {
             div()
                 .id(id)
                 .size(px(28.))
@@ -492,7 +494,7 @@ impl FilmlabApp {
             )
             .when(mode == Mode::Browse && library.folder.is_some(), |d| d.child(div().flex_none().child(self.browse_toolbar(cx))))
             .child(button("open", "folder-open", true, Box::new(|app, window, cx| app.prompt_folder(&OpenFolder, window, cx)), me.clone()))
-            .child(button("export", "download04", true, Box::new(|app, window, cx| export::open(app, window, cx)), me.clone()))
+            .child(button("export", "download04", true, Box::new(export::open), me.clone()))
             .when(mode == Mode::Develop, |d| {
                 d.child(button("undo", "undo02", can_undo, Box::new(|app, _, cx| app.develop.update(cx, |d, cx| d.undo(cx))), me.clone()))
                     .child(button("redo", "redo02", can_redo, Box::new(|app, _, cx| app.develop.update(cx, |d, cx| d.redo(cx))), me.clone()))

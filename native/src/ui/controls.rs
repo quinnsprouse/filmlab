@@ -7,6 +7,9 @@ use gpui_kit::*;
 use super::theme;
 use crate::menu::{self, Entry};
 
+pub type OnPick = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+type OnToggle = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+
 fn row(id: impl Into<ElementId>) -> Stateful<Div> {
     div().id(id).h(px(theme::ROW)).w_full().px(px(10.)).flex().items_center().justify_between().gap(px(8.)).rounded(px(theme::RADIUS)).bg(theme::surface()).text_size(px(13.)).font_weight(FontWeight::MEDIUM)
 }
@@ -20,7 +23,7 @@ pub struct Segmented {
     id: ElementId,
     label: Option<SharedString>,
     options: Vec<(SharedString, bool)>,
-    on_pick: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    on_pick: OnPick,
 }
 
 impl Segmented {
@@ -63,7 +66,7 @@ pub struct Toggle {
     id: ElementId,
     label: SharedString,
     on: bool,
-    on_change: Rc<dyn Fn(bool, &mut Window, &mut App)>,
+    on_change: OnToggle,
 }
 
 impl Toggle {
@@ -105,7 +108,7 @@ pub struct Picker {
     label: SharedString,
     value: SharedString,
     items: Rc<dyn Fn() -> Vec<PickerItem>>,
-    on_pick: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    on_pick: OnPick,
 }
 
 impl Picker {

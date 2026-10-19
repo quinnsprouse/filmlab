@@ -1016,12 +1016,12 @@ fn with_original(mut out: lightcraft_meta::Metadata, original: &lightcraft_meta:
         out.hierarchical_keywords.clone_from(&original.hierarchical_keywords);
     }
     if original.capture_time.is_some() {
-        out.capture_time = original.capture_time.clone();
+        out.capture_time = original.capture_time;
     }
     if !o.remove_location {
         fill_text!(sublocation, city, state, country);
         if original.gps.is_some() {
-            out.gps = original.gps.clone();
+            out.gps = original.gps;
         }
     }
     if o.metadata != MetadataPolicy::All {

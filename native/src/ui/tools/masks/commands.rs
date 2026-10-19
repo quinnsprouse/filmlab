@@ -19,7 +19,7 @@ fn run(app: &mut FilmlabApp, command: &str, params: Value, label: &str, key: &st
     out
 }
 
-// why: `mask.select` only moves the engine's active mask; the web app runs it without a history step, so
+// why: `mask.select` only moves the engine's active mask and isn't an edit, so
 // the history the command just wrote is put back
 fn engine_select(app: &mut FilmlabApp, id: Option<u32>, cx: &mut Cx) {
     app.develop.update(cx, |d, _| {

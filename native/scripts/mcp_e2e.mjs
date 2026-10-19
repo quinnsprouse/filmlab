@@ -7,8 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const binary = path.resolve(here, "../target/release/filmlab");
-const fixtures =
-  process.argv[2] || path.join(os.homedir(), "Developer/filmlab/.scratch/fixtures/roll");
+const fixtures = process.argv[2];
 const VERSION = "2026-07-28";
 const META = {
   "io.modelcontextprotocol/protocolVersion": VERSION,
@@ -19,8 +18,8 @@ if (!fs.existsSync(binary)) {
   console.error(`missing ${binary}; run: cd native && cargo build --release`);
   process.exit(2);
 }
-if (!fs.existsSync(fixtures)) {
-  console.error(`missing photo folder ${fixtures}`);
+if (!fixtures || !fs.existsSync(fixtures)) {
+  console.error("usage: node native/scripts/mcp_e2e.mjs <photo folder>");
   process.exit(2);
 }
 

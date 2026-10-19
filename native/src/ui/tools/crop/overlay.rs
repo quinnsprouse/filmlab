@@ -184,7 +184,7 @@ pub fn overlay(app: &mut FilmlabApp, frame: Bounds<Pixels>, _window: &mut Window
             let ups = me.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                 if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
-                    ups.update(cx, |app, cx| release(app, cx));
+                    ups.update(cx, release);
                 }
             });
         },

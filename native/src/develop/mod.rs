@@ -1190,7 +1190,7 @@ impl Develop {
         self.settings.as_ref().and_then(|s| core::control_values(&s.to_string()).ok()).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
     }
 
-    // why: port of the web's `applyProfileTo`; re-applying the same profile at the same step starts again from
+    // why: re-applying the same profile at the same step starts again from
     // the settings it first saw, so the amount replaces the earlier application instead of stacking
     pub fn apply_profile(&mut self, profile_id: &str, partial: &Value, amount: f64, label: &str, film: Option<FilmSettings>, cx: &mut Context<Develop>) {
         let Some(settings) = self.settings.clone() else { return };

@@ -290,7 +290,7 @@ impl Target {
         };
         self.surface.configure(&gpu.device, &config);
         // why: the engine's pixels are sRGB; naming the layer's space lets macOS colour-manage them to the
-        // display as the browser did, rather than showing them as the panel's native (P3) values
+        // display, rather than showing them as the panel's native (P3) values
         let srgb = CGColorSpace::with_name(Some(unsafe { objc2_core_graphics::kCGColorSpaceSRGB }));
         self.layer.setColorspace(srgb.as_deref());
         self.configured = Some((w, h));

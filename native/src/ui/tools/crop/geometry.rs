@@ -58,7 +58,7 @@ fn rotate_about(p: Vec2, degrees: f64, centre: Vec2) -> Vec2 {
 }
 
 /// Maps between the uncropped, upright frame (in frame pixels) and normalised straightened coordinates,
-/// the way the web `frameMap` does through `core::map_points`.
+/// through `core::map_points`.
 pub struct FrameMap {
     width: f64,
     height: f64,

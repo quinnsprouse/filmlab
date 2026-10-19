@@ -72,7 +72,7 @@ pub fn spots_of(settings: Option<&Value>) -> Vec<Spot> {
     settings.and_then(|s| s.get("spots")).and_then(Value::as_array).map(|a| a.iter().map(spot_of).collect()).unwrap_or_default()
 }
 
-/// Runs a LightCraft command and keeps the failure text for the panel (the web `guarded`).
+/// Runs a LightCraft command and keeps the failure text for the panel.
 pub fn run(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>, name: &str, params: Value, label: &str, key: &str) -> Option<Value> {
     let (result, error) = app.develop.update(cx, |d, cx| {
         let result = d.command(name, params, label, key, cx);

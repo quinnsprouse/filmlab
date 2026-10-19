@@ -69,7 +69,7 @@ pub fn write(profiles: &[Profile]) {
     }
 }
 
-// why: the web stores every group in the profile except film, whose settings travel as `film`
+// why: a profile stores every engine group; film's settings travel separately as `film`
 pub fn build(name: &str, settings: &Value, groups: Vec<String>, film: Option<Value>) -> Option<Profile> {
     let engine_groups: Vec<&String> = groups.iter().filter(|g| *g != "film").collect();
     let partial = core::extract_profile(&settings.to_string(), &serde_json::to_string(&engine_groups).ok()?).ok()?;

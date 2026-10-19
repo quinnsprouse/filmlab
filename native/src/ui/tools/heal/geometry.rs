@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use super::spots::{Spot, V};
 
-/// Maps between the overlay box (window points) and normalized image coordinates, like the web `Mapping`.
+/// Maps between the overlay box (window points) and normalized image coordinates.
 pub struct Mapping {
     pub facts: String,
     pub settings: String,

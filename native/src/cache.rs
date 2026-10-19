@@ -84,7 +84,7 @@ pub fn thumbnail(key: &Key, look: u64) -> Option<Pixels> {
 
 /// JPEG bytes of the RGBA pixels, ready for `store_thumbnail`.
 pub fn encode(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
-    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
     let mut out = Vec::new();
     JpegEncoder::new_with_quality(&mut out, QUALITY).encode(&rgb, width, height, ExtendedColorType::Rgb8).ok()?;
     Some(out)
