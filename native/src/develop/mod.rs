@@ -1,3 +1,4 @@
+mod marks;
 pub mod pan;
 pub mod plans;
 mod shared;
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 use crate::camera::{Camera, Native, Region, Size, WHOLE, Zoom, camera_of, mix_log_scale};
 use crate::film::{FilmSettings, render_film};
 use crate::library::{Library, PhotoState, ensure_luts};
+use marks::{Flat, Marks, Replay};
 use plans::{Inputs, Layer, Level, Plan, fit_plan, plans, same_plan};
 use shared::Shared;
 
@@ -186,49 +188,17 @@ pub struct Develop {
     rested: bool,
     /// Controls an agent set that nobody has touched since (control id, or `film.…` for the film look, to the value
     /// it set); the inspector draws them amber until you change them.
-    pub agent_marks: HashMap<String, Value>,
-    flat: HashMap<String, Value>,
+    pub agent_marks: Marks,
+    flat: Arc<Flat>,
+    replay: Replay,
     pub curve_input: Option<Arc<CurveInput>>,
     curve_input_wanted: bool,
 }
 
-// why: a run of slider edits in one section (exposure, then contrast, then highlights) is one change in the history
-// and undoes as one; keys of slider edits are their control ids, so the section comes from the controls catalog
-/// The ids whose values differ between two flattened edits. For an agent's change, a film look switched on from
-/// none counts only its stocks: the halation, grain and dust defaults that come with it weren't the agent's choice.
-fn changed(before: &HashMap<String, Value>, after: &HashMap<String, Value>, by_agent: bool) -> Vec<String> {
-    let had_film = before.keys().any(|k| k.starts_with("film."));
-    after
-        .iter()
-        .filter(|(id, v)| before.get(*id) != Some(*v) && !(v.is_null() && !before.contains_key(*id)))
-        .filter(|(id, _)| !by_agent || had_film || !id.starts_with("film.") || matches!(id.as_str(), "film.negative" | "film.print" | "film.utility"))
-        .map(|(id, _)| id.clone())
-        .collect()
-}
-
-/// A photo's edit as flat ids and values: every control (`light.exposure`) and the film look (`film.grain.size`).
-fn flatten(settings: &Value, film: Option<&FilmSettings>) -> HashMap<String, Value> {
-    fn walk(prefix: &str, v: &Value, out: &mut HashMap<String, Value>) {
-        match v {
-            Value::Object(map) => map.iter().for_each(|(k, v)| walk(&format!("{prefix}.{k}"), v, out)),
-            other => {
-                out.insert(prefix.to_string(), other.clone());
-            }
-        }
-    }
-    let values: HashMap<String, f64> = core::control_values(&settings.to_string()).ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
-    let mut out: HashMap<String, Value> = values.into_iter().map(|(k, v)| (k, json!(v))).collect();
-    for channel in POINT_CURVES {
-        out.insert(format!("curve.{channel}"), settings["curve"][channel].clone());
-    }
-    if let Some(film) = film {
-        walk("film", &film.normalized().to_value(), &mut out);
-    }
-    out
-}
-
 pub const POINT_CURVES: [&str; 4] = ["master", "red", "green", "blue"];
 
+// why: a run of slider edits in one section (exposure, then contrast, then highlights) is one change in the history
+// and undoes as one; keys of slider edits are their control ids, so the section comes from the controls catalog
 fn section_of(key: &str) -> Option<&'static str> {
     static SECTIONS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
         let raw: Vec<Value> = core::controls().ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
@@ -315,8 +285,9 @@ impl Develop {
             edited: None,
             dragging: None,
             rested: false,
-            agent_marks: HashMap::new(),
-            flat: HashMap::new(),
+            agent_marks: Marks::new(),
+            flat: Arc::default(),
+            replay: Replay::default(),
             curve_input: None,
             curve_input_wanted: false,
         }
@@ -1271,39 +1242,18 @@ impl Develop {
 
     /// Updates the agent's marks after a change: an agent's edit marks what it changed, anyone else's clears it.
     fn mark(&mut self, by_agent: bool) {
-        let now = self.settings.as_ref().map(|s| flatten(s, self.film.as_ref())).unwrap_or_default();
-        for id in changed(&self.flat, &now, by_agent) {
-            if by_agent {
-                self.agent_marks.insert(id.clone(), now[&id].clone());
-            } else {
-                self.agent_marks.remove(&id);
-            }
-        }
+        let now = Arc::new(self.settings.as_ref().map(|s| marks::flatten(s, self.film.as_ref())).unwrap_or_default());
+        marks::apply(&mut self.agent_marks, marks::changed(&self.flat, &now, by_agent), &now, by_agent);
         if !by_agent {
             self.agent_marks.retain(|id, _| now.contains_key(id));
         }
+        self.replay.at(&self.history, self.cursor, Some(now.clone()));
         self.flat = now;
     }
 
-    // why: undo, redo and a photo opened mid-session move through history at once, so the marks are replayed from the
-    // first step up to the current one; an agent change you undid, or one you edited after, isn't marked
+    /// Sets the agent's marks to what replaying history up to the current step gives.
     pub fn remark(&mut self) {
-        self.agent_marks.clear();
-        let steps: Vec<(bool, HashMap<String, Value>)> = self.history.iter().take(self.cursor + 1).map(|s| (s.key.starts_with("agent."), flatten(&s.settings, s.film.as_ref()))).collect();
-        let mut previous: Option<&HashMap<String, Value>> = None;
-        for (by_agent, flat) in &steps {
-            if let Some(before) = previous {
-                for id in changed(before, flat, *by_agent) {
-                    if *by_agent {
-                        self.agent_marks.insert(id.clone(), flat[&id].clone());
-                    } else {
-                        self.agent_marks.remove(&id);
-                    }
-                }
-            }
-            previous = Some(flat);
-        }
-        self.flat = steps.into_iter().last().map(|(_, f)| f).unwrap_or_default();
+        (self.flat, self.agent_marks) = self.replay.at(&self.history, self.cursor, None).unwrap_or_default();
     }
 
     pub fn undo(&mut self, cx: &mut Context<Develop>) {
