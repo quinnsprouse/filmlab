@@ -154,8 +154,8 @@ pub struct State {
 }
 
 impl State {
-    pub fn pointing(&self) -> bool {
-        self.pointer.is_some()
+    pub fn pointed(&self) -> Option<[u8; 3]> {
+        self.pointer
     }
 
     pub fn removing(&self) -> bool {

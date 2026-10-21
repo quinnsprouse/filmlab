@@ -18,6 +18,7 @@ const SPLIT_REACH: f32 = 6.0;
 const RAIL_REACH: f32 = 9.0;
 const REGION_SPAN: f64 = 200.0;
 const FINE: f64 = 0.1;
+const SAMPLE_REACH: f32 = 3.0;
 
 enum Commit {
     Points { channel: usize, points: Vec<[f64; 2]>, label: String, key: String },
@@ -174,7 +175,7 @@ pub fn moved(app: &mut FilmlabApp, event: &MouseMoveEvent, window: &Window, cx: 
         return;
     }
     let target = plot(app).filter(|p| p.bounds.contains(&event.position)).and_then(|p| target(app, p, event.position));
-    let pointer = over_photo(app, event.position, window, cx).and_then(|(u, v)| app.develop.read(cx).curve_input.as_ref()?.at(u, v));
+    let pointer = over_photo(app, event.position, window, cx).and_then(|(u, v, reach)| app.develop.read(cx).curve_input.as_ref()?.mean_around(u, v, reach));
     let state = &mut app.ui.curve;
     if target != state.hover || pointer != state.pointer {
         state.hover = target;
@@ -192,7 +193,7 @@ pub fn left_window(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>) {
     }
 }
 
-fn over_photo(app: &FilmlabApp, at: Point<Pixels>, window: &Window, cx: &App) -> Option<(f64, f64)> {
+fn over_photo(app: &FilmlabApp, at: Point<Pixels>, window: &Window, cx: &App) -> Option<(f64, f64, f64)> {
     if app.develop.read(cx).compare != Compare::After {
         return None;
     }
@@ -200,7 +201,8 @@ fn over_photo(app: &FilmlabApp, at: Point<Pixels>, window: &Window, cx: &App) ->
     let (x, y) = (f64::from(f32::from(at.x)), f64::from(f32::from(at.y)));
     let (frame, _) = app.fit_frame(window, cx)?;
     let on_stage = x >= stage.x && y >= stage.y && x < stage.x + stage.width && y < stage.y + stage.height;
-    (on_stage && frame.contains(&at)).then(|| (f64::from(f32::from(at.x - frame.left()) / f32::from(frame.size.width)), f64::from(f32::from(at.y - frame.top()) / f32::from(frame.size.height))))
+    let (width, height) = (f32::from(frame.size.width), f32::from(frame.size.height));
+    (on_stage && frame.contains(&at)).then(|| (f64::from(f32::from(at.x - frame.left()) / width), f64::from(f32::from(at.y - frame.top()) / height), f64::from(SAMPLE_REACH / width)))
 }
 
 fn drag(app: &mut FilmlabApp, event: &MouseMoveEvent, cx: &mut Context<FilmlabApp>) {

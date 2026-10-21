@@ -614,9 +614,15 @@ async fn tone_curve(run: &mut Run, cx: &mut AsyncApp) {
     if let Some(at) = photo {
         run.hover(cx, at);
         run.pause(cx, 200).await;
-        let pointing = run.read(cx, |a, _| a.ui.curve.pointing()).unwrap_or(false);
+        let pointing = run.read(cx, |a, _| a.ui.curve.pointed().is_some()).unwrap_or(false);
         run.check("tone curve: the pointer over the photo rings its tone on the curve", pointing, "");
         run.shoot_inspector(cx, "04o-curve-rgb-pointer").await;
+        let (shown, raw) = pointer_sweep(run, cx).await;
+        run.check(
+            "tone curve: sliding over a textured patch moves the ring at most half as much as the raw pixels",
+            raw > 0.0 && shown <= raw / 2.0,
+            format!("ring travelled {shown:.0} levels, the pixels under it {raw:.0}"),
+        );
         let away = on_graph(run, cx, 0.3, 0.95);
         run.hover(cx, away);
     }
@@ -812,6 +818,25 @@ async fn zoom(run: &mut Run, cx: &mut AsyncApp) {
     run.key(cx, "space");
     run.wait(cx, 5, move |a, cx| (a.develop.read(cx).camera.scale - fit).abs() < 1e-6).await;
     run.verify(cx, "zoom: fit again matches", false).await;
+}
+
+async fn pointer_sweep(run: &mut Run, cx: &mut AsyncApp) -> (f64, f64) {
+    let Some(frame) = run.on_window(cx, |window, cx| run.app.upgrade().and_then(|a| a.read(cx).fit_frame(window, cx))).flatten().map(|(b, _)| b) else { return (0.0, 0.0) };
+    let luma = |rgb: [u8; 3]| rgb.iter().map(|c| f64::from(*c)).sum::<f64>() / 3.0;
+    let (mut shown, mut raw) = (Vec::new(), Vec::new());
+    for step in 0..16 {
+        let u = 0.4 + 0.004 * f64::from(step);
+        let at = point(frame.left() + frame.size.width * u as f32, frame.top() + frame.size.height * 0.62);
+        run.hover(cx, at);
+        run.pause(cx, 30).await;
+        let read = run.read(cx, move |a, cx| Some((a.ui.curve.pointed()?, a.develop.read(cx).curve_input.as_ref()?.mean_around(u, 0.62, 0.0)?))).flatten();
+        if let Some((s, r)) = read {
+            shown.push(luma(s));
+            raw.push(luma(r));
+        }
+    }
+    let travel = |v: &[f64]| v.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>();
+    (travel(&shown), travel(&raw))
 }
 
 fn run_fit_center(app: &WeakEntity<FilmlabApp>, window: &mut Window, cx: &mut App) -> Option<Point<Pixels>> {

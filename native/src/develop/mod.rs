@@ -83,13 +83,23 @@ pub struct CurveInput {
 }
 
 impl CurveInput {
-    pub fn at(&self, u: f64, v: f64) -> Option<[u8; 3]> {
-        let (w, h) = (f64::from(self.width), f64::from(self.height));
+    pub fn mean_around(&self, u: f64, v: f64, reach: f64) -> Option<[u8; 3]> {
         if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
             return None;
         }
-        let i = ((v * h) as usize * self.width as usize + (u * w) as usize) * 4;
-        self.rgba.get(i..i + 3).map(|p| [p[0], p[1], p[2]])
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (x, y) = ((u * w as f64) as usize, (v * h as f64) as usize);
+        let r = (reach * w as f64).round() as usize;
+        let (columns, rows) = (x.saturating_sub(r)..=(x + r).min(w - 1), y.saturating_sub(r)..=(y + r).min(h - 1));
+        let (mut sum, mut n) = ([0u64; 3], 0u64);
+        for row in rows {
+            let line = self.rgba.get((row * w + columns.start()) * 4..(row * w + columns.end() + 1) * 4)?;
+            for p in line.as_chunks::<4>().0 {
+                sum.iter_mut().zip(p).for_each(|(s, c)| *s += u64::from(*c));
+                n += 1;
+            }
+        }
+        (n > 0).then(|| sum.map(|s| u8::try_from((s + n / 2) / n).unwrap_or(u8::MAX)))
     }
 }
 
