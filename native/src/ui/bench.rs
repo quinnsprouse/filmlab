@@ -141,7 +141,6 @@ struct Moves {
     took: Duration,
 }
 
-// why: what the hand feels while it moves is how often a new frame comes back and the longest wait for one
 async fn moves(driver: &Driver, cx: &mut AsyncApp, detail: bool, count: u32, step: impl Fn(u32, &mut AsyncApp)) -> Moves {
     let mut last = driver.read(cx, |a, cx| frame_of(a, cx, detail)).flatten();
     let (mut frames, mut worst, started) = (0usize, Duration::ZERO, Instant::now());
@@ -188,7 +187,11 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         return;
     }
     let driver = Driver { app: app.downgrade(), window };
+    let sized = std::env::var("FILMLAB_BENCH_WINDOW").ok().and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))));
     cx.spawn(async move |cx| {
+        if let Some((w, h)) = sized {
+            driver.on_window(cx, |window, _| window.resize(size(px(w), px(h))));
+        }
         let launch = STARTED.get().map_or(0.0, |t| ms(t.elapsed()));
         eprintln!("bench {:<28} {launch:>7.1} ms", "launch to first task");
         library(&driver, cx, launch).await;
@@ -351,6 +354,18 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
             ms(panned.worst),
             settled.map_or(f64::NAN, ms)
         );
+
+        let mut leave = Vec::new();
+        for i in 0..4 {
+            let c = 0.35 + 0.1 * f64::from(i);
+            driver.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: c }, false, false, cx));
+            cx.background_executor().timer(Duration::from_millis(40)).await;
+            let t = Instant::now();
+            driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
+            leave.push(ms(t.elapsed()));
+            until(&driver, cx, 60, |a, cx| a.develop.read(cx).idle_for(Duration::ZERO)).await;
+        }
+        report("leave 1:1 mid-render (UI)", &mut leave);
         driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
         driver.act(cx, |a, cx| a.set_mode(Mode::Browse, cx));
         cx.background_executor().timer(Duration::from_millis(300)).await;
