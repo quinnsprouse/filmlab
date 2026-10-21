@@ -40,6 +40,7 @@ pub mod output;
 pub mod profiles;
 pub mod redeye;
 pub mod spots;
+pub mod stop;
 pub mod tone;
 pub mod transform;
 pub mod upright;
@@ -588,6 +589,9 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         lap("prepare (precomputed)", &mut t);
         return finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t);
     }
+    if stop::stopped() {
+        return unwanted();
+    }
     let cached = shared.and_then(|(a, c)| c.get(a, geo));
     // (an `Option` so an uncached render can move the buffer on below)
     let mut sampled = Some(match &cached {
@@ -595,6 +599,9 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         None => Arc::new(frame.sample(src_img, w, h)),
     });
     lap("sample", &mut t);
+    if stop::stopped() {
+        return unwanted();
+    }
 
     let lin = match cached.as_ref().and_then(|e| e.lin.clone()).filter(|(k, _)| *k == lin_key) {
         Some((_, img)) => img,
@@ -612,6 +619,9 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         }
     };
     lap("wb/spots/nr", &mut t);
+    if stop::stopped() {
+        return unwanted();
+    }
     let mut planes = match cached.map(|e| e.planes) {
         Some(p) if p.key == lin_key => p,
         // A draft while noise reduction changes (a slider drag): the wide, edge-aware planes of the
@@ -629,7 +639,14 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     if let (Some((a, c)), Some(sampled)) = (shared, sampled) {
         c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });
     }
+    if stop::stopped() {
+        return unwanted();
+    }
     finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t)
+}
+
+fn unwanted() -> Rendered {
+    Rendered { image: Rgba8::new(0, 0), histogram: Histogram::of_srgb8(&Rgba8::new(0, 0)), deep: None }
 }
 
 /// Print a stage's time under `LIGHTCRAFT_PROFILE` (`t` is set only then) and restart the clock.

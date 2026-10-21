@@ -12,6 +12,9 @@ use lightcraft_engine::pipeline::{self, MaskView, OutputDepth, OutputSpace, Over
 use lightcraft_engine::sidecar::{OWNED, OWNED_IF_STATED, merge_into, parse_sidecar, sidecar_packet};
 use serde::{Deserialize, Serialize};
 
+pub use lightcraft_engine::pipeline::stop::Wanted;
+use lightcraft_engine::pipeline::stop;
+
 use crate::film::{Capture, Developer, FilmChain, FilmRequest, Light, LutLibrary, Scan, Scene, Textured, Toned};
 use crate::texture::{self, Region, Size};
 use serde_json::Value;
@@ -605,7 +608,7 @@ struct FilmJob<'a> {
 }
 
 struct FilmOutcome {
-    rendered: pipeline::Rendered,
+    rendered: Option<pipeline::Rendered>,
     keep: Option<Region>,
     view: Option<CachedScene>,
     look: Option<CachedScene>,
@@ -791,7 +794,7 @@ fn film_render(
     size_of: impl Fn(&RenderRequest) -> (usize, usize),
     render: impl Fn(&RenderRequest, Lane) -> pipeline::Rendered,
 ) -> Fallible<FilmOutcome> {
-    let plain = |job: FilmJob<'_>| FilmOutcome { rendered: render(req, Lane::View), keep: None, view: job.view, look: job.look };
+    let plain = |job: FilmJob<'_>| FilmOutcome { rendered: Some(render(req, Lane::View)), keep: None, view: job.view, look: job.look };
     let Some(request) = job.film else { return Ok(plain(job)) };
     let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(plain(job)) };
     let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
@@ -805,10 +808,15 @@ fn film_render(
     // why: the final pass renders the captured (grown) window too, so LightCraft's stage cache hits;
     // the margin is cut off afterwards
     let capture = RenderRequest { window: window.map(|_| PixelWindow { x: region.x, y: region.y, w: region.w, h: region.h }), ..*req };
+    let stopped = |view: Option<CachedScene>, look: Option<CachedScene>| FilmOutcome { rendered: None, keep: None, view, look };
     let mut view = match job.view.filter(|c| c.key == key) {
         Some(c) => c,
         None => {
-            let fresh = CachedScene::new(key, spent("capture", || capture_scene(region, || render(&capture, Lane::View))));
+            let scene = spent("capture", || capture_scene(region, || render(&capture, Lane::View)));
+            if stop::stopped() {
+                return Ok(stopped(None, job.look));
+            }
+            let fresh = CachedScene::new(key, scene);
             spent("prefetch", || crate::gpu::prefetch(&fresh.scene));
             fresh
         }
@@ -816,8 +824,14 @@ fn film_render(
     // why: a zoomed window takes the halation's ceiling from the whole frame, as its scan levels, so it glows as the
     // fit view and the export do
     let mut look = window.and(job.look).filter(|c| c.key == job.look_key);
-    match window {
-        Some(_) => measure_ceiling(&mut dev, whole_look(req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key)),
+    if window.is_some() {
+        whole_look(req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key);
+        if stop::stopped() {
+            return Ok(stopped(Some(view), None));
+        }
+    }
+    match look.as_mut() {
+        Some(whole) => measure_ceiling(&mut dev, whole),
         None => measure_ceiling(&mut dev, &mut view),
     }
     let textured_key = textured_key(request, &dev);
@@ -849,7 +863,7 @@ fn film_render(
     };
     let rendered = spent("final", || pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View)));
     let keep = window.map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
-    Ok(FilmOutcome { rendered, keep, view: Some(view), look: Some(look) })
+    Ok(FilmOutcome { rendered: Some(rendered), keep, view: Some(view), look: Some(look) })
 }
 
 impl Engine {
@@ -903,10 +917,14 @@ impl Engine {
     }
 
     pub fn render(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
-        pipeline::film_hook::without_tone_hook(|| self.render_frame(key, settings, view))
+        self.render_while(key, settings, view, None)?.ok_or_else(|| fail("a render nobody stopped came back stopped"))
     }
 
-    fn render_frame(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
+    pub fn render_while(&mut self, key: &str, settings: &str, view: &str, wanted: Option<Wanted>) -> Fallible<Option<Frame>> {
+        pipeline::film_hook::without_tone_hook(|| stop::while_wanted(wanted, || self.render_frame(key, settings, view)))
+    }
+
+    fn render_frame(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Option<Frame>> {
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
         let s: DevelopSettings = parse(settings)?;
         let v: ViewRequest = parse(view)?;
@@ -933,7 +951,6 @@ impl Engine {
             })
         };
         let outcome = if v.curve_input { pipeline::film_hook::with_curve_input(rendered) } else { rendered() }?;
-        let mut rendered = outcome.rendered;
         let keep = outcome.keep;
         if let (Some(k), Some(view)) = (stored, outcome.view) {
             self.scenes.insert(k, view);
@@ -941,11 +958,15 @@ impl Engine {
         if let Some(look) = outcome.look {
             self.looks.insert(key.to_string(), look);
         }
+        let Some(mut rendered) = outcome.rendered.filter(|_| !stop::stopped()) else { return Ok(None) };
         if let Some(h) = spent("hdr histogram", || pipeline::hdr_histogram(&src.image, &info, &s, &req)) {
             rendered.histogram = h;
         }
+        if stop::stopped() {
+            return Ok(None);
+        }
         let (width, height, rgba) = spent("crop", || cropped(rendered.image.width, rendered.image.height, rendered.image.data, keep));
-        Ok(Frame { width: width as u32, height: height as u32, rgba, histogram: rendered.histogram.to_words() })
+        Ok(Some(Frame { width: width as u32, height: height as u32, rgba, histogram: rendered.histogram.to_words() }))
     }
 
     pub fn load_lut(&mut self, id: &str, text: &str) -> Fallible<()> {
@@ -957,7 +978,7 @@ impl Engine {
     }
 
     pub fn export(&mut self, key: &str, facts: &str, state: &str, options: &str, film: &str) -> Fallible<Vec<u8>> {
-        pipeline::film_hook::without_tone_hook(|| self.export_file(key, facts, state, options, film))
+        pipeline::film_hook::without_tone_hook(|| stop::while_wanted(None, || self.export_file(key, facts, state, options, film)))
     }
 
     fn export_file(&mut self, key: &str, facts: &str, state: &str, options: &str, film: &str) -> Fallible<Vec<u8>> {
