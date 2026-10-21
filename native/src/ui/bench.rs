@@ -5,6 +5,7 @@ use gpui_kit::*;
 use super::app::{FilmlabApp, Mode};
 use super::driver::Driver;
 use crate::camera::Zoom;
+use crate::library::PhotoRecord;
 
 // why: FILMLAB_BENCH=1 times what a user waits for (window, library, opening and switching photos, edits, zoom) on
 // the folder last opened, so speed work can be measured before and after; results go to stderr as "bench" lines
@@ -48,6 +49,87 @@ fn current(a: &FilmlabApp, cx: &App) -> Option<String> {
     a.develop.read(cx).photo_id.clone()
 }
 
+fn megabytes() -> f64 {
+    super::soak::footprint() as f64 / 1_048_576.0
+}
+
+/// Times between the frames drawn while `step` runs before each of them; the app re-renders every frame.
+async fn frames(driver: &Driver, cx: &mut AsyncApp, mut step: impl FnMut(&mut FilmlabApp, &mut Context<FilmlabApp>) -> bool) -> Vec<f64> {
+    let mut intervals = Vec::new();
+    let mut last: Option<Instant> = None;
+    loop {
+        let (drawn, next) = futures::channel::oneshot::channel();
+        driver.on_window(cx, move |window, _| {
+            window.on_next_frame(move |_, _| {
+                let _ = drawn.send(Instant::now());
+            })
+        });
+        let Ok(at) = next.await else { break };
+        if let Some(previous) = last {
+            intervals.push(ms(at - previous));
+        }
+        last = Some(at);
+        let more = driver.act(cx, |a, cx| {
+            let more = step(a, cx);
+            cx.notify();
+            more
+        });
+        if more != Some(true) {
+            break;
+        }
+    }
+    intervals
+}
+
+fn report_frames(name: &str, intervals: &mut [f64]) {
+    let slow = intervals.iter().filter(|t| **t > 17.5).count();
+    let fps = intervals.len() as f64 * 1000.0 / intervals.iter().sum::<f64>().max(1.0);
+    report(name, intervals);
+    eprintln!("bench {:<28} {fps:>7.1} fps, {slow} of {} frames over 17.5 ms", "", intervals.len());
+}
+
+async fn library(driver: &Driver, cx: &mut AsyncApp, launch: f64) {
+    const LONG: u64 = 3600;
+    let started = Instant::now();
+    let since_launch = move || launch + ms(started.elapsed());
+    let first = until(driver, cx, LONG, |a, cx| a.viewport_pictures(cx).0 > 0).await;
+    eprintln!("bench {:<28} {:>7.1} ms from launch", "grid first picture", first.map_or(f64::NAN, |_| since_launch()));
+    let filled = until(driver, cx, LONG, |a, cx| {
+        let (shown, tiles) = a.viewport_pictures(cx);
+        tiles > 0 && shown == tiles
+    })
+    .await;
+    eprintln!("bench {:<28} {:>7.1} ms from launch", "grid viewport filled", filled.map_or(f64::NAN, |_| since_launch()));
+    let sampling = Instant::now();
+    let mut indexing = frames(driver, cx, move |_, _| sampling.elapsed() < Duration::from_secs(3)).await;
+    report_frames("frame while indexing", &mut indexing);
+    let indexed = until(driver, cx, LONG, |a, cx| {
+        let l = a.library.read(cx);
+        !l.photos.is_empty() && l.photos.iter().all(PhotoRecord::indexed)
+    })
+    .await;
+    let count = driver.read(cx, |a, cx| a.library.read(cx).photos.len()).unwrap_or(0);
+    eprintln!("bench {:<28} {:>7.1} ms from launch for {count} photos", "library indexed", indexed.map_or(f64::NAN, |_| since_launch()));
+    cx.background_executor().timer(Duration::from_secs(3)).await;
+    eprintln!("bench {:<28} {:>7.1} MB", "memory, indexed and idle", megabytes());
+    driver.act(cx, |a, _| a.browse.scroll_to(0.0));
+    let mut scrolling = frames(driver, cx, |a, _| {
+        let top = a.browse.scrolled() + 400.0;
+        a.browse.scroll_to(top);
+        top < a.browse.scroll_range()
+    })
+    .await;
+    let range = driver.read(cx, |a, _| a.browse.scroll_range()).unwrap_or(0.0);
+    report_frames("frame scrolling the grid", &mut scrolling);
+    eprintln!("bench {:<28} {range:>7.0} pt", "grid height scrolled");
+    cx.background_executor().timer(Duration::from_secs(3)).await;
+    eprintln!("bench {:<28} {:>7.1} MB", "memory, after scrolling", megabytes());
+    driver.act(cx, |a, cx| {
+        a.browse.scroll_to(0.0);
+        cx.notify();
+    });
+}
+
 pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
     if std::env::var_os("FILMLAB_BENCH").is_none() {
         return;
@@ -56,19 +138,17 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
     cx.spawn(async move |cx| {
         let launch = STARTED.get().map_or(0.0, |t| ms(t.elapsed()));
         eprintln!("bench {:<28} {launch:>7.1} ms", "launch to first task");
-        let indexed = until(&driver, cx, 300, |a, cx| {
-            let l = a.library.read(cx);
-            !l.photos.is_empty() && l.photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some())
-        })
-        .await;
-        let count = driver.read(cx, |a, cx| a.library.read(cx).photos.len()).unwrap_or(0);
-        eprintln!("bench {:<28} {:>7.1} ms for {count} photos (from launch {:.1} ms)", "library indexed", indexed.map_or(f64::NAN, ms), launch + indexed.map_or(f64::NAN, ms));
+        library(&driver, cx, launch).await;
+        if std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "library") {
+            cx.update(|cx| cx.quit());
+            return;
+        }
         let folder = driver.read(cx, |a, cx| a.library.read(cx).folder.clone()).flatten();
         if let Some(folder) = folder {
             let started = Instant::now();
             driver.act(cx, move |a, cx| a.open_folder(folder, cx));
             cx.background_executor().timer(Duration::from_millis(20)).await;
-            let again = until(&driver, cx, 300, |a, cx| a.library.read(cx).photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some())).await;
+            let again = until(&driver, cx, 300, |a, cx| a.library.read(cx).photos.iter().all(PhotoRecord::indexed)).await;
             eprintln!("bench {:<28} {:>7.1} ms", "library reopened", again.map_or(f64::NAN, |_| ms(started.elapsed())));
         }
         let ids: Vec<String> = driver.read(cx, |a, cx| a.library.read(cx).photos.iter().filter(|r| r.state.is_some()).map(|r| r.file.id.clone()).collect()).unwrap_or_default();

@@ -61,6 +61,13 @@ pub struct PhotoRecord {
     pub error: Option<String>,
 }
 
+impl PhotoRecord {
+    /// Whether indexing is done with this photo: its film thumbnail is rendered, or it couldn't be read.
+    pub fn indexed(&self) -> bool {
+        self.thumbnail.is_some() || self.error.is_some()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Saving {
     Idle,
