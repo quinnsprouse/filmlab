@@ -578,7 +578,8 @@ pub struct Screen {
 
 impl Gpu {
     pub fn screen(&self) -> Option<Screen> {
-        let (device, queue) = pollster::block_on(self.adapter.request_device(&wgpu::DeviceDescriptor { label: Some("screen"), ..Default::default() })).ok()?;
+        let required_limits = wgpu::Limits { max_texture_dimension_2d: self.adapter.limits().max_texture_dimension_2d, ..wgpu::Limits::default() };
+        let (device, queue) = pollster::block_on(self.adapter.request_device(&wgpu::DeviceDescriptor { label: Some("screen"), required_limits, ..Default::default() })).ok()?;
         Some(Screen { instance: self.instance.clone(), device, queue })
     }
 }

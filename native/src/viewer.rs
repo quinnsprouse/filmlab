@@ -286,7 +286,9 @@ impl Target {
         Some(Target { layer, surface, configured: None })
     }
 
-    fn configure(&mut self, screen: &Screen, (w, h): (u32, u32)) {
+    fn configure(&mut self, screen: &Screen, drawable: (u32, u32)) {
+        let most = screen.device.limits().max_texture_dimension_2d;
+        let (w, h) = (drawable.0.min(most), drawable.1.min(most));
         if self.configured == Some((w, h)) || w == 0 || h == 0 {
             return;
         }
