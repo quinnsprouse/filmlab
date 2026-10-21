@@ -101,6 +101,7 @@ pub fn strength(frame: Size, region: Region, p: &DustParams) -> Vec<(usize, f32)
     }
     let weights = gaussian(SIGMA_PER_U * rows as f64 * p.softness);
     let rad = weights.len() / 2;
+    let weight = |offset: isize| weights[(offset + rad as isize) as usize];
     let (tx, ty) = (taps(COLUMNS, frame.w), taps(rows, frame.h));
     let cy = (rows / 2) as f64;
     let mut sums: HashMap<usize, f64> = HashMap::new();
@@ -111,7 +112,7 @@ pub fn strength(frame: Size, region: Region, p: &DustParams) -> Vec<(usize, f32)
             if r < r0 || r > r1 || c < c0 || c > c1 {
                 0.0
             } else {
-                v * weights[(r - row as isize) as usize + rad] * weights[(c - col as isize) as usize + rad]
+                v * weight(r - row as isize) * weight(c - col as isize)
             }
         };
         let x0 = (CENTRE + (c0 as f64 - 1.0 - CENTRE) * size).floor().max(0.0) as usize;

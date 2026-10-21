@@ -1929,6 +1929,7 @@ dependencies = [
 name = "filmlab-engine"
 version = "0.1.0"
 dependencies = [
+ "lightcraft-color",
  "lightcraft-engine",
  "lightcraft-geom",
  "lightcraft-meta",

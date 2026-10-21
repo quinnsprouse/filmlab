@@ -8,6 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
+lightcraft-color = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
 lightcraft-engine = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
 lightcraft-geom = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }
 lightcraft-meta = { git = "https://github.com/storytold/lightcraft", rev = "f34c7a8a89e0d1bade0a6889185f40acecc84a9f" }

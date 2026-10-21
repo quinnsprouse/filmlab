@@ -13,3 +13,4 @@ mod pyramid;
 mod grain_tables;
 pub mod texture;
 mod texture_tables;
+pub mod tone_curve;

@@ -20,18 +20,28 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+const CURVE_SAMPLES: usize = 1024;
+
 /// Parametric region curve (encoded domain) composed with the master point curve.
-fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
+pub fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
     let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
     let master = !ToneCurve::point_curve_is_identity(&c.master);
     let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
     if !parametric && !master && !chans.iter().any(|b| *b) {
         return None;
     }
-    const N: usize = 1024;
+    let mut base = region_lut(c);
+    if master {
+        base = point_lut(&c.master).compose(&base);
+    }
+    let per = [&c.red, &c.green, &c.blue];
+    Some(std::array::from_fn(|i| if chans[i] { point_lut(per[i]).compose(&base) } else { base.clone() }))
+}
+
+pub fn region_lut(c: &ToneCurve) -> Lut1 {
     let (s1, s2, s3) = ((c.split_shadows / 100.0) as f32, (c.split_mid / 100.0) as f32, (c.split_highlights / 100.0) as f32);
     let regions = [(0.0, s1, c.shadows), (s1, s2, c.darks), (s2, s3, c.lights), (s3, 1.0, c.highlights)];
-    let mut base = Lut1::from_fn(N, |x| {
+    let mut base = Lut1::from_fn(CURVE_SAMPLES, |x| {
         let mut d = 0.0;
         for (a, b, amt) in regions {
             if amt == 0.0 {
@@ -45,15 +55,14 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         (x + d * 4.0 * x * (1.0 - x)).clamp(0.0, 1.0)
     });
     // keep monotone
-    for i in 1..N {
+    for i in 1..CURVE_SAMPLES {
         base.v[i] = base.v[i].max(base.v[i - 1]);
     }
-    let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
-    if master {
-        base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);
-    }
-    let per = [&c.red, &c.green, &c.blue];
-    Some(std::array::from_fn(|i| if chans[i] { MonotoneCurve::new(&to_pts(per[i])).to_lut(N).compose(&base) } else { base.clone() }))
+    base
+}
+
+pub fn point_lut(points: &[Point]) -> Lut1 {
+    MonotoneCurve::new(&points.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>()).to_lut(CURVE_SAMPLES)
 }
 
 /// Vignette (post-crop) parameters.
@@ -218,7 +227,8 @@ impl FinishParams {
         };
         let ev = s.light.exposure as f32;
         let gain = 2f32.powf(ev);
-        let grain = (s.grain.amount > 0.0 && effects).then(|| {
+        let curve_input = crate::film_hook::curve_input();
+        let grain = (s.grain.amount > 0.0 && effects && !curve_input).then(|| {
             let cell = (0.0006 + (s.grain.size / 100.0) as f32 * 0.0024) * px_per_long as f32;
             ((s.grain.amount / 100.0) as f32 * 0.13, cell.max(0.6), (s.grain.roughness / 100.0) as f32, s.grain.seed)
         });
@@ -229,9 +239,9 @@ impl FinishParams {
             calib: if calibration { crate::colorops::calibration_matrix(&s.calibration) } else { None },
             shadow_tint: if calibration { (s.calibration.shadows_tint / 100.0) as f32 } else { 0.0 },
             tone: base_tone(s, info, peak),
-            lut: crate::lut::get(&s.profile.id).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
+            lut: crate::lut::get(&s.profile.id).filter(|_| !curve_input).map(|l| (l, (s.profile.amount / 100.0).clamp(0.0, 2.0) as f32)),
             ops: ColorOps::new(s),
-            curves: curve_luts(&s.curve),
+            curves: curve_luts(&s.curve).filter(|_| !curve_input),
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),

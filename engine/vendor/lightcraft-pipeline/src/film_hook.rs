@@ -1,7 +1,7 @@
 //! Filmlab: replaces the global tone map with a film negative and print when a hook is set.
 //! With no hook the render takes exactly LightCraft's code path.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// Where a pixel is: `index` in the rendered image, `x`, `y` in the whole output frame, which is
@@ -68,15 +68,56 @@ pub trait ToneHook: Send + Sync {
 // the rendering thread before it fans out.
 thread_local! {
     static HOOK: RefCell<Option<Arc<dyn ToneHook>>> = const { RefCell::new(None) };
+    static CURVE_INPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Puts the thread's previous hook back when its scope ends, by return or by unwinding.
+struct Restore(Option<Arc<dyn ToneHook>>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        HOOK.with(|h| *h.borrow_mut() = previous);
+    }
+}
+
+fn installed<R>(hook: Option<Arc<dyn ToneHook>>, run: impl FnOnce() -> R) -> R {
+    let _restore = Restore(HOOK.with(|h| h.replace(hook)));
+    run()
 }
 
 pub fn with_tone_hook<R>(hook: Arc<dyn ToneHook>, run: impl FnOnce() -> R) -> R {
-    let previous = HOOK.with(|h| h.replace(Some(hook)));
-    let out = run();
-    HOOK.with(|h| *h.borrow_mut() = previous);
-    out
+    installed(Some(hook), run)
+}
+
+// Filmlab: a pool thread waiting inside one render can pick up another render whole (rayon helping), so a render
+// starts by setting aside any hook its thread already holds; otherwise a render without film takes the other's
+// capture and comes back without pixels, and its scene lands in the other's capture
+pub fn without_tone_hook<R>(run: impl FnOnce() -> R) -> R {
+    curve_input_set(false, || installed(None, run))
 }
 
 pub(crate) fn current() -> Option<Arc<dyn ToneHook>> {
     HOOK.with(|h| h.borrow().clone())
+}
+
+struct RestoreCurveInput(bool);
+
+impl Drop for RestoreCurveInput {
+    fn drop(&mut self) {
+        CURVE_INPUT.set(self.0);
+    }
+}
+
+fn curve_input_set<R>(on: bool, run: impl FnOnce() -> R) -> R {
+    let _restore = RestoreCurveInput(CURVE_INPUT.replace(on));
+    run()
+}
+
+pub fn with_curve_input<R>(run: impl FnOnce() -> R) -> R {
+    curve_input_set(true, run)
+}
+
+pub(crate) fn curve_input() -> bool {
+    CURVE_INPUT.get()
 }

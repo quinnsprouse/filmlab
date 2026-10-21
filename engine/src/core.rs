@@ -93,6 +93,8 @@ struct ViewRequest {
     overlay: Option<OverlayRequest>,
     #[serde(default)]
     film: Option<FilmRequest>,
+    #[serde(default)]
+    curve_input: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, Default)]
@@ -195,8 +197,11 @@ fn photo_of(f: &Facts) -> Photo {
     p
 }
 
+const NOT_RENDERED: [&str; 4] = ["detail.sharpenRadius", "detail.sharpenDetail", "detail.nrContrast", "enhance.denoise"];
+
 pub fn controls() -> Fallible<String> {
-    to_json(&CONTROLS)
+    let rendered: Vec<_> = CONTROLS.iter().filter(|c| !NOT_RENDERED.contains(&c.id)).collect();
+    to_json(&rendered)
 }
 
 pub fn probe(name: &str, bytes: &[u8]) -> Fallible<String> {
@@ -619,7 +624,9 @@ fn cropped(w: usize, h: usize, rgba: Vec<[u8; 4]>, keep: Option<Region>) -> (usi
     }
 }
 
-fn light_of(s: &DevelopSettings) -> Light {
+fn light_of(s: &DevelopSettings, req: &RenderRequest) -> Light {
+    let effective = s.effective();
+    let s = pipeline::settings_for(&effective, req);
     Light { contrast: s.light.contrast as f32, whites: s.light.whites as f32, blacks: s.light.blacks as f32 }
 }
 
@@ -896,6 +903,10 @@ impl Engine {
     }
 
     pub fn render(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
+        pipeline::film_hook::without_tone_hook(|| self.render_frame(key, settings, view))
+    }
+
+    fn render_frame(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
         let s: DevelopSettings = parse(settings)?;
         let v: ViewRequest = parse(view)?;
@@ -908,17 +919,20 @@ impl Engine {
         let job = FilmJob {
             luts: &self.luts,
             film: v.film.as_ref(),
-            light: light_of(&s),
+            light: light_of(&s, &req),
             view: stored.as_ref().and_then(|k| self.scenes.remove(k)),
             look: self.looks.remove(key),
             look_key: look_key(key, &s, &req),
             native: native_frame(loaded.width, loaded.height, &s),
         };
         let size_of = |r: &RenderRequest| pipeline::output_size(src.image.width, src.image.height, &s, r);
-        let outcome = film_render(job, &req, size_of, |r, lane| match (lane, &cache, &look_cache) {
-            (Lane::View, Some(cache), _) | (Lane::Look, _, Some(cache)) => pipeline::render_cached(&src.image, &info, &s, r, cache),
-            _ => pipeline::render(&src.image, &info, &s, r),
-        })?;
+        let rendered = || {
+            film_render(job, &req, size_of, |r, lane| match (lane, &cache, &look_cache) {
+                (Lane::View, Some(cache), _) | (Lane::Look, _, Some(cache)) => pipeline::render_cached(&src.image, &info, &s, r, cache),
+                _ => pipeline::render(&src.image, &info, &s, r),
+            })
+        };
+        let outcome = if v.curve_input { pipeline::film_hook::with_curve_input(rendered) } else { rendered() }?;
         let mut rendered = outcome.rendered;
         let keep = outcome.keep;
         if let (Some(k), Some(view)) = (stored, outcome.view) {
@@ -943,6 +957,10 @@ impl Engine {
     }
 
     pub fn export(&mut self, key: &str, facts: &str, state: &str, options: &str, film: &str) -> Fallible<Vec<u8>> {
+        pipeline::film_hook::without_tone_hook(|| self.export_file(key, facts, state, options, film))
+    }
+
+    fn export_file(&mut self, key: &str, facts: &str, state: &str, options: &str, film: &str) -> Fallible<Vec<u8>> {
         let film: Option<FilmRequest> = parse(film)?;
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
         let p = edited_photo(&parse(facts)?, parse(state)?);
@@ -962,7 +980,7 @@ impl Engine {
         };
         let info = loaded.source.info_or(loaded.header.clone());
         let native = native_frame(p.width, p.height, &p.develop);
-        let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop), view: None, look: None, look_key: 0, native };
+        let job = FilmJob { luts: &self.luts, film: film.as_ref(), light: light_of(&p.develop, &req), view: None, look: None, look_key: 0, native };
         let size_of = |r: &RenderRequest| pipeline::output_size(loaded.source.image.width, loaded.source.image.height, &p.develop, r);
         // (by bands for an 8-bit render whose plan reads no pixels: see film_export)
         let bands = req.depth == OutputDepth::U8 && req.overlay == Overlay::None && !pipeline::plan_reads_pixels(&p.develop);

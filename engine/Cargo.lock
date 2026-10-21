@@ -666,6 +666,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 name = "filmlab-engine"
 version = "0.1.0"
 dependencies = [
+ "lightcraft-color",
  "lightcraft-engine",
  "lightcraft-geom",
  "lightcraft-meta",
