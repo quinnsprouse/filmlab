@@ -15,7 +15,15 @@ pub struct Form {
 }
 
 pub fn open(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabApp>) {
-    let name = cx.new(|cx| InputState::new(window, cx).placeholder("Golden stone"));
+    start(app, LOOK_GROUPS.into_iter().collect(), "Golden stone", window, cx);
+}
+
+pub fn open_curve(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabApp>) {
+    start(app, HashSet::from(["toneCurve"]), "Faded print", window, cx);
+}
+
+fn start(app: &mut FilmlabApp, chosen: HashSet<&'static str>, placeholder: &'static str, window: &mut Window, cx: &mut Context<FilmlabApp>) {
+    let name = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
     let enter = cx.subscribe_in(&name, window, |app, _, event: &InputEvent, _, cx| {
         match event {
             InputEvent::PressEnter { .. } => submit(app, cx),
@@ -24,7 +32,7 @@ pub fn open(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabA
         }
     });
     name.update(cx, |input, cx| input.focus(window, cx));
-    app.rail.saving = Some(Form { name, chosen: LOOK_GROUPS.into_iter().collect(), _enter: enter });
+    app.rail.saving = Some(Form { name, chosen, _enter: enter });
     cx.notify();
 }
 

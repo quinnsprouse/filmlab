@@ -75,6 +75,24 @@ pub struct DisplayFrame {
     pub histogram: Vec<u32>,
 }
 
+pub struct CurveInput {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    made_from: Value,
+}
+
+impl CurveInput {
+    pub fn at(&self, u: f64, v: f64) -> Option<[u8; 3]> {
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let i = ((v * h) as usize * self.width as usize + (u * w) as usize) * 4;
+        self.rgba.get(i..i + 3).map(|p| [p[0], p[1], p[2]])
+    }
+}
+
 struct Animation {
     from: Camera,
     to: Camera,
@@ -131,6 +149,8 @@ pub struct Develop {
     /// it set); the inspector draws them amber until you change them.
     pub agent_marks: HashMap<String, Value>,
     flat: HashMap<String, Value>,
+    pub curve_input: Option<Arc<CurveInput>>,
+    curve_input_wanted: bool,
 }
 
 // why: a run of slider edits in one section (exposure, then contrast, then highlights) is one change in the history
@@ -159,11 +179,16 @@ fn flatten(settings: &Value, film: Option<&FilmSettings>) -> HashMap<String, Val
     }
     let values: HashMap<String, f64> = core::control_values(&settings.to_string()).ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
     let mut out: HashMap<String, Value> = values.into_iter().map(|(k, v)| (k, json!(v))).collect();
+    for channel in POINT_CURVES {
+        out.insert(format!("curve.{channel}"), settings["curve"][channel].clone());
+    }
     if let Some(film) = film {
         walk("film", &film.normalized().to_value(), &mut out);
     }
     out
 }
+
+pub const POINT_CURVES: [&str; 4] = ["master", "red", "green", "blue"];
 
 fn section_of(key: &str) -> Option<&'static str> {
     static SECTIONS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
@@ -252,6 +277,8 @@ impl Develop {
             rested: false,
             agent_marks: HashMap::new(),
             flat: HashMap::new(),
+            curve_input: None,
+            curve_input_wanted: false,
         }
     }
 
@@ -270,6 +297,11 @@ impl Develop {
 
     fn inputs(&self) -> Option<Inputs> {
         let settings = self.shown_settings()?.clone();
+        let film = if self.compare == Compare::Before { None } else { render_film(self.film.as_ref()) };
+        self.inputs_of(settings, film, self.overlay.clone())
+    }
+
+    fn inputs_of(&self, settings: Value, film: Option<FilmSettings>, overlay: Option<Value>) -> Option<Inputs> {
         if self.status != Status::Ready {
             return None;
         }
@@ -277,16 +309,7 @@ impl Develop {
         let facts = self.facts.as_ref()?;
         let apply_crop = self.tool != Tool::Crop;
         let native: [f64; 2] = serde_json::from_str(&core::frame_size(&facts.to_string(), &settings.to_string(), apply_crop).ok()?).ok()?;
-        let film = if self.compare == Compare::Before { None } else { render_film(self.film.as_ref()) };
-        Some(Inputs {
-            photo_id,
-            revision: self.planned_revision(),
-            settings,
-            film,
-            overlay: self.overlay.clone(),
-            apply_crop,
-            native: (native[0], native[1]),
-        })
+        Some(Inputs { photo_id, revision: self.planned_revision(), settings, film, overlay, apply_crop, native: (native[0], native[1]) })
     }
 
     fn target_zoom(&self) -> Zoom {
@@ -325,6 +348,7 @@ impl Develop {
         self.overlay = None;
         self.fit = None;
         self.detail = None;
+        self.curve_input = None;
         self.shown.clear();
         self.applied = None;
         self.rested = false;
@@ -524,6 +548,9 @@ impl Develop {
         }
         self.drop_stale_detail();
         let Some(plan) = self.next_plan() else {
+            if self.measure_curve_input(cx) {
+                return;
+            }
             self.schedule_trim(cx);
             self.schedule_idle(cx);
             return;
@@ -531,29 +558,10 @@ impl Develop {
         self.trim = None;
         self.idle = None;
         self.in_flight = true;
-        let engine = self.engine.clone();
-        let key = source_key(&plan.photo_id, plan.level);
-        let mut view = plan.view.clone();
-        if let Some(o) = &plan.overlay {
-            view["overlay"] = o.clone();
-        }
-        if let Some(f) = &plan.film {
-            view["film"] = f.to_value();
-        }
-        let settings = plan.settings.to_string();
-        let film = plan.film.clone();
         let started = Instant::now();
+        let rendering = self.rendering(&plan, cx);
         cx.spawn(async move |this, cx| {
-            let rendered = cx
-                .background_spawn(async move {
-                    // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
-                    // render that holds it would deadlock the pool
-                    let mut engine = engine.lock().map_err(|e| e.to_string())?;
-                    let engine = &mut *engine;
-                    ensure_luts(engine, film.as_ref())?;
-                    crate::perf::interactive(|| engine.render(&key, &settings, &view.to_string()))
-                })
-                .await;
+            let rendered = rendering.await;
             if std::env::var_os("FILMLAB_TRACE").is_some()
                 && let Ok(f) = &rendered
             {
@@ -590,6 +598,70 @@ impl Develop {
             });
         })
         .detach();
+    }
+
+    fn rendering(&self, plan: &Plan, cx: &mut Context<Develop>) -> Task<Result<core::Frame, String>> {
+        let engine = self.engine.clone();
+        let key = source_key(&plan.photo_id, plan.level);
+        let mut view = plan.view.clone();
+        if let Some(o) = &plan.overlay {
+            view["overlay"] = o.clone();
+        }
+        if let Some(f) = &plan.film {
+            view["film"] = f.to_value();
+        }
+        let settings = plan.settings.to_string();
+        let film = plan.film.clone();
+        cx.background_spawn(async move {
+            // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
+            // render that holds it would deadlock the pool
+            let mut engine = engine.lock().map_err(|e| e.to_string())?;
+            let engine = &mut *engine;
+            ensure_luts(engine, film.as_ref())?;
+            crate::perf::interactive(|| engine.render(&key, &settings, &view.to_string()))
+        })
+    }
+
+    pub fn watch_curve_input(&mut self, wanted: bool, cx: &mut Context<Develop>) {
+        if std::mem::replace(&mut self.curve_input_wanted, wanted) != wanted && wanted {
+            self.pump(cx);
+        }
+    }
+
+    fn curve_input_plan(&self) -> Option<(Plan, Value)> {
+        if !self.curve_input_wanted || self.dragging.is_some() || self.compare != Compare::After {
+            return None;
+        }
+        let inputs = self.inputs_of(self.settings.clone()?, render_film(self.film.as_ref()), None)?;
+        let mut plan = self.runnable(&fit_plan(&inputs, self.viewport))?;
+        let mut uncurved = plan.settings.clone();
+        uncurved.as_object_mut()?.remove("curve");
+        let made_from = json!([plan.photo_id, plan.level.tag(), uncurved, plan.film.as_ref().map(FilmSettings::to_value), plan.view]);
+        if self.curve_input.as_ref().is_some_and(|c| c.made_from == made_from) {
+            return None;
+        }
+        plan.view["curveInput"] = json!(true);
+        Some((plan, made_from))
+    }
+
+    fn measure_curve_input(&mut self, cx: &mut Context<Develop>) -> bool {
+        let Some((plan, made_from)) = self.curve_input_plan() else { return false };
+        self.in_flight = true;
+        let rendering = self.rendering(&plan, cx);
+        cx.spawn(async move |this, cx| {
+            let rendered = rendering.await;
+            let _ = this.update(cx, |develop, cx| {
+                develop.in_flight = false;
+                let (width, height, rgba) = rendered.map_or((0, 0, Vec::new()), |mut f| (f.width, f.height, f.take_rgba()));
+                if develop.photo_id.as_deref() == Some(plan.photo_id.as_str()) {
+                    develop.curve_input = Some(Arc::new(CurveInput { width, height, rgba, made_from }));
+                }
+                cx.notify();
+                develop.pump(cx);
+            });
+        })
+        .detach();
+        true
     }
 
     fn sync_camera(&mut self) {
@@ -701,6 +773,7 @@ impl Develop {
         self.path = None;
         self.fit = None;
         self.detail = None;
+        self.curve_input = None;
         self.shown.clear();
         self.prerendered.clear();
         self.rested = false;

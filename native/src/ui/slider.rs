@@ -5,12 +5,13 @@ use std::sync::Arc;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::color_rail::{self, ColorRail};
 use super::theme;
 
 type OnChange = Rc<dyn Fn(f64, &mut Window, &mut App)>;
 
 #[derive(Clone)]
-struct DragValue(ElementId);
+pub(super) struct DragValue(pub(super) ElementId);
 
 pub struct Nothing;
 
@@ -19,7 +20,7 @@ pub struct OnRelease(pub Rc<dyn Fn(&mut App)>);
 
 impl Global for OnRelease {}
 
-fn released(cx: &mut App) {
+pub(super) fn released(cx: &mut App) {
     if let Some(f) = cx.try_global::<OnRelease>().map(|g| g.0.clone()) {
         f(cx);
     }
@@ -44,12 +45,14 @@ pub struct ParamSlider {
     shown: Option<SharedString>,
     disabled: bool,
     agent: bool,
+    lit: bool,
+    rail: Option<ColorRail>,
     on_change: Option<OnChange>,
 }
 
 impl ParamSlider {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>, value: f64, min: f64, max: f64) -> Self {
-        ParamSlider { id: id.into(), label: label.into(), value, min, max, step: 1.0, fallback: 0.0, decimals: 0, shown: None, disabled: false, agent: false, on_change: None }
+        ParamSlider { id: id.into(), label: label.into(), value, min, max, step: 1.0, fallback: 0.0, decimals: 0, shown: None, disabled: false, agent: false, lit: false, rail: None, on_change: None }
     }
 
     pub fn step(mut self, step: f64) -> Self {
@@ -84,6 +87,16 @@ impl ParamSlider {
         self
     }
 
+    pub fn lit(mut self, lit: bool) -> Self {
+        self.lit = lit;
+        self
+    }
+
+    pub fn rail(mut self, rail: ColorRail) -> Self {
+        self.rail = Some(rail);
+        self
+    }
+
     pub fn on_change(mut self, f: impl Fn(f64, &mut Window, &mut App) + 'static) -> Self {
         self.on_change = Some(Rc::new(f));
         self
@@ -104,7 +117,7 @@ fn snap(value: f64, min: f64, max: f64, step: f64) -> f64 {
     ((stepped * 1e6).round() / 1e6).clamp(min, max)
 }
 
-fn value_at(x: Pixels, bounds: Bounds<Pixels>, min: f64, max: f64, step: f64) -> f64 {
+pub(super) fn value_at(x: Pixels, bounds: Bounds<Pixels>, min: f64, max: f64, step: f64) -> f64 {
     let width = f64::from(f32::from(bounds.size.width)).max(1.0);
     let t = (f64::from(f32::from(x - bounds.left())) / width).clamp(0.0, 1.0);
     snap(min + t * (max - min), min, max, step)
@@ -114,8 +127,8 @@ fn value_at(x: Pixels, bounds: Bounds<Pixels>, min: f64, max: f64, step: f64) ->
 const MORPH: Duration = Duration::from_millis(240);
 
 #[derive(Default)]
-struct Interaction {
-    bounds: Bounds<Pixels>,
+pub(super) struct Interaction {
+    pub(super) bounds: Bounds<Pixels>,
     hovered: bool,
     dragging: bool,
     /// The amber state last drawn (none before the first paint), and the morph toward it: where it started and when.
@@ -151,6 +164,77 @@ impl Interaction {
         self.agent = Some(agent);
         self.amber()
     }
+
+    pub(super) fn lit(&self, active: bool) -> bool {
+        active && (self.hovered || self.dragging)
+    }
+
+    pub(super) fn set_dragging(&mut self, dragging: bool, cx: &mut Context<Self>) {
+        self.dragging = dragging;
+        cx.notify();
+    }
+}
+
+pub(super) fn interaction(id: &ElementId, window: &mut Window, cx: &mut App) -> Entity<Interaction> {
+    window.use_keyed_state(ElementId::NamedChild(Arc::new(id.clone()), "slider".into()), cx, |_, _| Interaction::default())
+}
+
+pub(super) fn amber(state: &Entity<Interaction>, agent: bool, window: &mut Window, cx: &mut App) -> f32 {
+    let (amber, morphing) = state.update(cx, |s, _| s.morph(agent, super::motion::reduced()));
+    if morphing {
+        window.request_animation_frame();
+    }
+    amber
+}
+
+pub(super) fn fill_of(lit: bool, amber: f32) -> Hsla {
+    let gray = if lit { theme::fill_active() } else { theme::fill() };
+    blend(gray, if lit { rgba(0xFFB34033).into() } else { rgba(0xFFB34024).into() }, amber)
+}
+
+pub(super) fn handle_of(amber: f32) -> Hsla {
+    blend(theme::handle(), theme::accent(), amber)
+}
+
+pub(super) fn handle(at: f32, color: Hsla) -> Div {
+    div().absolute().top(px(8.)).h(px(20.)).w(px(3.)).ml(px(-1.5)).left(relative(at.clamp(0.012, 0.988))).rounded_full().bg(color)
+}
+
+pub(super) fn caption(label: SharedString, value: SharedString, lit: bool) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_size(px(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .child(div().text_color(theme::label()).child(label))
+        .child(div().pr(px(2.)).font_features(theme::tabular()).text_color(if lit { theme::focus() } else { theme::label() }).child(value))
+}
+
+pub(super) fn measured(state: &Entity<Interaction>) -> Canvas<()> {
+    let record = state.clone();
+    canvas(move |b, _, cx| record.update(cx, |s, _| s.bounds = b), |_, _, _, _| {}).absolute().size_full()
+}
+
+pub(super) fn tracked(row: Stateful<Div>, state: &Entity<Interaction>) -> Stateful<Div> {
+    let (hover, release, end) = (state.clone(), state.clone(), state.clone());
+    row.on_hover(move |over, _, cx| {
+        hover.update(cx, |s, cx| {
+            s.hovered = *over;
+            cx.notify();
+        })
+    })
+    .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+        release.update(cx, |s, cx| s.set_dragging(false, cx));
+        released(cx);
+    })
+    .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+        end.update(cx, |s, cx| s.set_dragging(false, cx));
+        released(cx);
+    })
 }
 
 fn blend(a: Hsla, b: Hsla, t: f32) -> Hsla {
@@ -166,22 +250,12 @@ impl RenderOnce for ParamSlider {
         let value = self.value.clamp(min, max);
         let at = ((value - min) / (max - min).max(f64::EPSILON)) as f32;
         let text = self.readout(value);
-        let state = window.use_keyed_state(ElementId::NamedChild(Arc::new(self.id.clone()), "slider".into()), cx, |_, _| Interaction::default());
-        let (hovered, dragging) = {
-            let s = state.read(cx);
-            (s.hovered, s.dragging)
-        };
+        let state = interaction(&self.id, window, cx);
         let active = !self.disabled && self.on_change.is_some();
-        let lit = active && (hovered || dragging);
-        let (amber, morphing) = state.update(cx, |s, _| s.morph(self.agent, super::motion::reduced()));
-        if morphing {
-            window.request_animation_frame();
-        }
-        let gray_fill = if lit { theme::fill_active() } else { theme::fill() };
-        let fill = blend(gray_fill, if lit { rgba(0xFFB34033).into() } else { rgba(0xFFB34024).into() }, amber);
-        let handle = blend(theme::handle(), theme::accent(), amber);
+        let lit = state.read(cx).lit(active) || (active && self.lit);
+        let amber = amber(&state, self.agent, window, cx);
         let centre = (min < 0.0 && max > 0.0).then(|| (-min / (max - min)) as f32);
-        let (record, hover, press, release, end) = (state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
+        let press = state.clone();
         let (on_press, on_drag, on_reset) = (self.on_change.clone(), self.on_change.clone(), self.on_change.clone());
         let fallback = self.fallback;
         let drag_id = self.id.clone();
@@ -194,7 +268,7 @@ impl RenderOnce for ParamSlider {
             .overflow_hidden()
             .bg(theme::surface())
             .when(self.disabled, |d| d.opacity(0.4))
-            .child(canvas(move |b, _, cx| record.update(cx, |s, _| s.bounds = b), |_, _, _, _| {}).absolute().size_full())
+            .child(measured(&state))
             // why: GPUI clips children to the rectangle, not the rounded corners, so the fill rounds its own
             .child(
                 div()
@@ -205,31 +279,15 @@ impl RenderOnce for ParamSlider {
                     .w(relative(at))
                     .rounded_l(px(theme::RADIUS))
                     .when(at > 0.98, |d| d.rounded_r(px(theme::RADIUS)))
-                    .bg(fill),
+                    .bg(fill_of(lit, amber)),
             )
+            .when_some(self.rail, |d, rail| d.child(color_rail::strip(rail, self.disabled)))
             .when_some(centre.filter(|_| lit), |d, c| d.child(div().absolute().top(px(14.)).h(px(8.)).w(px(1.)).left(relative(c)).rounded_full().bg(theme::hashmark())))
-            .child(div().absolute().top(px(8.)).h(px(20.)).w(px(3.)).ml(px(-1.5)).left(relative(at.clamp(0.012, 0.988))).rounded_full().bg(handle))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(div().text_color(theme::label()).child(self.label))
-                    .child(div().pr(px(2.)).font_features(theme::tabular()).text_color(if lit { theme::focus() } else { theme::label() }).child(text)),
-            )
+            .child(handle(at, handle_of(amber)))
+            .child(caption(self.label, text, lit))
             .when(active, |d| {
-                d.cursor_ew_resize()
-                    .on_hover(move |over, _, cx| {
-                        hover.update(cx, |s, cx| {
-                            s.hovered = *over;
-                            cx.notify();
-                        })
-                    })
+                tracked(d, &state)
+                    .cursor_ew_resize()
                     .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         cx.stop_propagation();
                         if event.click_count >= 2 {
@@ -239,27 +297,10 @@ impl RenderOnce for ParamSlider {
                             return;
                         }
                         let b = press.read(cx).bounds;
-                        press.update(cx, |s, cx| {
-                            s.dragging = true;
-                            cx.notify();
-                        });
+                        press.update(cx, |s, cx| s.set_dragging(true, cx));
                         if let Some(f) = &on_press {
                             f(value_at(event.position.x, b, min, max, step), window, cx);
                         }
-                    })
-                    .on_mouse_up(MouseButton::Left, move |_, _, cx| {
-                        release.update(cx, |s, cx| {
-                            s.dragging = false;
-                            cx.notify();
-                        });
-                        released(cx);
-                    })
-                    .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
-                        end.update(cx, |s, cx| {
-                            s.dragging = false;
-                            cx.notify();
-                        });
-                        released(cx);
                     })
                     .on_drag(DragValue(drag_id.clone()), |_, _, _, cx| cx.new(|_| Nothing))
                     .on_drag_move(move |event: &DragMoveEvent<DragValue>, window, cx| {

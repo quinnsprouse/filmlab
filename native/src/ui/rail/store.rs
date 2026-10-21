@@ -69,6 +69,13 @@ pub fn write(profiles: &[Profile]) {
     }
 }
 
+impl Profile {
+    /// A saved tone curve: a profile that keeps the Tone curve and nothing else, which the curve menu lists.
+    pub fn is_curve(&self) -> bool {
+        self.groups.len() == 1 && self.groups[0] == "toneCurve"
+    }
+}
+
 // why: a profile stores every engine group; film's settings travel separately as `film`
 pub fn build(name: &str, settings: &Value, groups: Vec<String>, film: Option<Value>) -> Option<Profile> {
     let engine_groups: Vec<&String> = groups.iter().filter(|g| *g != "film").collect();
@@ -77,12 +84,8 @@ pub fn build(name: &str, settings: &Value, groups: Vec<String>, film: Option<Val
     Some(Profile { id: new_id(), name: name.trim().to_string(), groups, partial: serde_json::from_str(&partial).ok()?, film, created_at: iso_now() })
 }
 
-/// The profiles the rail shows, read from disk the first time they're needed.
+/// The profiles the rail shows.
 pub fn shown(rail: &mut super::State) -> &mut Vec<Profile> {
-    if !rail.loaded {
-        rail.profiles = load();
-        rail.loaded = true;
-    }
     &mut rail.profiles
 }
 

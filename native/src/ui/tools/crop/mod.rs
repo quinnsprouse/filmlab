@@ -3,6 +3,7 @@ mod commands;
 mod custom;
 mod geometry;
 mod guides;
+mod level;
 mod overlay;
 mod panel;
 
@@ -25,6 +26,12 @@ pub struct State {
     gestures: u64,
     readout: Option<(geometry::Vec2, f64)>,
     cursor: CursorStyle,
+    leveling: level::Leveling,
+    guide: guides::Guide,
+}
+
+pub fn shows_level_grid(app: &FilmlabApp) -> bool {
+    matches!(app.tools.crop.guide, guides::Guide::Level(_))
 }
 
 /// Where the edit history stood when the crop tool opened, so Escape can go back to it.

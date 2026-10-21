@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,6 +14,27 @@ type OnToggle = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 
 fn row(id: impl Into<ElementId>) -> Stateful<Div> {
     div().id(id).h(px(theme::ROW)).w_full().px(px(10.)).flex().items_center().justify_between().gap(px(8.)).rounded(px(theme::RADIUS)).bg(theme::surface()).text_size(px(13.)).font_weight(FontWeight::MEDIUM)
+}
+
+#[derive(Clone, Default)]
+pub struct Placed(Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>);
+
+impl Placed {
+    pub fn get(&self, id: &str) -> Option<Bounds<Pixels>> {
+        self.0.borrow().get(id).copied()
+    }
+
+    pub fn record(&self, id: impl Into<SharedString>) -> impl IntoElement {
+        let (placed, id) = (self.0.clone(), id.into());
+        canvas(
+            move |bounds, _, _| {
+                placed.borrow_mut().insert(id, bounds);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    }
 }
 
 pub fn header(title: impl Into<SharedString>) -> impl IntoElement {
@@ -96,18 +119,12 @@ impl RenderOnce for Toggle {
     }
 }
 
-pub struct PickerItem {
-    pub label: String,
-    pub checked: bool,
-    pub header: bool,
-}
-
 #[derive(IntoElement)]
 pub struct Picker {
     id: ElementId,
     label: SharedString,
     value: SharedString,
-    items: Rc<dyn Fn() -> Vec<PickerItem>>,
+    items: Rc<dyn Fn() -> Vec<Entry>>,
     on_pick: OnPick,
 }
 
@@ -116,7 +133,7 @@ impl Picker {
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         value: impl Into<SharedString>,
-        items: impl Fn() -> Vec<PickerItem> + 'static,
+        items: impl Fn() -> Vec<Entry> + 'static,
         on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
     ) -> Self {
         Picker { id: id.into(), label: label.into(), value: value.into(), items: Rc::new(items), on_pick: Rc::new(on_pick) }
@@ -146,17 +163,8 @@ impl RenderOnce for Picker {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
                 let anchor = *bounds.read(cx);
-                let listed = items();
-                let mut entries = Vec::new();
-                let mut map = Vec::new();
-                for (i, item) in listed.iter().enumerate() {
-                    if item.header {
-                        entries.push(Entry::Header(item.label.clone()));
-                    } else {
-                        entries.push(Entry::Item { label: item.label.clone(), checked: item.checked });
-                        map.push(i);
-                    }
-                }
+                let entries = items();
+                let map: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| matches!(e, Entry::Item { .. })).map(|(i, _)| i).collect();
                 let rx = menu::popup(window, anchor, entries);
                 let pick = pick.clone();
                 let handle = window.window_handle();

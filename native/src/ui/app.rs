@@ -209,6 +209,9 @@ impl FilmlabApp {
         remember(&folder, None);
         self.set_mode(Mode::Browse, cx);
         self.selected = None;
+        if self.develop.read(cx).photo_id.is_some() {
+            self.develop.update(cx, |d, cx| d.unload(cx));
+        }
         self.library.update(cx, |library, cx| library.open(folder, cx));
     }
 
@@ -222,6 +225,10 @@ impl FilmlabApp {
             }
         })
         .detach();
+    }
+
+    pub fn focus_app(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
     }
 
     pub fn open_photo(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -257,7 +264,7 @@ impl FilmlabApp {
         if self.rail_open { RAIL + 2.0 * MARGIN } else { MARGIN }
     }
 
-    fn stage(&self, window: &Window) -> Rect {
+    pub(crate) fn stage(&self, window: &Window) -> Rect {
         let v = window.viewport_size();
         let (w, h) = (f32::from(v.width), f32::from(v.height));
         let x = self.left();
@@ -705,6 +712,11 @@ impl Render for FilmlabApp {
         }
         let develop_mode = self.mode == Mode::Develop;
         let tool = self.develop.read(cx).tool;
+        let curve_open = develop_mode && tool == Tool::Edit && self.ui.open.get("curve").copied().unwrap_or(false);
+        self.develop.update(cx, |d, cx| d.watch_curve_input(curve_open, cx));
+        if window.focused(cx).is_none() || (!curve_open && self.ui.curve.holds_focus(window)) {
+            window.focus(&self.focus, cx);
+        }
         let inspector_body = develop_mode.then(|| {
             let body = match tool {
                 Tool::Edit => inspector(self, cx),
@@ -845,6 +857,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-shift-e", Export, None),
         KeyBinding::new("cmd-\\", ToggleRail, None),
     ]);
+    super::curve::bind(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.set_menus([
         Menu { name: "Filmlab".into(), items: vec![MenuItem::action("Quit Filmlab", Quit)], disabled: false },

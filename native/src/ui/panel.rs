@@ -1,10 +1,12 @@
 pub enum Row {
     Slider(&'static str, &'static str),
+    HueRange { low: &'static str, high: &'static str, label: &'static str, hues: (f64, f64) },
     Toggle(&'static str, &'static str, &'static str),
     Treatment,
     WhiteBalance,
     Mixer,
     Grading,
+    ToneCurve,
     VignetteStyle,
     FilmStock,
     Halation,
@@ -21,6 +23,9 @@ pub struct Section {
 }
 
 use Row::*;
+
+const PURPLE_HUES: (f64, f64) = (240.0, 360.0);
+const GREEN_HUES: (f64, f64) = (90.0, 210.0);
 
 pub const SECTIONS: &[Section] = &[
     Section { id: "film", title: "Film", open: true, rows: &[FilmStock] },
@@ -41,19 +46,7 @@ pub const SECTIONS: &[Section] = &[
         ],
     },
     Section { id: "color", title: "Color", open: true, rows: &[Treatment, WhiteBalance, Slider("color.vibrance", "Vibrance"), Slider("color.saturation", "Saturation")] },
-    Section {
-        id: "curve",
-        title: "Tone curve",
-        open: false,
-        rows: &[
-            Slider("curve.highlights", "Highlights"),
-            Slider("curve.lights", "Lights"),
-            Slider("curve.darks", "Darks"),
-            Slider("curve.shadows", "Shadows"),
-            Group("Region splits", &[Slider("curve.splitShadows", "Shadows split"), Slider("curve.splitMid", "Midtones split"), Slider("curve.splitHighlights", "Highlights split")]),
-            Slider("curve.refineSaturation", "Refine saturation"),
-        ],
-    },
+    Section { id: "curve", title: "Tone curve", open: false, rows: &[ToneCurve] },
     Section { id: "mixer", title: "Color mixer", open: false, rows: &[Mixer] },
     Section { id: "grading", title: "Color grading", open: false, rows: &[Grading] },
     Section {
@@ -105,11 +98,9 @@ pub const SECTIONS: &[Section] = &[
                 "Defringe",
                 &[
                     Slider("optics.defringePurple", "Purple amount"),
-                    Slider("optics.defringePurpleHueLo", "Purple hue low"),
-                    Slider("optics.defringePurpleHueHi", "Purple hue high"),
+                    HueRange { low: "optics.defringePurpleHueLo", high: "optics.defringePurpleHueHi", label: "Purple hue", hues: PURPLE_HUES },
                     Slider("optics.defringeGreen", "Green amount"),
-                    Slider("optics.defringeGreenHueLo", "Green hue low"),
-                    Slider("optics.defringeGreenHueHi", "Green hue high"),
+                    HueRange { low: "optics.defringeGreenHueLo", high: "optics.defringeGreenHueHi", label: "Green hue", hues: GREEN_HUES },
                 ],
             ),
         ],

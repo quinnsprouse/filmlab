@@ -8,12 +8,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::app::FilmlabApp;
-use super::controls::{Picker, PickerItem, Segmented, Toggle, header};
+use super::color_rail::ColorRail;
+use super::controls::{Picker, Placed, Segmented, Toggle, header};
+use super::curve::{self, Tab};
 use super::panel::{GRADING_REGIONS, MIXER_BANDS, Row, SECTIONS, sentence};
+use super::range::{RangeEnd, RangeSlider};
 use super::slider::ParamSlider;
+use super::wheels::{GradingWheels, Tint, Wheel};
 use super::{icon, theme};
 use crate::develop::Develop;
 use crate::film::{FilmSettings, GAUGES};
+use crate::menu::Entry;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
 
 #[derive(Deserialize, Clone)]
@@ -40,7 +45,7 @@ pub fn spec(id: &str) -> Option<&'static Spec> {
     SPECS.get(id)
 }
 
-fn format(spec: &Spec, value: f64) -> String {
+pub(super) fn format(spec: &Spec, value: f64) -> String {
     let text = format!("{value:.prec$}", prec = spec.decimals);
     if value > 0.0 && spec.min < 0.0 { format!("+{text}") } else { text }
 }
@@ -69,17 +74,34 @@ pub struct Ui {
     pub open: HashMap<&'static str, bool>,
     pub mixer: usize,
     pub grading: usize,
+    pub curve: curve::State,
+    pub placed: Placed,
+    pub scroll: ScrollHandle,
 }
 
 impl Default for Ui {
     fn default() -> Self {
-        Ui { open: SECTIONS.iter().map(|s| (s.id, s.open)).collect(), mixer: 0, grading: 1 }
+        Ui { open: SECTIONS.iter().map(|s| (s.id, s.open)).collect(), mixer: 0, grading: 1, curve: curve::State::default(), placed: Placed::default(), scroll: ScrollHandle::new() }
+    }
+}
+
+const ROWS_ABOVE_SECTIONS: usize = 2;
+
+impl Ui {
+    pub fn reveal(&self, section: &str) {
+        if let Some(index) = SECTIONS.iter().position(|s| s.id == section) {
+            self.scroll.scroll_to_top_of_item(ROWS_ABOVE_SECTIONS + 2 * index);
+        }
     }
 }
 
 type Rows = Vec<AnyElement>;
 
 fn control(id: impl Into<String>, label: impl Into<String>, ctx: &Ctx, develop: &Entity<Develop>) -> Option<AnyElement> {
+    slider(id, label, ctx, develop).map(IntoElement::into_any_element)
+}
+
+fn slider(id: impl Into<String>, label: impl Into<String>, ctx: &Ctx, develop: &Entity<Develop>) -> Option<ParamSlider> {
     let (id, label): (String, String) = (id.into(), label.into());
     let spec = spec(&id)?;
     let values = &ctx.values;
@@ -93,12 +115,72 @@ fn control(id: impl Into<String>, label: impl Into<String>, ctx: &Ctx, develop: 
             .decimals(spec.decimals)
             .fallback(reset)
             .agent(agent)
+            .when_some(ColorRail::for_control(&id, values), ParamSlider::rail)
+            .when(is_angle(&id), |s| s.shown(format!("{value:.0}°")))
             .on_change(move |v, _, cx| {
                 let text = format(spec, v);
                 d.update(cx, |d, cx| d.edit_controls(&[(id.as_str(), v)], &format!("{label} {text}"), cx));
-            })
-            .into_any_element(),
+            }),
     )
+}
+
+fn is_angle(id: &str) -> bool {
+    id.starts_with("grading.") && id.ends_with(".hue")
+}
+
+fn hue_range(low: &'static str, high: &'static str, label: &'static str, (from, to): (f64, f64), ctx: &Ctx, develop: &Entity<Develop>, placed: &Placed) -> Option<AnyElement> {
+    let end = |id: &str| -> Option<RangeEnd> {
+        let spec = spec(id)?;
+        Some(RangeEnd { value: ctx.values.get(id).copied().unwrap_or(spec.default), min: spec.min, max: spec.max, fallback: spec.default })
+    };
+    let d = develop.clone();
+    let range = RangeSlider::new(SharedString::from(low), label, end(low)?, end(high)?, ColorRail::Spectrum { from, to })
+        .agent(ctx.marks.contains(low) || ctx.marks.contains(high))
+        .on_change(move |lo, hi, _, cx| d.update(cx, |d, cx| d.edit_controls(&[(low, lo), (high, hi)], &format!("{label} {lo:.0}–{hi:.0}"), cx)));
+    Some(div().relative().child(range).child(placed.record(low)).into_any_element())
+}
+
+fn grading_wheels(app: &FilmlabApp, ctx: &Ctx, develop: &Entity<Develop>, cx: &mut Context<FilmlabApp>) -> AnyElement {
+    let value = |region: &str, part: &str| ctx.values.get(&format!("grading.{region}.{part}")).copied().unwrap_or(0.0);
+    let wheels = GRADING_REGIONS.iter().map(|region| Wheel { region, label: sentence(region).into(), tint: Tint { hue: value(region, "hue"), sat: value(region, "sat") } }).collect();
+    let (me, d) = (cx.entity(), develop.clone());
+    GradingWheels::new(
+        wheels,
+        app.ui.grading,
+        app.ui.placed.clone(),
+        move |i, _, cx| {
+            me.update(cx, |app, cx| {
+                app.ui.grading = i;
+                cx.notify();
+            })
+        },
+        move |i, tint, _, cx| {
+            let region = GRADING_REGIONS[i];
+            let (hue, sat) = (format!("grading.{region}.hue"), format!("grading.{region}.sat"));
+            let label = if tint.sat.round() == 0.0 { format!("{} tint reset", sentence(region)) } else { format!("{} tint {:.0}° · {:.0}", sentence(region), tint.hue, tint.sat) };
+            d.update(cx, |d, cx| d.edit_controls(&[(hue.as_str(), tint.hue), (sat.as_str(), tint.sat)], &label, cx));
+        },
+    )
+    .into_any_element()
+}
+
+fn hint(text: impl Into<SharedString>) -> AnyElement {
+    div().px(px(2.)).pb(px(4.)).text_size(px(12.)).line_height(px(18.)).text_color(theme::tertiary()).child(text.into()).into_any_element()
+}
+
+fn tone_curve(app: &FilmlabApp, ctx: &Ctx, develop: &Entity<Develop>, cx: &mut Context<FilmlabApp>) -> Rows {
+    let shown = curve::Shown::of(app, &ctx.settings, &ctx.values, &ctx.marks, cx);
+    let mut rows: Rows = vec![curve::tabs(app, &shown, cx), curve::graph(app, &shown, cx)];
+    if shown.tab == Tab::Regions {
+        for (id, label) in curve::REGIONS.iter().rev() {
+            rows.extend(slider(*id, *label, ctx, develop).map(|s| s.lit(shown.lit_region() == Some(*id)).into_any_element()));
+        }
+    } else {
+        rows.extend(shown.hint().map(hint));
+        rows.push(curve::presets(&shown, cx));
+    }
+    rows.extend(control("curve.refineSaturation", "Refine saturation", ctx, develop));
+    rows
 }
 
 fn film_rows(film: &FilmSettings, stocks: &[Stock], develop: &Entity<Develop>) -> Rows {
@@ -123,7 +205,7 @@ fn film_rows(film: &FilmSettings, stocks: &[Stock], develop: &Entity<Develop>) -
                 SharedString::from(format!("stock-{label}")),
                 label,
                 shown,
-                move || listed.iter().map(|(checked, l)| PickerItem { label: l.clone(), checked: *checked, header: false }).collect(),
+                move || listed.iter().map(|(checked, l)| Entry::Item { label: l.clone(), checked: *checked }).collect(),
                 move |i, _, cx| {
                     let (id, name) = options[i].clone();
                     let mut next = base.clone();
@@ -170,20 +252,22 @@ fn halation_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<
         Toggle::new("hal-on", "Halation", h.enabled(), move |on, _, cx| edit(&d, &f, "on", format!("Halation {}", if on { "on" } else { "off" }), Box::new(move |h| h.on = Some(on)))(cx))
             .into_any_element(),
     ];
-    let slider = |id: &'static str, label: &'static str, value: f64, min: f64, max: f64, step: f64, reset: f64, apply: fn(&mut crate::film::Halation, f64)| {
+    let slider = |id: &'static str, label: &'static str, value: f64, (min, max, step): (f64, f64, f64), reset: f64, rail: Option<ColorRail>, apply: fn(&mut crate::film::Halation, f64)| {
         let (d, f) = (develop.clone(), film.clone());
         ParamSlider::new(id, label, value, min, max)
             .step(step)
             .fallback(reset)
             .disabled(!h.enabled())
+            .when_some(rail, ParamSlider::rail)
             .agent(marks.contains(&format!("film.halation.{id}")))
             .on_change(move |v, _, cx| edit(&d, &f, id, format!("Halation {} {v}", label.to_lowercase()), Box::new(move |h| apply(h, v)))(cx))
             .into_any_element()
     };
-    rows.push(slider("amount", "Amount", (h.amount * 100.0).round(), 0.0, 100.0, 1.0, stock.amount * 100.0, |h, v| h.amount = v / 100.0));
-    rows.push(slider("hue", "Hue", (h.hue.unwrap_or(0.45) * 100.0).round(), 0.0, 100.0, 1.0, 45.0, |h, v| h.hue = Some(v / 100.0)));
-    rows.push(slider("sat", "Saturation", (h.sat.unwrap_or(1.0) * 100.0).round(), 0.0, 100.0, 1.0, 100.0, |h, v| h.sat = Some(v / 100.0)));
-    rows.push(slider("radius", "Radius", h.radius, 1.0, 10.0, 0.1, stock.radius, |h, v| h.radius = v));
+    let (percent, halation_hue) = ((0.0, 100.0, 1.0), h.hue.unwrap_or(0.45));
+    rows.push(slider("amount", "Amount", (h.amount * 100.0).round(), percent, stock.amount * 100.0, None, |h, v| h.amount = v / 100.0));
+    rows.push(slider("hue", "Hue", (halation_hue * 100.0).round(), percent, 45.0, Some(ColorRail::HalationHue), |h, v| h.hue = Some(v / 100.0)));
+    rows.push(slider("sat", "Saturation", (h.sat.unwrap_or(1.0) * 100.0).round(), percent, 100.0, Some(ColorRail::HalationSaturation { halation_hue }), |h, v| h.sat = Some(v / 100.0)));
+    rows.push(slider("radius", "Radius", h.radius, (1.0, 10.0, 0.1), stock.radius, None, |h, v| h.radius = v));
     let (d, f) = (develop.clone(), film.clone());
     let only = h.highlights_only.unwrap_or(true);
     rows.push(
@@ -290,7 +374,7 @@ fn white_balance_rows(facts: &Value, settings: &Value, marks: &HashSet<String>, 
         "wb-mode",
         "White balance",
         current,
-        move || listed.iter().map(|(c, l)| PickerItem { label: l.clone(), checked: *c, header: false }).collect(),
+        move || listed.iter().map(|(c, l)| Entry::Item { label: l.clone(), checked: *c }).collect(),
         move |i, _, cx| {
             let (mode, label) = modes[i];
             d.update(cx, |d, cx| {
@@ -298,24 +382,38 @@ fn white_balance_rows(facts: &Value, settings: &Value, marks: &HashSet<String>, 
             });
         },
     );
-    let wb = |id: &'static str, label: &'static str, value: f64, (min, max, step): (f64, f64, f64)| {
+    let (shot_temp, shot_tint) = as_shot(facts, settings, &view);
+    let neutral = |value: f64, (min, max, _): (f64, f64, f64)| ((value - min) / (max - min)).clamp(0.0, 1.0);
+    let (temp_rail, tint_rail) = (ColorRail::temp(neutral(shot_temp, temp)), ColorRail::tint(neutral(shot_tint, tint)));
+    let wb = |id: &'static str, label: &'static str, value: f64, (min, max, step): (f64, f64, f64), rail: ColorRail| {
         let d = develop.clone();
         ParamSlider::new(id, label, value, min, max)
             .step(step)
             .decimals(0)
+            .rail(rail)
             .agent(marks.contains(id))
             .on_change(move |v, _, cx| {
                 d.update(cx, |d, cx| d.edit_controls(&[(id, v)], &format!("{label} {}", v.round()), cx));
             })
             .into_any_element()
     };
-    vec![mode_rows.into_any_element(), wb("wb.temp", "Temp", view.temp, temp), wb("wb.tint", "Tint", view.tint, tint)]
+    vec![mode_rows.into_any_element(), wb("wb.temp", "Temp", view.temp, temp, temp_rail), wb("wb.tint", "Tint", view.tint, tint, tint_rail)]
+}
+
+fn as_shot(facts: &Value, settings: &Value, view: &WhiteBalance) -> (f64, f64) {
+    if !view.kelvin {
+        return (0.0, 0.0);
+    }
+    let mut shot = settings.clone();
+    shot["wb"]["mode"] = json!("asShot");
+    core::white_balance(&facts.to_string(), &shot.to_string()).ok().and_then(|j| serde_json::from_str::<WhiteBalance>(&j).ok()).map_or((view.temp, view.tint), |v| (v.temp, v.tint))
 }
 
 fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut Context<FilmlabApp>) {
     let develop = &app.develop;
     match r {
         Row::Slider(id, label) => rows.extend(control(*id, *label, ctx, develop)),
+        Row::HueRange { low, high, label, hues } => rows.extend(hue_range(low, high, label, *hues, ctx, develop, &app.ui.placed)),
         Row::Toggle(section, field, label) => {
             let on = ctx.settings[section][field].as_bool().unwrap_or(false);
             let d = develop.clone();
@@ -370,23 +468,15 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
         }
         Row::Grading => {
             let region = GRADING_REGIONS[app.ui.grading];
-            let me = cx.entity();
-            rows.push(
-                Segmented::new("grading-region", GRADING_REGIONS.iter().enumerate().map(|(i, r)| (SharedString::from(sentence(r)), i == app.ui.grading)).collect(), move |i, _, cx| {
-                    me.update(cx, |app, cx| {
-                        app.ui.grading = i;
-                        cx.notify();
-                    })
-                })
-                .label("Adjust")
-                .into_any_element(),
-            );
+            rows.push(grading_wheels(app, ctx, develop, cx));
+            rows.push(hint("Drag inside a wheel to tint that range. The ringed one is edited below."));
             for (part, label) in [("hue", "Hue"), ("sat", "Saturation"), ("lum", "Luminance")] {
                 rows.extend(control(format!("grading.{region}.{part}"), label, ctx, develop));
             }
             rows.extend(control("grading.blending", "Blending", ctx, develop));
             rows.extend(control("grading.balance", "Balance", ctx, develop));
         }
+        Row::ToneCurve => rows.extend(tone_curve(app, ctx, develop, cx)),
         Row::VignetteStyle => {
             let style = ctx.settings["vignette"]["style"].as_str().unwrap_or("highlightPriority").to_string();
             let styles = [("highlightPriority", "Highlight"), ("colorPriority", "Color"), ("paintOverlay", "Paint")];
@@ -428,6 +518,10 @@ fn section_of_mark(id: &str) -> Option<&'static str> {
                     Row::Slider(id, _) => {
                         out.insert(*id, section);
                     }
+                    Row::HueRange { low, high, .. } => {
+                        out.insert(*low, section);
+                        out.insert(*high, section);
+                    }
                     Row::Group(_, children) => walk(section, children, out),
                     _ => {}
                 }
@@ -439,7 +533,7 @@ fn section_of_mark(id: &str) -> Option<&'static str> {
         }
         out
     });
-    let prefixed = [("film.halation.", "halation"), ("film.grain.", "grain"), ("film.blur", "grain"), ("film.dust.", "dust"), ("film.", "film"), ("mixer.", "mixer"), ("bw.", "mixer"), ("grading.", "grading"), ("wb.", "color")];
+    let prefixed = [("film.halation.", "halation"), ("film.grain.", "grain"), ("film.blur", "grain"), ("film.dust.", "dust"), ("film.", "film"), ("mixer.", "mixer"), ("bw.", "mixer"), ("grading.", "grading"), ("wb.", "color"), ("curve.", "curve")];
     prefixed.iter().find(|(p, _)| id.starts_with(p)).map(|(_, s)| *s).or_else(|| SLIDERS.get(id).copied())
 }
 
@@ -546,6 +640,7 @@ pub fn inspector(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
         .id("inspector-scroll")
         .size_full()
         .overflow_y_scroll()
+        .track_scroll(&app.ui.scroll)
         .px(px(12.))
         .pt(px(12.))
         .pb(px(8.))

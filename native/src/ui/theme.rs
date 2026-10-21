@@ -76,6 +76,18 @@ pub fn thumb() -> Hsla {
     white(0.95)
 }
 
+pub fn ring() -> Hsla {
+    white(0.85)
+}
+
+pub fn outline() -> Hsla {
+    white(0.1)
+}
+
+pub fn puck_outline() -> Hsla {
+    Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.35 }
+}
+
 pub fn hover() -> Hsla {
     white(0.08)
 }

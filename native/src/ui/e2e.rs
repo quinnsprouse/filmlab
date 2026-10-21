@@ -1,12 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use filmlab_engine::core::{self, Engine};
 use gpui_kit::*;
 use serde_json::{Value, json};
 
 use super::app::{FilmlabApp, INSPECTOR, MARGIN, Mode, TOP};
+use super::curve::{self, Tab};
 use super::driver::Driver;
+use super::inspector::Ui;
+use super::tools::crop;
+use super::wheels::GradingWheels;
 use crate::develop::plans::Plan;
 use crate::develop::{Compare, DisplayFrame, Tool};
 use crate::film::{FilmSettings, Gauge};
@@ -151,6 +155,27 @@ impl Run {
         self.shot(name);
     }
 
+    async fn shoot_inspector(&self, cx: &mut AsyncApp, name: &str) {
+        self.shoot(cx, name).await;
+        let Some(shots) = &self.shots else { return };
+        let Some((width, height)) = self.on_window(cx, |window, _| {
+            let (size, scale) = (window.viewport_size(), window.scale_factor());
+            ((f32::from(size.width) * scale).round() as u32, (f32::from(size.height) * scale).round() as u32)
+        }) else {
+            return;
+        };
+        let crops = shots.with_file_name("crops");
+        let _ = std::fs::create_dir_all(&crops);
+        let wide = 640.min(width);
+        let _ = std::process::Command::new("sips")
+            .args(["-c", &height.to_string(), &wide.to_string(), "--cropOffset", "0", &(width - wide).to_string()])
+            .arg(shots.join(format!("{name}.png")))
+            .arg("--out")
+            .arg(crops.join(format!("{name}.png")))
+            .stdout(std::process::Stdio::null())
+            .status();
+    }
+
 }
 
 pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
@@ -180,6 +205,7 @@ async fn script(run: &mut Run, cx: &mut AsyncApp) {
     let Some((id, folder, stem, facts)) = open_first(run, cx).await else { return };
     edits(run, cx, &folder, &stem, &facts).await;
     film(run, cx).await;
+    color_controls(run, cx).await;
     zoom(run, cx).await;
     tools(run, cx).await;
     compare_and_profiles(run, cx).await;
@@ -354,6 +380,396 @@ async fn film(run: &mut Run, cx: &mut AsyncApp) {
     run.check("film: setting the look back restores the exact frame", restored.is_some_and(|l| l.hash == base.hash), "");
 }
 
+async fn show_section(run: &Run, cx: &mut AsyncApp, section: &'static str) {
+    run.act(cx, |a, cx| {
+        a.ui.open.iter_mut().for_each(|(id, open)| *open = *id == section);
+        cx.notify();
+    });
+    run.pause(cx, 200).await;
+    run.act(cx, |a, cx| {
+        a.ui.reveal(section);
+        cx.notify();
+    });
+    run.pause(cx, 300).await;
+}
+
+fn values_of(ids: [&'static str; 2]) -> impl Fn(&FilmlabApp, &App) -> [f64; 2] {
+    move |a, cx| {
+        let values = a.develop.read(cx).control_values();
+        ids.map(|id| values.get(id).copied().unwrap_or(f64::NAN))
+    }
+}
+
+fn history_step(a: &FilmlabApp, cx: &App) -> usize {
+    a.develop.read(cx).cursor
+}
+
+async fn color_controls(run: &mut Run, cx: &mut AsyncApp) {
+    for (section, shot) in [("color", "04a-color"), ("halation", "04b-halation"), ("calibration", "04c-calibration")] {
+        show_section(run, cx, section).await;
+        run.shoot(cx, shot).await;
+    }
+    for (tab, shot) in ["04d-mixer-hue", "04e-mixer-saturation", "04f-mixer-luminance"].into_iter().enumerate() {
+        run.act(cx, |a, cx| {
+            a.ui.mixer = tab;
+            cx.notify();
+        });
+        show_section(run, cx, "mixer").await;
+        run.shoot(cx, shot).await;
+    }
+    run.develop(cx, |d, cx| d.edit_settings(json!({"treatment": "bw"}), "Black & white", "treatment", cx));
+    show_section(run, cx, "mixer").await;
+    run.shoot(cx, "04g-mixer-bw").await;
+    run.develop(cx, |d, cx| d.undo(cx));
+    grading_wheel(run, cx).await;
+    defringe_range(run, cx).await;
+    tone_curve(run, cx).await;
+    run.act(cx, |a, cx| {
+        a.ui = Ui::default();
+        cx.notify();
+    });
+    run.pause(cx, 300).await;
+}
+
+async fn grading_wheel(run: &mut Run, cx: &mut AsyncApp) {
+    show_section(run, cx, "grading").await;
+    run.shoot(cx, "04h-grading").await;
+    let Some(disc) = run.read(cx, |a, _| a.ui.placed.get(&GradingWheels::disc_id("shadows"))).flatten() else {
+        run.check("grading: the Shadows wheel is laid out", false, "");
+        return;
+    };
+    let tint = values_of(["grading.shadows.hue", "grading.shadows.sat"]);
+    let before = run.read(cx, &tint).unwrap_or_default();
+    let steps = run.read(cx, history_step).unwrap_or(0);
+    let (hue, reach) = (135f32.to_radians(), disc.size.width * 0.3);
+    let centre = disc.center();
+    run.drag(cx, centre, point(centre.x + reach * hue.cos(), centre.y - reach * hue.sin()));
+    run.pause(cx, 300).await;
+    let [h, s] = run.read(cx, &tint).unwrap_or_default();
+    let selected = run.read(cx, |a, _| a.ui.grading).unwrap_or(usize::MAX);
+    run.check("grading: dragging inside the Shadows wheel selects it and sets its hue and saturation", selected == 0 && (h - 135.0).abs() <= 2.0 && (s - 60.0).abs() <= 2.0, format!("selected {selected}, hue {h}, sat {s} (want 135, 60)"));
+    let added = run.read(cx, history_step).unwrap_or(0) - steps;
+    run.check("grading: the wheel drag is one undo step", added == 1, format!("{added} steps added"));
+    run.verify(cx, "grading: the tinted photo matches", false).await;
+    run.shoot(cx, "04i-grading-tinted").await;
+    run.key(cx, "cmd-z");
+    let undone = run.read(cx, &tint).unwrap_or_default();
+    run.check("grading: one undo takes the whole drag back", undone == before, format!("{undone:?}, before {before:?}"));
+    run.key(cx, "cmd-shift-z");
+    run.pause(cx, 300).await;
+    run.click(cx, centre, 2);
+    run.pause(cx, 300).await;
+    let reset = run.read(cx, &tint).unwrap_or_default();
+    run.check("grading: double-clicking a wheel resets its hue and saturation", reset == [0.0, 0.0], format!("{reset:?}"));
+}
+
+async fn defringe_range(run: &mut Run, cx: &mut AsyncApp) {
+    const LOW: &str = "optics.defringePurpleHueLo";
+    const HIGH: &str = "optics.defringePurpleHueHi";
+    show_section(run, cx, "optics").await;
+    let Some(row) = run.read(cx, |a, _| a.ui.placed.get(LOW)).flatten() else {
+        run.check("defringe: the Purple hue range is laid out", false, "");
+        return;
+    };
+    let ends = values_of([LOW, HIGH]);
+    let x_at = |value: f64| row.left() + row.size.width * (value / 100.0) as f32;
+    let at = |value: f64| point(x_at(value), row.center().y);
+    run.click(cx, at(50.0), 2);
+    run.pause(cx, 300).await;
+    let reset = run.read(cx, &ends).unwrap_or_default();
+    run.check("defringe: double-clicking the range resets both ends", reset == [30.0, 70.0], format!("{reset:?}"));
+    run.shoot(cx, "04j-optics").await;
+
+    run.drag(cx, at(30.0), at(50.0));
+    run.pause(cx, 300).await;
+    let low = run.read(cx, &ends).unwrap_or_default();
+    run.check("defringe: dragging the low handle moves only the low end", low == [50.0, 70.0], format!("{low:?}"));
+    run.key(cx, "cmd-z");
+    let undone = run.read(cx, &ends).unwrap_or_default();
+    run.check("defringe: one undo takes the whole drag back", undone == reset, format!("{undone:?}"));
+    run.key(cx, "cmd-shift-z");
+    run.pause(cx, 300).await;
+
+    run.drag(cx, at(70.0), at(25.0));
+    run.pause(cx, 300).await;
+    let high = run.read(cx, &ends).unwrap_or_default();
+    run.check("defringe: the high handle stops at the low one instead of crossing it", high == [50.0, 50.0], format!("{high:?}"));
+    run.verify(cx, "defringe: the edited photo matches", false).await;
+    run.shoot(cx, "04k-optics-dragged").await;
+    run.click(cx, at(50.0), 2);
+    run.pause(cx, 300).await;
+}
+
+fn master_points(a: &FilmlabApp, cx: &App) -> Vec<[f64; 2]> {
+    let settings = a.develop.read(cx).settings.clone().unwrap_or_default();
+    settings["curve"]["master"].as_array().map(|ps| ps.iter().filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?])).collect()).unwrap_or_default()
+}
+
+fn step_label(a: &FilmlabApp, cx: &App) -> String {
+    let d = a.develop.read(cx);
+    d.history.get(d.cursor).map(|s| s.label.clone()).unwrap_or_default()
+}
+
+fn on_diagonal(points: &[[f64; 2]]) -> bool {
+    points.iter().all(|[x, y]| (x - y).abs() < 1e-9)
+}
+
+fn level(value: f64) -> i64 {
+    (value * 255.0).round() as i64
+}
+
+fn on_graph(run: &Run, cx: &mut AsyncApp, u: f64, v: f64) -> Point<Pixels> {
+    let graph = run.read(cx, |a, _| a.ui.placed.get(curve::GRAPH)).flatten().unwrap_or_default();
+    let side = f32::from(graph.size.width) - 20.0;
+    point(graph.left() + px(10.0 + u as f32 * side), graph.top() + px(10.0 + (1.0 - v) as f32 * side))
+}
+
+fn on_rail(run: &Run, cx: &mut AsyncApp, u: f64) -> Point<Pixels> {
+    let floor = on_graph(run, cx, u, 0.0);
+    point(floor.x, floor.y + px(11.5))
+}
+
+async fn pick_curve_tab(run: &mut Run, cx: &mut AsyncApp, tab: Tab, clicks: usize) -> bool {
+    let Some(at) = run.read(cx, move |a, _| a.ui.placed.get(&tab.id())).flatten() else { return false };
+    run.click(cx, at.center(), clicks);
+    run.pause(cx, 300).await;
+    run.read(cx, |a, _| a.ui.curve.tab).is_some_and(|t| t == tab)
+}
+
+async fn tone_curve(run: &mut Run, cx: &mut AsyncApp) {
+    let start = run.read(cx, history_step).unwrap_or(0);
+    show_section(run, cx, "curve").await;
+    let graph = run.read(cx, |a, _| a.ui.placed.get(curve::GRAPH)).flatten();
+    run.check("tone curve: the section opens with its graph", graph.is_some_and(|g| (f32::from(g.size.height) - 292.0).abs() < 0.5), format!("{graph:?}"));
+    if graph.is_none() {
+        return;
+    }
+    let measured = run.wait(cx, 10, |a, cx| a.develop.read(cx).curve_input.as_ref().is_some_and(|i| i.width > 0)).await;
+    run.check("tone curve: the tones entering the curve are measured for its histogram", measured, "");
+
+    let regions = pick_curve_tab(run, cx, Tab::Regions, 1).await;
+    run.check("tone curve: clicking the Regions tab selects it", regions, "");
+    let regional = values_of(["curve.darks", "curve.splitShadows"]);
+    let steps = run.read(cx, history_step).unwrap_or(0);
+    let (from, to) = (on_graph(run, cx, 0.375, 0.5), on_graph(run, cx, 0.375, 0.6));
+    run.drag(cx, from, to);
+    run.pause(cx, 300).await;
+    let [darks, _] = run.read(cx, &regional).unwrap_or_default();
+    let added = run.read(cx, history_step).unwrap_or(0) - steps;
+    let label = run.read(cx, step_label).unwrap_or_default();
+    run.check("tone curve: dragging up in the Darks band raises Darks as one step", darks == 20.0 && added == 1 && label == "Darks +20", format!("darks {darks}, {added} steps, \"{label}\""));
+    run.verify(cx, "tone curve: the Darks edit renders and matches", false).await;
+    let over = on_graph(run, cx, 0.375, 0.55);
+    run.hover(cx, over);
+    let lit = run.read(cx, |a, _| a.ui.curve.tab == Tab::Regions).unwrap_or(false);
+    run.shoot_inspector(cx, "04l-curve-regions").await;
+    let (from, to) = (on_rail(run, cx, 0.25), on_rail(run, cx, 0.30));
+    run.drag(cx, from, to);
+    run.pause(cx, 300).await;
+    let [_, split] = run.read(cx, &regional).unwrap_or_default();
+    run.check("tone curve: dragging the shadows split handle moves the split", lit && split == 30.0, format!("shadows split {split}"));
+
+    let rgb = pick_curve_tab(run, cx, Tab::Rgb, 1).await;
+    run.check("tone curve: clicking the RGB tab selects it", rgb, "");
+    let Some(plain) = run.verify(cx, "tone curve: the photo before adding a point matches", false).await else { return };
+    let steps = run.read(cx, history_step).unwrap_or(0);
+    let on_line = on_graph(run, cx, 0.6, 0.6);
+    run.click(cx, on_line, 1);
+    let added = run.verify(cx, "tone curve: the photo with an added point matches", false).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    let label = run.read(cx, step_label).unwrap_or_default();
+    let same = added.is_some_and(|l| l.hash == plain.hash || (l.mean - plain.mean).abs() < 0.001);
+    run.check(
+        "tone curve: clicking the line adds a point without changing the photo",
+        master.len() == 3 && on_diagonal(&master) && same && label == format!("RGB curve point at {}", level(master.get(1).map_or(0.0, |p| p[0]))) && run.read(cx, history_step).unwrap_or(0) == steps + 1,
+        format!("{master:?}, \"{label}\", unchanged {same}"),
+    );
+
+    let steps = run.read(cx, history_step).unwrap_or(0);
+    let before = master.clone();
+    let (from, to) = (on_graph(run, cx, 0.6, 0.6), on_graph(run, cx, 0.6, 0.72));
+    run.hold(cx, from, to);
+    run.shoot_inspector(cx, "04m-curve-rgb-drag").await;
+    run.release(cx, to);
+    let lifted = run.verify(cx, "tone curve: the lifted curve renders and matches", false).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    let label = run.read(cx, step_label).unwrap_or_default();
+    let added = run.read(cx, history_step).unwrap_or(0) - steps;
+    let lifted_point = master.get(1).copied().unwrap_or_default();
+    run.check(
+        "tone curve: dragging the point bends the curve and brightens the photo as one step",
+        (lifted_point[1] - 0.72).abs() < 0.01 && lifted.is_some_and(|l| l.mean > plain.mean + 0.005) && added == 1 && label == format!("RGB curve {} → {}", level(lifted_point[0]), level(lifted_point[1])),
+        format!("{master:?}, {added} steps, \"{label}\""),
+    );
+    let over = on_graph(run, cx, 0.6, 0.72);
+    run.hover(cx, over);
+    run.shoot_inspector(cx, "04n-curve-rgb-hover").await;
+    run.key(cx, "cmd-z");
+    let undone = run.read(cx, master_points).unwrap_or_default();
+    run.check("tone curve: one undo takes the whole point drag back", undone == before, format!("{undone:?}"));
+    run.key(cx, "cmd-shift-z");
+    run.pause(cx, 300).await;
+
+    let photo = run.on_window(cx, |window, cx| run_fit_center(&run.app, window, cx)).flatten();
+    if let Some(at) = photo {
+        run.hover(cx, at);
+        run.pause(cx, 200).await;
+        let pointing = run.read(cx, |a, _| a.ui.curve.pointing()).unwrap_or(false);
+        run.check("tone curve: the pointer over the photo rings its tone on the curve", pointing, "");
+        run.shoot_inspector(cx, "04o-curve-rgb-pointer").await;
+        let away = on_graph(run, cx, 0.3, 0.95);
+        run.hover(cx, away);
+    }
+
+    let (from, below) = (on_graph(run, cx, 0.6, 0.72), on_graph(run, cx, 0.6, 0.0));
+    let off = point(below.x, below.y + px(62.0));
+    run.hold(cx, from, off);
+    let warned = run.read(cx, |a, _| a.ui.curve.removing()).unwrap_or(false);
+    run.shoot_inspector(cx, "04p-curve-rgb-remove").await;
+    run.release(cx, off);
+    run.pause(cx, 300).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    let label = run.read(cx, step_label).unwrap_or_default();
+    run.check("tone curve: dragging a point off the graph removes it", warned && master.len() <= 2 && on_diagonal(&master) && label == "RGB curve point removed", format!("release to remove shown {warned}, {master:?}, \"{label}\""));
+
+    let names = run.read(cx, |a, _| curve::preset_names(a)).unwrap_or_default();
+    let medium = names.iter().position(|n| n == "Medium Contrast");
+    if let Some(i) = medium {
+        run.act(cx, |a, cx| curve::pick_preset(a, i, cx));
+    }
+    run.verify(cx, "tone curve: the Medium Contrast preset renders and matches", false).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    let label = run.read(cx, step_label).unwrap_or_default();
+    run.check(
+        "tone curve: the point curve menu applies Medium Contrast",
+        master == [[0.0, 0.0], [0.25, 0.2], [0.5, 0.5], [0.75, 0.8], [1.0, 1.0]] && label == "Point curve Medium Contrast",
+        format!("menu {names:?}, {master:?}, \"{label}\""),
+    );
+    run.shoot_inspector(cx, "04q-curve-rgb-preset").await;
+
+    let app = run.app.clone();
+    run.on_window(cx, |window, cx| app.update(cx, |a, cx| curve::choose(a, curve::Preset::Save, window, cx)));
+    run.pause(cx, 300).await;
+    for c in "medium print".chars() {
+        run.key(cx, &if c == ' ' { "space-> ".to_string() } else { format!("{c}->{c}") });
+    }
+    run.key(cx, "enter");
+    run.pause(cx, 300).await;
+    let kept = run.read(cx, |a, _| a.rail.curves().find(|p| p.name == "medium print").map(|p| p.id.clone())).flatten();
+    run.check("tone curve: Save curve keeps the tone curve alone as a profile", kept.is_some(), format!("curves {:?}", run.read(cx, |a, _| a.rail.curves().map(|p| p.name.clone()).collect::<Vec<_>>())));
+    if let Some(linear) = names.iter().position(|n| n == "Linear") {
+        run.act(cx, |a, cx| curve::pick_preset(a, linear, cx));
+    }
+    run.pause(cx, 300).await;
+    if let Some(id) = kept.clone() {
+        run.on_window(cx, |window, cx| app.update(cx, |a, cx| curve::choose(a, curve::Preset::Saved(id), window, cx)));
+    }
+    run.verify(cx, "tone curve: a saved curve renders and matches", false).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    let label = run.read(cx, step_label).unwrap_or_default();
+    let named = run.read(cx, |a, cx| a.develop.read(cx).settings.clone().is_some_and(|s| a.rail.curves().any(|p| p.name == "medium print" && p.partial["curve"] == s["curve"]))).unwrap_or(false);
+    run.check(
+        "tone curve: the curve menu applies a saved curve as one step and names it",
+        master == [[0.0, 0.0], [0.25, 0.2], [0.5, 0.5], [0.75, 0.8], [1.0, 1.0]] && label == "Tone curve medium print" && named,
+        format!("{master:?}, \"{label}\", named {named}"),
+    );
+
+    let (photo, steps) = run.read(cx, |a, cx| (a.develop.read(cx).photo_id.clone(), history_step(a, cx))).unwrap_or_default();
+    let middle = on_graph(run, cx, 0.5, 0.5);
+    run.click(cx, middle, 1);
+    run.pause(cx, 200).await;
+    for key in ["up", "shift-up", "left"] {
+        run.key(cx, key);
+    }
+    run.pause(cx, 300).await;
+    let nudged = run.read(cx, master_points).unwrap_or_default().get(2).copied().unwrap_or_default();
+    let (still, added) = run.read(cx, |a, cx| (a.develop.read(cx).photo_id.clone(), history_step(a, cx) - steps)).unwrap_or_default();
+    run.check(
+        "tone curve: arrow keys move the focused point a level at a time, ten with shift, as one step",
+        (nudged[1] - (0.5 + 11.0 / 255.0)).abs() < 1e-9 && (nudged[0] - (0.5 - 1.0 / 255.0)).abs() < 1e-9 && still == photo && added == 1,
+        format!("{nudged:?}, {added} steps, same photo {}", still == photo),
+    );
+    run.key(cx, "tab");
+    run.shoot_inspector(cx, "04r-curve-rgb-keyboard").await;
+    run.key(cx, "backspace");
+    run.pause(cx, 300).await;
+    let master = run.read(cx, master_points).unwrap_or_default();
+    run.check("tone curve: tab moves to the next point and delete removes it", master.len() == 4 && !master.iter().any(|p| p[0] == 0.75), format!("{master:?}"));
+    run.key(cx, "escape");
+    run.verify(cx, "tone curve: the keyboard edit renders and matches", false).await;
+
+    pick_curve_tab(run, cx, Tab::Red, 1).await;
+    let (from, to) = (on_graph(run, cx, 0.62, 0.62), on_graph(run, cx, 0.62, 0.66));
+    run.drag(cx, from, to);
+    run.pause(cx, 300).await;
+    let label = run.read(cx, step_label).unwrap_or_default();
+    run.check("tone curve: a press and drag on the Red line adds and drags a point in one step", label.starts_with("Red curve 158 → "), format!("\"{label}\""));
+    run.shoot_inspector(cx, "04s-curve-red").await;
+    pick_curve_tab(run, cx, Tab::Green, 1).await;
+    run.shoot_inspector(cx, "04t-curve-green").await;
+    pick_curve_tab(run, cx, Tab::Blue, 1).await;
+    let (from, to) = (on_graph(run, cx, 0.0, 0.0), on_graph(run, cx, 0.0, 0.07));
+    run.drag(cx, from, to);
+    run.pause(cx, 300).await;
+    let label = run.read(cx, step_label).unwrap_or_default();
+    run.check("tone curve: dragging the Blue black point lifts it", label == "Blue curve 0 → 18", format!("\"{label}\""));
+    run.shoot_inspector(cx, "04u-curve-blue").await;
+
+    run.develop(cx, |d, cx| d.command("develop.curve", json!({"channel": "red", "points": [[0.0, 0.0], [0.4, 0.46], [1.0, 1.0]]}), "Warm the shadows", "agent.e2e.curve", cx));
+    let marked = run.read(cx, |a, cx| a.develop.read(cx).agent_marks.contains_key("curve.red")).unwrap_or(false);
+    pick_curve_tab(run, cx, Tab::Red, 1).await;
+    run.check("tone curve: an agent's point curve is marked", marked, "");
+    run.shoot_inspector(cx, "04v-curve-red-agent").await;
+    run.develop(cx, |d, cx| d.undo(cx));
+
+    pick_curve_tab(run, cx, Tab::Rgb, 1).await;
+    let shown = |a: &FilmlabApp, cx: &App| a.develop.read(cx).fit.as_ref().map(|f| std::sync::Arc::as_ptr(f) as usize);
+    let press = on_graph(run, cx, 0.35, 0.35);
+    run.hold(cx, press, press);
+    let (mut last, mut updates, mut gap, mut since) = (run.read(cx, shown).flatten(), 0, Duration::ZERO, Instant::now());
+    for i in 0..60 {
+        let wave = (i as f64 / 60.0 * std::f64::consts::TAU).sin() * 0.12;
+        let to = on_graph(run, cx, 0.35, 0.35 + wave);
+        run.move_held(cx, to);
+        run.pause(cx, 16).await;
+        let now = run.read(cx, shown).flatten();
+        if now != last {
+            (last, updates) = (now, updates + 1);
+            gap = gap.max(since.elapsed());
+            since = Instant::now();
+        }
+    }
+    gap = gap.max(since.elapsed());
+    run.release(cx, press);
+    run.pause(cx, 300).await;
+    run.check("tone curve: the photo keeps up with a one-second point drag", updates >= 20 && gap < Duration::from_millis(250), format!("{updates} photo frames for 60 moves, longest wait {} ms", gap.as_millis()));
+    if let Some(rgb) = run.read(cx, |a, _| a.ui.placed.get(&Tab::Rgb.id())).flatten() {
+        run.click(cx, rgb.center(), 2);
+    }
+    let began = Instant::now();
+    let mut eased = Vec::new();
+    while began.elapsed() < Duration::from_millis(400) {
+        eased.push((began.elapsed().as_millis(), run.read(cx, |a, _| a.ui.curve.resetting()).flatten()));
+        run.pause(cx, 10).await;
+    }
+    let moving: Vec<_> = eased.iter().filter_map(|(ms, t)| t.map(|t| (*ms, t))).collect();
+    let done = eased.iter().find(|(_, t)| t.is_none() && !moving.is_empty()).map(|(ms, _)| *ms);
+    let ordered = moving.windows(2).all(|w| w[1].1 >= w[0].1);
+    run.check(
+        "tone curve: double-clicking the RGB tab eases the line back to straight over about 200 ms",
+        moving.len() >= 5 && ordered && done.is_some_and(|ms| ms <= 320),
+        format!("{} samples while easing, {:?}, straight by {done:?} ms", moving.len(), moving.iter().map(|(ms, t)| format!("{ms}ms:{t:.2}")).collect::<Vec<_>>()),
+    );
+
+    let reset = pick_curve_tab(run, cx, Tab::Regions, 2).await;
+    run.pause(cx, 300).await;
+    let after = run.read(cx, &regional).unwrap_or_default();
+    run.check("tone curve: double-clicking the Regions tab resets it", reset && after == [0.0, 25.0], format!("{after:?}"));
+    run.verify(cx, "tone curve: the reset curve renders and matches", false).await;
+    run.develop(cx, |d, cx| d.go_to(start, cx));
+    run.settled(cx, false).await;
+}
+
 async fn zoom(run: &mut Run, cx: &mut AsyncApp) {
     let center = run.on_window(cx, |window, cx| run_fit_center(&run.app, window, cx)).flatten();
     let Some(center) = center else {
@@ -411,8 +827,14 @@ async fn tools(run: &mut Run, cx: &mut AsyncApp) {
     let crop = run.wait(cx, 5, move |a, cx| tool(a, cx) == Tool::Crop).await;
     run.check("crop: R opens the crop tool", crop, "");
     let square = run.develop(cx, |d, cx| d.command("crop.aspect", json!({"aspect": "1x1"}), "Crop 1 : 1", "crop.aspect", cx)).flatten();
+    run.settled(cx, false).await;
     let angle = run.develop(cx, |d, cx| d.command("develop.set", json!({"values": {"crop.angle": 4.0}}), "Straighten", "crop.angle", cx)).flatten();
     run.check("crop: the 1:1 aspect and a 4° straighten apply", square.is_some() && angle.is_some(), "");
+    let level = run.wait(cx, 2, |a, _| crop::shows_level_grid(a)).await;
+    run.check("crop: straightening shows the level grid", level, "");
+    run.shoot(cx, "06a-crop-level").await;
+    let cleared = run.wait(cx, 3, |a, _| !crop::shows_level_grid(a)).await;
+    run.check("crop: the level grid clears once the angle stops changing", cleared, "");
     run.verify(cx, "crop: the crop tool's frame matches", false).await;
     run.shoot(cx, "06-crop").await;
     run.key(cx, "e");

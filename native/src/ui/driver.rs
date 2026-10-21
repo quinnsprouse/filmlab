@@ -49,6 +49,12 @@ impl Driver {
         });
     }
 
+    pub fn hover(&self, cx: &mut AsyncApp, at: Point<Pixels>) {
+        self.on_window(cx, |window, cx| {
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }), cx);
+        });
+    }
+
     pub fn drag(&self, cx: &mut AsyncApp, from: Point<Pixels>, to: Point<Pixels>) {
         self.on_window(cx, |window, cx| {
             mouse(window, cx, from, true, 1);
@@ -59,6 +65,23 @@ impl Driver {
             }
             mouse(window, cx, to, false, 1);
         });
+    }
+
+    pub fn hold(&self, cx: &mut AsyncApp, from: Point<Pixels>, to: Point<Pixels>) {
+        self.on_window(cx, |window, cx| {
+            mouse(window, cx, from, true, 1);
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() }), cx);
+        });
+    }
+
+    pub fn move_held(&self, cx: &mut AsyncApp, to: Point<Pixels>) {
+        self.on_window(cx, |window, cx| {
+            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() }), cx);
+        });
+    }
+
+    pub fn release(&self, cx: &mut AsyncApp, at: Point<Pixels>) {
+        self.on_window(cx, |window, cx| mouse(window, cx, at, false, 1));
     }
 
     pub async fn pause(&self, cx: &mut AsyncApp, ms: u64) {

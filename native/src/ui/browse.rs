@@ -397,7 +397,7 @@ impl FilmlabApp {
                 "sort",
                 "Sort",
                 sort_label,
-                move || sorts.iter().map(|(s, l)| super::controls::PickerItem { label: l.to_string(), checked: *s == sort, header: false }).collect(),
+                move || sorts.iter().map(|(s, l)| crate::menu::Entry::Item { label: l.to_string(), checked: *s == sort }).collect(),
                 move |i, _, cx| {
                     pick_me.update(cx, |app, cx| {
                         app.browse.sort = sorts[i].0;

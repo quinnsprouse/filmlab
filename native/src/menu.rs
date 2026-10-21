@@ -38,6 +38,7 @@ impl Target {
     }
 }
 
+#[derive(Clone)]
 pub enum Entry {
     Item { label: String, checked: bool },
     Header(String),

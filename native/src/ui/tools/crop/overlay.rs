@@ -160,15 +160,24 @@ fn release(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>) {
     }
 }
 
-pub fn overlay(app: &mut FilmlabApp, frame: Bounds<Pixels>, _window: &mut Window, cx: &mut Context<FilmlabApp>) -> Option<AnyElement> {
-    let size = app.develop.read(cx).fit.as_ref().map(|f| (f.width, f.height))?;
+pub fn overlay(app: &mut FilmlabApp, frame: Bounds<Pixels>, window: &mut Window, cx: &mut Context<FilmlabApp>) -> Option<AnyElement> {
+    let (size, photo) = {
+        let d = app.develop.read(cx);
+        (d.fit.as_ref().map(|f| (f.width, f.height))?, d.photo_id.clone())
+    };
     app.tools.crop.frame = Some((frame, size));
     let v = view(app, cx)?;
+    let leveling = app.tools.crop.leveling.strength(photo, v.crop.angle);
+    if leveling > 0.0 {
+        window.request_animation_frame();
+    }
     let guide = match app.tools.crop.gesture {
-        Some(Gesture::Rotate { .. }) => Guide::Grid,
+        Some(Gesture::Rotate { .. }) => Guide::Level(1.0),
         Some(Gesture::Handle { .. }) => Guide::Thirds,
+        None if leveling > 0.0 => Guide::Level(leveling),
         None => Guide::None,
     };
+    app.tools.crop.guide = guide;
     let (corners, handles, bounds) = (v.corners, v.handles, frame);
     let me = cx.entity();
     let painter = canvas(

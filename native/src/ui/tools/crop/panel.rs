@@ -5,7 +5,7 @@ use super::aspect::{OPTIONS, aspect_name, aspect_value};
 use super::geometry::read_crop;
 use super::{Entry, cancel, commands, custom, finish};
 use crate::ui::app::FilmlabApp;
-use crate::ui::controls::{Picker, PickerItem, Toggle, header};
+use crate::ui::controls::{Picker, Toggle, header};
 use crate::ui::slider::ParamSlider;
 use crate::ui::theme;
 
@@ -115,7 +115,7 @@ pub fn panel(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<Filmlab
     let fields = app.tools.crop.custom.then(|| custom::fields(app, window, cx));
     let custom_row = fields.map(|(w, h)| custom::row(&w, &h, cx));
     let error = app.tools.crop.error.clone();
-    let items = move || OPTIONS.iter().map(|(value, label)| PickerItem { label: (*label).to_string(), checked: *value == shown, header: false }).collect();
+    let items = move || OPTIONS.iter().map(|(value, label)| crate::menu::Entry::Item { label: (*label).to_string(), checked: *value == shown }).collect();
     let toggle_me = me.clone();
     div()
         .p(px(10.))

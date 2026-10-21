@@ -18,7 +18,6 @@ const MARK_FADE: Duration = Duration::from_millis(150);
 
 pub struct State {
     profiles: Vec<Profile>,
-    loaded: bool,
     amount: f64,
     confirming: Option<String>,
     saving: Option<save::Form>,
@@ -26,15 +25,24 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        State { profiles: Vec::new(), loaded: false, amount: 100.0, confirming: None, saving: None }
+        State { profiles: store::load(), amount: 100.0, confirming: None, saving: None }
     }
 }
 
-pub fn rail(app: &mut FilmlabApp, _window: &mut Window, cx: &mut Context<FilmlabApp>) -> AnyElement {
-    if !app.rail.loaded {
-        app.rail.profiles = store::load();
-        app.rail.loaded = true;
+impl State {
+    /// The saved tone curves, newest first, as the curve menu lists them.
+    pub fn curves(&self) -> impl Iterator<Item = &Profile> {
+        self.profiles.iter().filter(|p| p.is_curve())
     }
+}
+
+/// Opens the profile form in the rail with only the Tone curve chosen, for the curve menu's Save curve.
+pub fn save_curve(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabApp>) {
+    app.rail_open = true;
+    save::open_curve(app, window, cx);
+}
+
+pub fn rail(app: &mut FilmlabApp, _window: &mut Window, cx: &mut Context<FilmlabApp>) -> AnyElement {
     if app.rail.saving.is_some() {
         return save::form(app, cx);
     }

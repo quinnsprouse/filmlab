@@ -3,12 +3,16 @@ use gpui_kit::*;
 use super::geometry::Vec2;
 use crate::ui::theme;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 pub enum Guide {
+    #[default]
     None,
     Thirds,
-    Grid,
+    Level(f32),
 }
+
+const LEVEL_CELLS: f64 = 16.0;
+const LEVEL_MIN_CELL: f64 = 24.0;
 
 fn white(a: f32) -> Hsla {
     Hsla { h: 0.0, s: 0.0, l: 1.0, a }
@@ -30,14 +34,46 @@ fn lerp(a: Vec2, b: Vec2, t: f64) -> Vec2 {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
 }
 
-fn guide_lines(corners: &[Vec2; 4], guide: Guide) -> Vec<[Vec2; 2]> {
-    let steps: Vec<f64> = match guide {
-        Guide::None => return Vec::new(),
-        Guide::Thirds => vec![1.0 / 3.0, 2.0 / 3.0],
-        Guide::Grid => (1..8).map(|i| f64::from(i) / 8.0).collect(),
-    };
+fn distance(a: Vec2, b: Vec2) -> f64 {
+    (b[0] - a[0]).hypot(b[1] - a[1])
+}
+
+fn vertical(corners: &[Vec2; 4], t: f64) -> [Vec2; 2] {
     let [a, b, c, d] = *corners;
-    steps.into_iter().flat_map(|t| [[lerp(a, b, t), lerp(d, c, t)], [lerp(a, d, t), lerp(b, c, t)]]).collect()
+    [lerp(a, b, t), lerp(d, c, t)]
+}
+
+fn horizontal(corners: &[Vec2; 4], t: f64) -> [Vec2; 2] {
+    let [a, b, c, d] = *corners;
+    [lerp(a, d, t), lerp(b, c, t)]
+}
+
+fn thirds(corners: &[Vec2; 4]) -> Vec<[Vec2; 2]> {
+    [1.0 / 3.0, 2.0 / 3.0].into_iter().flat_map(|t| [vertical(corners, t), horizontal(corners, t)]).collect()
+}
+
+fn from_centre(length: f64, cell: f64) -> impl Iterator<Item = (f64, bool)> {
+    let reach = (length / 2.0 / cell).ceil() as i32;
+    (-reach..=reach).map(move |k| (0.5 + f64::from(k) * cell / length, k == 0)).filter(|(t, _)| *t > 0.0 && *t < 1.0)
+}
+
+fn level_lines(corners: &[Vec2; 4]) -> Vec<([Vec2; 2], bool)> {
+    let (width, height) = (distance(corners[0], corners[1]), distance(corners[0], corners[3]));
+    let cell = (width.max(height) / LEVEL_CELLS).max(LEVEL_MIN_CELL);
+    let verticals = from_centre(width, cell).map(|(t, centre)| (vertical(corners, t), centre));
+    let horizontals = from_centre(height, cell).map(|(t, centre)| (horizontal(corners, t), centre));
+    verticals.chain(horizontals).collect()
+}
+
+fn paint_level(window: &mut Window, origin: Point<Pixels>, corners: &[Vec2; 4], strength: f32) {
+    let lines: Vec<_> = level_lines(corners).into_iter().map(|(line, centre)| (line.map(|p| point(origin, p)), centre)).collect();
+    for (line, _) in &lines {
+        stroke(window, line, false, 3.0, Hsla { a: 0.3 * strength, ..theme::backdrop() });
+    }
+    for (line, centre) in &lines {
+        let alpha = if *centre { 0.75 } else { 0.38 };
+        stroke(window, line, false, 1.0, white(alpha * strength));
+    }
 }
 
 fn toward(corner: Vec2, target: Vec2, length: f64) -> Vec2 {
@@ -75,10 +111,16 @@ pub fn paint(window: &mut Window, origin: Point<Pixels>, size: Size<Pixels>, cor
     if let Ok(path) = scrim.build() {
         window.paint_path(path, Hsla { a: 0.7, ..theme::backdrop() });
     }
-    stroke(window, &quad, true, 1.0, white(0.9));
-    for line in guide_lines(corners, guide) {
-        stroke(window, &line.map(|p| point(origin, p)), false, 1.0, white(0.5));
+    match guide {
+        Guide::None => {}
+        Guide::Thirds => {
+            for line in thirds(corners) {
+                stroke(window, &line.map(|p| point(origin, p)), false, 1.0, white(0.5));
+            }
+        }
+        Guide::Level(strength) => paint_level(window, origin, corners, strength),
     }
+    stroke(window, &quad, true, 1.0, white(0.9));
     let marks = marks(corners, handles);
     for (width, color) in [(5.0, Hsla { a: 0.6, ..theme::backdrop() }), (3.0, white(1.0))] {
         for mark in &marks {
