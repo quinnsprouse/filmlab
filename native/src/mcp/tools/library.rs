@@ -54,7 +54,7 @@ pub async fn open_folder(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: V
     hub.close_all(cx).await;
     let target = folder.clone();
     driver.act(cx, move |a, cx| a.open_folder(target, cx)).ok_or("Filmlab's window is gone")?;
-    let indexed = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| a.library.read(cx).photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some());
+    let indexed = |a: &crate::ui::app::FilmlabApp, cx: &gpui_kit::App| a.library.read(cx).photos.iter().all(crate::library::PhotoRecord::indexed);
     let done = !p.wait.unwrap_or(true) || driver.wait(cx, 240, indexed).await;
     let summary = driver
         .read(cx, |a, cx| {
@@ -63,7 +63,7 @@ pub async fn open_folder(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: V
             json!({
                 "folder": folder,
                 "photos": l.photos.len(),
-                "indexing": l.photos.iter().filter(|r| r.thumbnail.is_none() && r.error.is_none()).count(),
+                "indexing": l.photos.iter().filter(|r| !r.indexed()).count(),
                 "errors": errors,
                 "note": l.photos.is_empty().then_some("the folder has no photos"),
             })

@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::UNIX_EPOCH;
@@ -19,7 +20,7 @@ pub struct Pixels {
 }
 
 /// Identifies a photo file by path, size and modification time.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Key(u64);
 
 pub fn hash(parts: &[&[u8]]) -> u64 {
@@ -80,6 +81,13 @@ pub fn thumbnail(key: &Key, look: u64) -> Option<Pixels> {
     }
     let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?.into_rgba8();
     Some(Pixels { width: image.width(), height: image.height(), rgba: image.into_raw() })
+}
+
+/// The `look` the cached thumbnail was rendered with, read without decoding it.
+pub fn thumbnail_look(key: &Key) -> Option<u64> {
+    let mut head = [0u8; 8];
+    fs::File::open(file(key, "thumb")?).ok()?.read_exact(&mut head).ok()?;
+    Some(u64::from_le_bytes(head))
 }
 
 /// JPEG bytes of the RGBA pixels, ready for `store_thumbnail`.

@@ -26,7 +26,7 @@ pub fn status(hub: &Hub, driver: &Driver, cx: &mut AsyncApp) -> Answer {
         .read(cx, |a, cx| {
             let library = a.library.read(cx);
             let d = a.develop.read(cx);
-            let indexing = library.photos.iter().filter(|r| r.thumbnail.is_none() && r.error.is_none()).count();
+            let indexing = library.photos.iter().filter(|r| !r.indexed()).count();
             let photo = d.photo_id.as_ref().map(|id| {
                 let name = library.record(id).map_or(id.as_str(), |r| r.file.name.as_str());
                 json!({"id": id, "name": name, "size": [d.native.0.round(), d.native.1.round()]})

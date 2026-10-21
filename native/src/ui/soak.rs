@@ -44,7 +44,7 @@ pub fn start(app: &Entity<FilmlabApp>, cx: &mut App) {
     let weak = app.downgrade();
     cx.spawn(async move |cx| {
         let started = Instant::now();
-        wait_until(cx, &weak, |a, cx| a.library.read(cx).photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some())).await;
+        wait_until(cx, &weak, |a, cx| a.library.read(cx).photos.iter().all(crate::library::PhotoRecord::indexed)).await;
         log("browse, thumbnails ready", started);
         let ids: Vec<String> = weak.read_with(cx, |a, cx| a.library.read(cx).photos.iter().map(|r| r.file.id.clone()).collect()).unwrap_or_default();
         let Some(first) = ids.first().cloned() else { return };

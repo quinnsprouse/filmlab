@@ -169,7 +169,7 @@ fn disc_image() -> Option<Arc<RenderImage>> {
             rgba.extend([mix(vivid.r, neutral.r), mix(vivid.g, neutral.g), mix(vivid.b, neutral.b), 255]);
         }
     }
-    crate::library::image_of(DISC_PIXELS, DISC_PIXELS, rgba)
+    crate::pictures::image_of(DISC_PIXELS, DISC_PIXELS, rgba)
 }
 
 fn gray_share(radius: f64) -> f64 {

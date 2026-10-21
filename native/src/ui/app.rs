@@ -69,6 +69,7 @@ pub struct FilmlabApp {
     pub rail_open: bool,
     pub export: export::State,
     pub browse: browse::State,
+    strip: ScrollHandle,
     viewer: Rc<RefCell<Option<Viewer>>>,
     pushed: Rc<RefCell<Pushed>>,
     glass: GlassLayer,
@@ -135,6 +136,7 @@ impl FilmlabApp {
             rail_open: true,
             export: export::State::default(),
             browse: browse::State::default(),
+            strip: ScrollHandle::new(),
             viewer,
             pushed: Rc::default(),
             glass: GlassLayer::default(),
@@ -558,10 +560,28 @@ impl FilmlabApp {
             })
     }
 
-    fn filmstrip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let photos: Vec<(String, Option<Arc<RenderImage>>)> = self.library.read(cx).photos.iter().map(|r| (r.file.id.clone(), r.thumbnail.clone())).collect();
+    fn filmstrip(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        const EDGE: f32 = STRIP - 16.0;
+        const GAP: f32 = 2.0;
+        const PAD: f32 = 8.0;
+        let pitch = EDGE + GAP;
+        let count = self.library.read(cx).photos.len();
+        let width = f32::from(window.viewport_size().width) - self.left() - INSPECTOR - 2.0 * MARGIN;
+        let scrolled = -f32::from(self.strip.offset().x);
+        let first = (((scrolled - PAD) / pitch).floor().max(0.0) as usize).min(count);
+        let last = (((scrolled + width) / pitch).ceil().max(0.0) as usize + 1).clamp(first, count);
+        let ids: Vec<String> = self.library.read(cx).photos[first..last].iter().map(|r| r.file.id.clone()).collect();
+        self.library.update(cx, |l, cx| l.want(&ids, cx));
         let current = self.develop.read(cx).photo_id.clone();
-        let thumbs: Vec<_> = photos.into_iter().map(|(id, image)| self.thumb(&id, image, current.as_deref() == Some(id.as_str()), STRIP - 16.0, cx)).collect();
+        let thumbs: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let image = self.library.read(cx).picture(id).map(|p| p.image.clone());
+                self.thumb(id, image, current.as_deref() == Some(id.as_str()), EDGE, cx).flex_none().into_any_element()
+            })
+            .collect();
+        let before = (first > 0).then(|| div().flex_none().w(px(first as f32 * pitch - GAP)).into_any_element());
+        let after = (last < count).then(|| div().flex_none().w(px((count - last) as f32 * pitch - GAP)).into_any_element());
         self.glass
             .pane("strip", 20.0)
             .occlude()
@@ -570,12 +590,25 @@ impl FilmlabApp {
             .right(px(INSPECTOR + 2.0 * MARGIN))
             .bottom(px(MARGIN))
             .h(px(STRIP))
-            .child(div().id("strip-scroll").size_full().overflow_x_scroll().flex().items_center().gap(px(2.)).px(px(8.)).children(thumbs))
+            .child(
+                div()
+                    .id("strip-scroll")
+                    .size_full()
+                    .track_scroll(&self.strip)
+                    .overflow_x_scroll()
+                    .flex()
+                    .items_center()
+                    .gap(px(GAP))
+                    .px(px(PAD))
+                    .children(before)
+                    .children(thumbs)
+                    .children(after),
+            )
     }
 
-    fn browse(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.library.read(cx).folder.is_some() {
-            return self.browse_grid(RAIL + 2.0 * MARGIN, INSPECTOR + 2.0 * MARGIN, TOP + MARGIN, cx);
+            return self.browse_grid(RAIL + 2.0 * MARGIN, INSPECTOR + 2.0 * MARGIN, TOP + MARGIN, window, cx);
         }
         let me = cx.entity();
         div()
@@ -699,6 +732,7 @@ impl FilmlabApp {
 impl Render for FilmlabApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.glass.begin();
+        self.library.update(cx, |l, _| l.begin_frame());
         if self.mode == Mode::Develop {
             let (stage, _) = self.device_stage(window);
             let viewport = Size { width: stage.width, height: stage.height };
@@ -780,7 +814,7 @@ impl Render for FilmlabApp {
             }))
             .when(develop_mode, |d| d.child(self.stage_layer(window, cx)))
             .children(overlay)
-            .when(!develop_mode, |d| d.child(self.browse(cx)))
+            .when(!develop_mode, |d| d.child(self.browse(window, cx)))
             .when_some(browse_panes, |d, (rail_body, panel_body)| {
                 d.child(self.glass.pane("browse-rail", 22.0).occlude().absolute().left(px(MARGIN)).top(px(TOP + MARGIN)).bottom(px(MARGIN)).w(px(RAIL)).child(rail_body))
                     .child(self.glass.pane("browse-panel", 22.0).occlude().absolute().right(px(MARGIN)).top(px(TOP + MARGIN)).bottom(px(MARGIN)).w(px(INSPECTOR)).child(panel_body))
@@ -816,7 +850,7 @@ impl Render for FilmlabApp {
             .when_some(rail_body, |d, body| {
                 d.child(self.glass.pane("rail", 22.0).occlude().absolute().left(px(MARGIN)).top(px(TOP + MARGIN)).bottom(px(MARGIN)).w(px(RAIL)).child(body))
             })
-            .when(develop_mode, |d| d.child(self.filmstrip(cx)))
+            .when(develop_mode, |d| d.child(self.filmstrip(window, cx)))
             .children(dialog)
             .child(self.painter(window, cx))
             .child(self.glass.finish())

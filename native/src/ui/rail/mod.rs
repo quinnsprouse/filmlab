@@ -79,7 +79,10 @@ fn profiles_section(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElemen
     let develop = app.develop.read(cx);
     let photo = develop.photo_id.clone();
     let applied = develop.applied.as_ref().filter(|a| a.photo_id == photo).map(|a| a.profile_id.clone());
-    let thumbnail = photo.and_then(|id| app.library.read(cx).record(&id).and_then(|r| r.thumbnail.clone()));
+    let thumbnail = photo.and_then(|id| {
+        app.library.update(cx, |l, cx| l.want([&id], cx));
+        app.library.read(cx).picture(&id).map(|p| p.image.clone())
+    });
     let me = cx.entity();
     let profiles = &app.rail.profiles;
     let rows: Vec<AnyElement> = profiles.iter().map(|p| profile_row(app, p, applied.as_deref() == Some(p.id.as_str()), thumbnail.clone(), &me)).collect();

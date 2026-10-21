@@ -9,6 +9,7 @@ pub mod driver;
 pub mod e2e;
 pub mod export;
 pub mod glass_layer;
+pub mod grid;
 pub mod icon;
 pub mod inspector;
 pub mod motion;

@@ -9,6 +9,7 @@ pub mod library;
 pub mod mcp;
 pub mod menu;
 pub mod perf;
+pub mod pictures;
 pub mod stocks;
 pub mod ui;
 pub mod viewer;

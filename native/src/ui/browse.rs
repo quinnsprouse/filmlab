@@ -1,17 +1,17 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::app::{FilmlabApp, Mode};
 use super::controls::Segmented;
+use super::grid::{self, CAPTION, CAPTION_GAP, GAP_X, GAP_Y, Grid, HEADER_GAP, PAD_TOP, PAD_X, ROW_HEIGHT, SECTION_END, Section, TILE_HEIGHT, day_label, passes};
 use super::{icon, theme};
 use crate::library::PhotoRecord;
 
-const ROW_HEIGHT: f32 = 136.0;
-const DEFAULT_ASPECT: f32 = 1.5;
 const PREVIEW_COUNT: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -39,10 +39,13 @@ pub struct State {
     scroll: ScrollHandle,
     tiles: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     order: Vec<String>,
+    grid: Grid,
+    /// How many rows the first day had when its whole section was last drawn, to learn the header's height from.
+    first_drawn: Option<usize>,
 }
 
 impl State {
-    /// Where a photo's tile was last laid out, in window points.
+    /// Where a photo's tile was last laid out, in window points, while it is on screen.
     pub fn tile(&self, id: &str) -> Option<Bounds<Pixels>> {
         self.tiles.borrow().get(id).copied()
     }
@@ -65,85 +68,64 @@ impl State {
     pub fn scroll_to(&self, top: f32) {
         self.scroll.set_offset(point(px(0.), px(-top.clamp(0.0, self.scroll_range()))));
     }
+
+    fn regroup(&mut self, library: &crate::library::Library) {
+        if self.grid.regroup(library, self.filter, self.sort) {
+            self.order = self.grid.order();
+        }
+    }
+
+    fn measure_header(&mut self) -> bool {
+        let Some(rows) = self.first_drawn.take() else { return false };
+        let Some(first) = self.scroll.bounds_for_item(0) else { return false };
+        self.grid.measured(f32::from(first.size.height), rows)
+    }
 }
 
-struct Tile {
+/// What one tile on screen shows.
+struct Face {
     id: String,
     index: usize,
     width: f32,
-    time: String,
+    flag: String,
+    failed: bool,
+    image: Option<Arc<RenderImage>>,
 }
 
-struct Day {
-    key: String,
-    label: String,
-    tiles: Vec<Tile>,
-}
-
-const INDEXING: &str = "indexing";
-const UNDATED: &str = "undated";
-
-fn day_key(record: &PhotoRecord) -> String {
-    let Some(probed) = &record.probed else { return INDEXING.into() };
-    probed.facts["captured"].as_str().and_then(|c| c.get(0..10)).map(String::from).unwrap_or_else(|| UNDATED.into())
-}
-
-fn weekday(y: i64, m: i64, d: i64) -> usize {
-    let (y, m) = if m < 3 { (y - 1, m + 12) } else { (y, m) };
-    ((d + (13 * (m + 1)) / 5 + y + y / 4 - y / 100 + y / 400 + 6) % 7) as usize
-}
-
-pub fn day_label(key: &str) -> String {
-    match key {
-        INDEXING => return "Indexing".into(),
-        UNDATED => return "Undated".into(),
-        _ => {}
+fn face_of(tile: &grid::Tile, record: &PhotoRecord, image: Option<Arc<RenderImage>>) -> Face {
+    Face {
+        id: tile.id.clone(),
+        index: tile.index,
+        width: tile.width,
+        flag: record.state.as_ref().map(|s| s.flag.clone()).unwrap_or_default(),
+        failed: record.error.is_some(),
+        image,
     }
-    let parts: Vec<i64> = key.split('-').filter_map(|p| p.parse().ok()).collect();
-    let [y, m, d] = parts[..] else { return key.into() };
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    format!("{}, {} {d}", DAYS[weekday(y, m, d)], MONTHS[(m.clamp(1, 12) - 1) as usize])
-}
-
-fn wanted(filter: Filter, record: &PhotoRecord) -> bool {
-    let flag = record.state.as_ref().map(|s| s.flag.as_str()).unwrap_or("none");
-    match filter {
-        Filter::All => true,
-        Filter::Picks => flag == "pick",
-        Filter::Rejected => flag == "reject",
-    }
-}
-
-fn group(photos: &[PhotoRecord], filter: Filter, sort: Sort) -> Vec<Day> {
-    let mut days: Vec<Day> = Vec::new();
-    for (index, record) in photos.iter().enumerate() {
-        if !wanted(filter, record) {
-            continue;
-        }
-        let facts = record.probed.as_ref().map(|p| &p.facts);
-        let aspect = facts.and_then(|f| Some(f["width"].as_f64()? as f32 / f["height"].as_f64().filter(|h| *h > 0.0)? as f32)).unwrap_or(DEFAULT_ASPECT);
-        let time = facts.and_then(|f| f["captured"].as_str()).and_then(|c| c.get(11..)).unwrap_or_default().to_string();
-        let tile = Tile { id: record.file.id.clone(), index: index + 1, width: (ROW_HEIGHT * aspect).round(), time };
-        let key = day_key(record);
-        match days.iter_mut().find(|d| d.key == key) {
-            Some(day) => day.tiles.push(tile),
-            None => days.push(Day { label: day_label(&key), key, tiles: vec![tile] }),
-        }
-    }
-    let rank = |k: &str| u8::from(k == INDEXING || k == UNDATED);
-    days.sort_by(|a, b| rank(&a.key).cmp(&rank(&b.key)).then_with(|| if sort == Sort::Oldest { a.key.cmp(&b.key) } else { b.key.cmp(&a.key) }));
-    for day in &mut days {
-        day.tiles.sort_by(|a, b| match sort {
-            Sort::Name => photos[a.index - 1].file.name.cmp(&photos[b.index - 1].file.name),
-            _ => a.time.cmp(&b.time).then(a.index.cmp(&b.index)),
-        });
-    }
-    days
 }
 
 fn count_label(n: usize) -> String {
     format!("{n} {}", if n == 1 { "photo" } else { "photos" })
+}
+
+/// The rows of one day the grid draws, with what each of their tiles shows.
+struct Shown {
+    rows: std::ops::Range<usize>,
+    faces: Vec<Vec<Face>>,
+}
+
+struct DayRow {
+    key: String,
+    label: String,
+    count: usize,
+}
+
+/// One day of the grid this frame: a spacer as tall as its section, or its header and the rows near the viewport.
+struct Drawn {
+    at: usize,
+    rows: usize,
+    height: f32,
+    rows_height: f32,
+    shown: Option<(usize, Shown)>,
 }
 
 impl FilmlabApp {
@@ -177,8 +159,8 @@ impl FilmlabApp {
         let viewport = self.browse.scroll.bounds();
         let library = self.library.read(cx);
         let tiles = self.browse.tiles.borrow();
-        let visible: Vec<&String> = self.browse.order.iter().filter(|id| tiles.get(*id).is_some_and(|b| b.intersects(&viewport))).collect();
-        let shown = visible.iter().filter(|id| library.record(id).is_some_and(|r| r.thumbnail.is_some())).count();
+        let visible: Vec<&String> = tiles.iter().filter(|(_, b)| b.intersects(&viewport)).map(|(id, _)| id).collect();
+        let shown = visible.iter().filter(|id| library.picture(id).is_some()).count();
         (shown, visible.len())
     }
 
@@ -220,15 +202,13 @@ impl FilmlabApp {
         let next = if dy == 0 {
             ids.get((at as i64 + i64::from(dx)).clamp(0, ids.len() as i64 - 1) as usize).cloned()
         } else {
-            let tiles = self.browse.tiles.borrow();
-            let current = tiles.get(&ids[at]).copied();
-            current.and_then(|c| {
-                let centre = c.center().x;
+            let places = self.browse.grid.places();
+            places.get(ids[at].as_str()).copied().and_then(|(top, centre)| {
                 ids.iter()
-                    .filter_map(|id| tiles.get(id).map(|b| (id, b)))
-                    .filter(|(_, b)| f32::from(b.top() - c.top()) * dy as f32 > 1.0)
+                    .filter_map(|id| places.get(id.as_str()).map(|p| (id, *p)))
+                    .filter(|(_, (t, _))| (t - top) * dy as f32 > 1.0)
                     .min_by(|(_, a), (_, b)| {
-                        let row = |r: &&Bounds<Pixels>| (f32::from(r.top() - c.top()) * dy as f32, f32::from(r.center().x - centre).abs());
+                        let row = |(t, c): &(f32, f32)| ((t - top) * dy as f32, (c - centre).abs());
                         row(a).partial_cmp(&row(b)).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .map(|(id, _)| id.clone())
@@ -243,17 +223,14 @@ impl FilmlabApp {
         }
     }
 
-    fn tile(&self, tile: &Tile, record: &PhotoRecord, cx: &mut Context<Self>) -> AnyElement {
+    fn tile(&self, face: Face, focused: bool, selected: bool, cx: &mut Context<Self>) -> AnyElement {
         let me = cx.entity();
-        let id = tile.id.clone();
-        let focused = self.selected.as_deref() == Some(id.as_str());
-        let selected = self.browse.selection.contains(&id);
-        let reject = record.state.as_ref().is_some_and(|s| s.flag == "reject");
-        let flag = record.state.as_ref().map(|s| s.flag.clone()).unwrap_or_default();
+        let id = face.id.clone();
+        let reject = face.flag == "reject";
         let tiles = self.browse.tiles.clone();
         let record_id = id.clone();
-        let face = match (&record.thumbnail, &record.error) {
-            (_, Some(_)) => div()
+        let picture = match (face.image, face.failed) {
+            (_, true) => div()
                 .size_full()
                 .flex()
                 .flex_col()
@@ -266,15 +243,15 @@ impl FilmlabApp {
                 .child(icon::icon("alert02", px(16.)))
                 .child("Couldn't read this file")
                 .into_any_element(),
-            (Some(image), None) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).when(reject, |i| i.opacity(0.35)).into_any_element(),
-            (None, None) => div().size_full().bg(theme::surface()).into_any_element(),
+            (Some(image), false) => img(image).size_full().object_fit(ObjectFit::Cover).when(reject, |i| i.opacity(0.35)).into_any_element(),
+            (None, false) => div().size_full().bg(theme::surface()).into_any_element(),
         };
         div()
             .id(SharedString::from(format!("tile-{id}")))
-            .w(px(tile.width))
+            .w(px(face.width))
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(px(CAPTION_GAP))
             .on_click(move |event, _, cx| {
                 let id = id.clone();
                 let modifiers = event.modifiers();
@@ -296,7 +273,7 @@ impl FilmlabApp {
                     .child(canvas(move |b, _, _| {
                         tiles.borrow_mut().insert(record_id.clone(), b);
                     }, |_, _, _, _| {}).absolute().size_full())
-                    .child(face)
+                    .child(picture)
                     .child(div().absolute().inset_0().rounded(px(4.)).border_1().border_color(if focused {
                         theme::accent()
                     } else if selected {
@@ -310,7 +287,7 @@ impl FilmlabApp {
             )
             .child(
                 div()
-                    .h(px(14.))
+                    .h(px(CAPTION))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -318,45 +295,121 @@ impl FilmlabApp {
                     .font_features(theme::tabular())
                     .text_color(if focused { theme::accent() } else { theme::tertiary() })
                     .when(focused, |d| d.font_weight(FontWeight::BOLD))
-                    .child(format!("▸{}", tile.index))
-                    .when(flag == "pick", |d| d.child(icon::icon("flag02", px(12.))))
-                    .when(flag == "reject", |d| d.child(icon::icon("cancel01", px(12.)))),
+                    .child(format!("▸{}", face.index))
+                    .when(face.flag == "pick", |d| d.child(icon::icon("flag02", px(12.))))
+                    .when(face.flag == "reject", |d| d.child(icon::icon("cancel01", px(12.)))),
             )
             .into_any_element()
     }
 
-    pub fn browse_grid(&mut self, left: f32, right: f32, top: f32, cx: &mut Context<Self>) -> AnyElement {
-        let photos = self.library.read(cx).photos.clone();
-        let days = group(&photos, self.browse.filter, self.browse.sort);
-        self.browse.order = days.iter().flat_map(|d| d.tiles.iter().map(|t| t.id.clone())).collect();
-        let selection = self.browse.selection.clone();
-        let sections: Vec<AnyElement> = days
+    fn day_header(day: &grid::Day, chosen: usize) -> Div {
+        div()
+            .flex()
+            .items_baseline()
+            .gap(px(10.))
+            .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(theme::primary()).child(day.label.clone()))
+            .child(div().text_size(px(12.)).font_features(theme::tabular()).text_color(theme::tertiary()).child(format!(
+                "{}{}",
+                count_label(day.tiles.len()),
+                if chosen > 0 { format!(" · {chosen} selected") } else { String::new() }
+            )))
+    }
+
+    /// The rows of `section` that overlap `from..to`, with what each of their tiles shows.
+    fn shown(&self, section: &Section, header: f32, from: f32, to: f32, cx: &App) -> Shown {
+        let library = self.library.read(cx);
+        let rows = section.rows_within(header, from, to);
+        let faces = section.rows[rows.clone()]
             .iter()
-            .map(|day| {
-                let chosen = day.tiles.iter().filter(|t| selection.contains(&t.id)).count();
-                let tiles: Vec<AnyElement> = day.tiles.iter().map(|t| self.tile(t, &photos[t.index - 1], cx)).collect();
+            .map(|range| {
+                section.day.tiles[range.clone()]
+                    .iter()
+                    .filter_map(|tile| Some(face_of(tile, library.record(&tile.id)?, library.picture(&tile.id).map(|p| p.image.clone()))))
+                    .collect()
+            })
+            .collect();
+        Shown { rows, faces }
+    }
+
+    /// The photos of `section` in rows overlapping `from..to`, top to bottom.
+    fn photos_within<'a>(section: &'a Section, header: f32, from: f32, to: f32) -> impl Iterator<Item = &'a String> {
+        let rows = section.rows_within(header, from, to);
+        section.rows[rows].iter().flat_map(|range| section.day.tiles[range.clone()].iter().map(|t| &t.id))
+    }
+
+    pub fn browse_grid(&mut self, left: f32, right: f32, top: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.browse.regroup(self.library.read(cx));
+        let viewport = window.viewport_size();
+        self.browse.grid.reflow(f32::from(viewport.width) - left - right - 2.0 * PAD_X);
+        if self.browse.measure_header() {
+            window.request_animation_frame();
+        }
+        self.browse.tiles.borrow_mut().clear();
+        let header = self.browse.grid.header();
+        let whole = !self.browse.grid.header_known();
+        let height = match f32::from(self.browse.scroll.bounds().size.height) {
+            h if h > 0.0 => h,
+            _ => f32::from(viewport.height) - top,
+        };
+        let (from, to) = (self.browse.scrolled(), self.browse.scrolled() + height);
+        let selection: HashSet<&str> = self.browse.selection.iter().map(String::as_str).collect();
+        let focus = self.selected.clone();
+        let (mut visible, mut ahead, mut behind) = (Vec::new(), Vec::new(), Vec::new());
+        let mut days: Vec<Drawn> = Vec::new();
+        for (at, section) in self.browse.grid.sections().iter().enumerate() {
+            visible.extend(Self::photos_within(section, header, from, to).cloned());
+            ahead.extend(Self::photos_within(section, header, to, to + height).cloned());
+            behind.extend(Self::photos_within(section, header, from - height, from).cloned());
+            let near = section.top < to + GAP_Y && section.top + section.height > from - GAP_Y;
+            let shown = (whole || near).then(|| {
+                let chosen = section.day.tiles.iter().filter(|t| selection.contains(t.id.as_str())).count();
+                (chosen, self.shown(section, header, from - TILE_HEIGHT, to + TILE_HEIGHT, cx))
+            });
+            days.push(Drawn { at, rows: section.rows.len(), height: section.height, rows_height: section.rows_height(), shown });
+        }
+        behind.reverse();
+        let mut seen: HashSet<String> = HashSet::new();
+        let wanted: Vec<String> = visible.into_iter().chain(ahead).chain(behind).filter(|id| seen.insert(id.clone())).collect();
+        self.library.update(cx, |l, cx| l.want(&wanted, cx));
+        if whole && !days.is_empty() {
+            window.request_animation_frame();
+        }
+        let selection: HashSet<String> = self.browse.selection.iter().cloned().collect();
+        let mut sections: Vec<AnyElement> = Vec::new();
+        for drawn in days {
+            let Some((chosen, shown)) = drawn.shown else {
+                sections.push(div().flex_none().h(px(drawn.height)).into_any_element());
+                continue;
+            };
+            if drawn.at == 0 {
+                self.browse.first_drawn = Some(drawn.rows);
+            }
+            let head = Self::day_header(&self.browse.grid.days()[drawn.at], chosen);
+            let mut lines: Vec<AnyElement> = Vec::new();
+            for (row, faces) in shown.rows.clone().zip(shown.faces) {
+                let tiles: Vec<AnyElement> = faces
+                    .into_iter()
+                    .map(|face| {
+                        let focused = focus.as_deref() == Some(face.id.as_str());
+                        let selected = selection.contains(&face.id);
+                        self.tile(face, focused, selected, cx)
+                    })
+                    .collect();
+                lines.push(div().absolute().left_0().right_0().top(px(grid::row_top(row))).flex().gap_x(px(GAP_X)).children(tiles).into_any_element());
+            }
+            sections.push(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(14.))
-                    .pb(px(28.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap(px(10.))
-                            .child(div().text_size(px(15.)).font_weight(FontWeight::BOLD).text_color(theme::primary()).child(day.label.clone()))
-                            .child(div().text_size(px(12.)).font_features(theme::tabular()).text_color(theme::tertiary()).child(format!(
-                                "{}{}",
-                                count_label(day.tiles.len()),
-                                if chosen > 0 { format!(" · {chosen} selected") } else { String::new() }
-                            ))),
-                    )
-                    .child(div().flex().flex_wrap().gap_x(px(6.)).gap_y(px(14.)).children(tiles))
-                    .into_any_element()
-            })
-            .collect();
-        let empty = match (photos.is_empty(), sections.is_empty(), self.browse.filter) {
+                    .gap(px(HEADER_GAP))
+                    .pb(px(SECTION_END))
+                    .child(head)
+                    .child(div().relative().flex_none().w_full().h(px(drawn.rows_height)).children(lines))
+                    .into_any_element(),
+            );
+        }
+        let photos = self.library.read(cx).photos.len();
+        let empty = match (photos == 0, sections.is_empty(), self.browse.filter) {
             (false, true, Filter::Picks) => Some("No picks yet. Press P to pick a photo."),
             (false, true, Filter::Rejected) => Some("No rejected photos."),
             _ => None,
@@ -370,8 +423,8 @@ impl FilmlabApp {
             .bottom_0()
             .track_scroll(&self.browse.scroll)
             .overflow_y_scroll()
-            .px(px(16.))
-            .pt(px(8.))
+            .px(px(PAD_X))
+            .pt(px(PAD_TOP))
             .children(sections)
             .when_some(empty, |d, text| d.child(div().pt(px(80.)).flex().justify_center().text_size(px(13.)).text_color(theme::tertiary()).child(text)))
             .into_any_element()
@@ -379,8 +432,8 @@ impl FilmlabApp {
 
     pub fn browse_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let photos = &self.library.read(cx).photos;
-        let picks = photos.iter().filter(|r| wanted(Filter::Picks, r)).count();
-        let rejected = photos.iter().filter(|r| wanted(Filter::Rejected, r)).count();
+        let picks = photos.iter().filter(|r| passes(Filter::Picks, r)).count();
+        let rejected = photos.iter().filter(|r| passes(Filter::Rejected, r)).count();
         let filter = self.browse.filter;
         let me = cx.entity();
         let filters = [(Filter::All, "All", photos.len()), (Filter::Picks, "Picks", picks), (Filter::Rejected, "Rejected", rejected)];
@@ -431,12 +484,17 @@ impl FilmlabApp {
             ))
     }
 
-    pub fn browse_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub fn browse_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.browse.regroup(self.library.read(cx));
+        let cover = self.library.read(cx).photos.iter().find(|r| r.error.is_none()).map(|r| r.file.id.clone());
+        if let Some(id) = &cover {
+            self.library.update(cx, |l, cx| l.want([id], cx));
+        }
         let library = self.library.read(cx);
         let name = library.folder.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let cover = library.photos.iter().find_map(|r| r.thumbnail.clone());
+        let cover = cover.and_then(|id| library.picture(&id).map(|p| p.image.clone()));
         let total = library.photos.len();
-        let days = group(&library.photos, self.browse.filter, self.browse.sort);
+        let days: Vec<DayRow> = self.browse.grid.days().iter().map(|d| DayRow { key: d.key.clone(), label: d.label.clone(), count: d.tiles.len() }).collect();
         let top = self.browse.scroll.top_item();
         let me = cx.entity();
         div()
@@ -493,7 +551,7 @@ impl FilmlabApp {
                         })
                     })
                     .child(day.label.clone())
-                    .child(div().text_size(px(12.)).font_features(theme::tabular()).text_color(theme::tertiary()).child(day.tiles.len().to_string()))
+                    .child(div().text_size(px(12.)).font_features(theme::tabular()).text_color(theme::tertiary()).child(day.count.to_string()))
             })))
             .into_any_element()
     }
@@ -524,17 +582,18 @@ impl FilmlabApp {
     }
 
     pub fn browse_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let previewed: Vec<String> = self.browse.selection.iter().take(PREVIEW_COUNT).cloned().collect();
+        self.library.update(cx, |l, cx| l.want(&previewed, cx));
         let library = self.library.read(cx);
-        let selection = self.browse.selection.clone();
+        let selection = &self.browse.selection;
         let total = library.photos.len();
         let count = selection.len();
         let me = cx.entity();
-        let flags: std::collections::HashSet<String> = library.photos.iter().filter(|r| selection.contains(&r.file.id)).map(|r| r.state.as_ref().map(|s| s.flag.clone()).unwrap_or_default()).collect();
+        let flags: HashSet<String> = selection.iter().filter_map(|id| library.record(id)).map(|r| r.state.as_ref().map(|s| s.flag.clone()).unwrap_or_default()).collect();
         let current = (flags.len() == 1).then(|| flags.into_iter().next().unwrap_or_default());
-        let thumbs: Vec<AnyElement> = selection
+        let thumbs: Vec<AnyElement> = previewed
             .iter()
-            .take(PREVIEW_COUNT)
-            .map(|id| match library.record(id).and_then(|r| r.thumbnail.clone()) {
+            .map(|id| match library.picture(id).map(|p| p.image.clone()) {
                 Some(image) => img(image).w(px(60.)).h(px(40.)).rounded(px(3.)).object_fit(ObjectFit::Cover).into_any_element(),
                 None => div().w(px(60.)).h(px(40.)).rounded(px(3.)).bg(theme::surface()).into_any_element(),
             })

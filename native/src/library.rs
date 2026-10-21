@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use filmlab_engine::core::{self, Engine};
 use gpui_kit::{App, AppContext, Context, Entity, RenderImage};
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::cache;
 use crate::film::{FilmSettings, render_film};
+use crate::pictures::{Picture, Pictures, Source, image_of};
 use crate::stocks;
 
 const RAW: [&str; 15] = ["dng", "cr3", "cr2", "arw", "nef", "nrw", "raf", "rw2", "rwl", "orf", "pef", "srw", "erf", "3fr", "iiq"];
@@ -16,6 +18,10 @@ const IMAGE: [&str; 8] = ["jpg", "jpeg", "png", "tif", "tiff", "webp", "heic", "
 const THUMBNAIL_EDGE: usize = 480;
 const THUMBNAIL_SOURCE: usize = 512;
 const INDEXERS: usize = 3;
+const PROBERS: usize = 4;
+const LOADERS: usize = 4;
+const NOTIFY_EVERY: Duration = Duration::from_millis(33);
+const IDLE_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct PhotoFile {
@@ -54,17 +60,17 @@ impl PhotoState {
 #[derive(Clone)]
 pub struct PhotoRecord {
     pub file: PhotoFile,
-    pub refreshes: u64,
     pub probed: Option<Probed>,
     pub state: Option<PhotoState>,
-    pub thumbnail: Option<Arc<RenderImage>>,
+    /// The look of the film thumbnail in the disk cache, once one is rendered.
+    pub film: Option<u64>,
     pub error: Option<String>,
 }
 
 impl PhotoRecord {
     /// Whether indexing is done with this photo: its film thumbnail is rendered, or it couldn't be read.
     pub fn indexed(&self) -> bool {
-        self.thumbnail.is_some() || self.error.is_some()
+        self.film.is_some() || self.error.is_some()
     }
 }
 
@@ -87,6 +93,20 @@ pub struct Library {
     writing: HashMap<PathBuf, Option<Write>>,
     /// Photos whose last write failed.
     failed: HashSet<String>,
+    by_id: HashMap<String, usize>,
+    revision: u64,
+    pictures: Pictures,
+    loading: HashSet<String>,
+    /// Photos with no embedded preview to show while their film thumbnail renders.
+    previewless: HashSet<String>,
+    unrendered: VecDeque<String>,
+    rendering: HashSet<String>,
+    renderers: usize,
+    probing: bool,
+    /// Photos whose thumbnail is being re-rendered after an edit, and whether another edit came in meanwhile.
+    refreshing: HashMap<String, bool>,
+    notifying: bool,
+    previews: usize,
 }
 
 struct Write {
@@ -168,6 +188,16 @@ pub fn ensure_luts(engine: &mut Engine, film: Option<&FilmSettings>) -> Result<(
 
 static INDEX_ENGINES: LazyLock<Vec<Mutex<Engine>>> = LazyLock::new(|| (0..INDEXERS).map(|_| Mutex::new(Engine::new())).collect());
 
+/// The engine that re-renders a thumbnail after an edit, holding the last photo it decoded for the next edit of it.
+struct Refresher {
+    engine: Engine,
+    decoded: Option<cache::Key>,
+}
+
+const REFRESHED: &str = "refreshed";
+
+static REFRESHER: LazyLock<Mutex<Refresher>> = LazyLock::new(|| Mutex::new(Refresher { engine: Engine::new(), decoded: None }));
+
 fn state_of(probed: &Probed, sidecar: Option<&str>) -> Result<PhotoState, String> {
     match sidecar.or(probed.embedded_xmp.as_deref()) {
         Some(xmp) => serde_json::from_str(&core::read_sidecar(&probed.facts.to_string(), xmp)?).map_err(|e| e.to_string()),
@@ -175,66 +205,91 @@ fn state_of(probed: &Probed, sidecar: Option<&str>) -> Result<PhotoState, String
     }
 }
 
-pub fn image_of(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Arc<RenderImage>> {
-    for px in rgba.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
-    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+/// Hash of everything in `state` that changes its thumbnail's pixels.
+fn look_of(state: &PhotoState) -> u64 {
+    let film = render_film(state.film().as_ref()).map(|f| f.to_value().to_string()).unwrap_or_default();
+    cache::look(&state.settings.to_string(), &film, THUMBNAIL_EDGE, THUMBNAIL_SOURCE)
 }
 
-fn look_of(settings: &Value, film: Option<&FilmSettings>) -> u64 {
-    let film = film.map(|f| f.to_value().to_string()).unwrap_or_default();
-    cache::look(&settings.to_string(), &film, THUMBNAIL_EDGE, THUMBNAIL_SOURCE)
-}
-
-fn cached_image(pixels: cache::Pixels) -> Option<Arc<RenderImage>> {
-    let cache::Pixels { width, height, mut rgba } = pixels;
-    rgba.as_chunks_mut::<4>().0.iter_mut().for_each(|px| px.swap(0, 2));
-    let buffer = image::RgbaImage::from_raw(width, height, rgba)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
-}
-
-// why: the engine is locked here, outside the thumbnail pool, and only its decode and render run in the pool; a pool
-// thread that waited on a lock held by a render it is helping would deadlock the pool. A folder's first index is
-// what the user is waiting on, so it runs user-initiated on every core (edits, user-interactive, still come first);
-// a refresh after an edit runs at utility QoS on the efficiency cores so it never slows the next edit
-fn thumbnail(slot: usize, facts: &Value, bytes: &[u8], settings: &Value, film: Option<&FilmSettings>, key: Option<&cache::Key>, waited_on: bool) -> Result<Arc<RenderImage>, String> {
-    let mut engine = INDEX_ENGINES[slot % INDEXERS].lock().map_err(|e| e.to_string())?;
-    let engine = &mut *engine;
-    ensure_luts(engine, film)?;
+fn view_of(film: Option<&FilmSettings>) -> String {
     let mut view = json!({"maxW": THUMBNAIL_EDGE, "maxH": THUMBNAIL_EDGE});
     if let Some(f) = film {
         view["film"] = f.to_value();
     }
-    let work = || {
-        engine.load("scratch", &facts.to_string(), bytes, THUMBNAIL_SOURCE)?;
-        engine.render("scratch", &settings.to_string(), &view.to_string())
-    };
-    let frame = if waited_on { crate::perf::initiated(work) } else { crate::perf::background(work) };
-    engine.release("scratch");
-    let mut frame = frame?;
+    view.to_string()
+}
+
+struct Rendered {
+    look: u64,
+    image: Arc<RenderImage>,
+}
+
+fn finish(mut frame: core::Frame, state: &PhotoState, key: Option<&cache::Key>) -> Result<Rendered, String> {
+    let look = look_of(state);
     let rgba = frame.take_rgba();
     if let Some(key) = key
         && let Some(jpeg) = cache::encode(frame.width, frame.height, &rgba)
     {
-        cache::store_thumbnail(key, look_of(settings, film), &jpeg);
+        cache::store_thumbnail(key, look, &jpeg);
     }
-    image_of(frame.width, frame.height, rgba).ok_or_else(|| "the thumbnail has no pixels".to_string())
+    let image = image_of(frame.width, frame.height, rgba).ok_or_else(|| "the thumbnail has no pixels".to_string())?;
+    Ok(Rendered { look, image })
 }
 
-struct Indexed {
-    probed: Probed,
-    state: PhotoState,
-    thumbnail: Arc<RenderImage>,
+// why: the engine is locked here, outside the thumbnail pool, and only its decode and render run in the pool; a pool
+// thread that waited on a lock held by a render it is helping would deadlock the pool. A folder's first index is
+// what the user is waiting on, so it runs user-initiated on every core (edits, user-interactive, still come first)
+fn index_render(slot: usize, file: &PhotoFile, probed: &Probed, state: &PhotoState) -> Result<Rendered, String> {
+    let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
+    let film = render_film(state.film().as_ref());
+    let mut engine = INDEX_ENGINES[slot % INDEXERS].lock().map_err(|e| e.to_string())?;
+    let engine = &mut *engine;
+    ensure_luts(engine, film.as_ref())?;
+    let view = view_of(film.as_ref());
+    let frame = crate::perf::initiated(|| {
+        engine.load("scratch", &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
+        engine.render("scratch", &state.settings.to_string(), &view)
+    });
+    engine.release("scratch");
+    finish(frame?, state, cache::key(&file.path).as_ref())
 }
 
-/// A photo whose probe and thumbnail were both found in the cache.
-struct Warm {
-    id: String,
+// why: a refresh after an edit runs at utility QoS on the efficiency cores so it never slows the next edit, and
+// keeps the photo decoded because the next edit is most likely to the same photo
+fn refresh_render(path: &Path, probed: &Probed, state: &PhotoState) -> Result<Rendered, String> {
+    let key = cache::key(path);
+    let film = render_film(state.film().as_ref());
+    let mut refresher = REFRESHER.lock().map_err(|e| e.to_string())?;
+    let Refresher { engine, decoded } = &mut *refresher;
+    ensure_luts(engine, film.as_ref())?;
+    let view = view_of(film.as_ref());
+    let reuse = key.is_some() && *decoded == key && engine.has(REFRESHED);
+    let frame = crate::perf::background(|| {
+        if !reuse {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            engine.load(REFRESHED, &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
+        }
+        engine.render(REFRESHED, &state.settings.to_string(), &view)
+    });
+    *decoded = if frame.is_ok() { key.clone() } else { None };
+    finish(frame?, state, key.as_ref())
+}
+
+/// The film thumbnail of a photo rendered on a fresh engine, bypassing every cache, as RGBA.
+pub fn fresh_thumbnail(path: &Path, probed: &Probed, state: &PhotoState) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let film = render_film(state.film().as_ref());
+    let mut engine = Engine::new();
+    ensure_luts(&mut engine, film.as_ref())?;
+    engine.load("fresh", &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
+    Ok(engine.render("fresh", &state.settings.to_string(), &view_of(film.as_ref()))?.take_rgba())
+}
+
+/// What the disk cache already knows about a photo: its probe, and whether its film thumbnail matches its look.
+struct Known {
     probed: Probed,
     state: PhotoState,
-    thumbnail: Arc<RenderImage>,
+    film: Option<u64>,
 }
 
 fn cached_probe(key: Option<&cache::Key>) -> Option<Probed> {
@@ -245,22 +300,21 @@ fn sidecar_text(file: &PhotoFile) -> Option<String> {
     file.sidecar.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
 }
 
-fn warm(file: &PhotoFile) -> Option<Warm> {
+fn known(file: &PhotoFile) -> Option<Known> {
     let key = cache::key(&file.path)?;
     let probed = cached_probe(Some(&key))?;
     let state = state_of(&probed, sidecar_text(file).as_deref()).ok()?;
-    let film = render_film(state.film().as_ref());
-    let pixels = cache::thumbnail(&key, look_of(&state.settings, film.as_ref()))?;
-    Some(Warm { id: file.id.clone(), probed, state, thumbnail: cached_image(pixels)? })
+    let look = look_of(&state);
+    let film = (cache::thumbnail_look(&key) == Some(look)).then_some(look);
+    Some(Known { probed, state, film })
 }
 
-fn index(slot: usize, file: &PhotoFile) -> Result<Indexed, String> {
+fn probe_file(file: &PhotoFile) -> Result<(Probed, PhotoState), String> {
     let key = cache::key(&file.path);
-    let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
-    let sidecar = sidecar_text(file);
     let probed = match cached_probe(key.as_ref()) {
         Some(probed) => probed,
         None => {
+            let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
             let json = core::probe(&file.name, &bytes)?;
             if let Some(key) = &key {
                 cache::store_probe(key, &json);
@@ -268,36 +322,113 @@ fn index(slot: usize, file: &PhotoFile) -> Result<Indexed, String> {
             serde_json::from_str(&json).map_err(|e| e.to_string())?
         }
     };
-    let state = state_of(&probed, sidecar.as_deref())?;
-    let film = render_film(state.film().as_ref());
-    let thumbnail = thumbnail(slot, &probed.facts, &bytes, &state.settings, film.as_ref(), key.as_ref(), true)?;
-    Ok(Indexed { probed, state, thumbnail })
+    let state = state_of(&probed, sidecar_text(file).as_deref())?;
+    Ok((probed, state))
+}
+
+struct RenderJob {
+    id: String,
+    file: PhotoFile,
+    probed: Probed,
+    state: PhotoState,
 }
 
 impl Library {
     pub fn new() -> Library {
-        Library { folder: None, photos: Vec::new(), saving: Saving::Idle, save_error: None, generation: 0, writing: HashMap::new(), failed: HashSet::new() }
+        Library {
+            folder: None,
+            photos: Vec::new(),
+            saving: Saving::Idle,
+            save_error: None,
+            generation: 0,
+            writing: HashMap::new(),
+            failed: HashSet::new(),
+            by_id: HashMap::new(),
+            revision: 0,
+            pictures: Pictures::default(),
+            loading: HashSet::new(),
+            previewless: HashSet::new(),
+            unrendered: VecDeque::new(),
+            rendering: HashSet::new(),
+            renderers: 0,
+            probing: false,
+            refreshing: HashMap::new(),
+            notifying: false,
+            previews: 0,
+        }
     }
 
     pub fn record(&self, id: &str) -> Option<&PhotoRecord> {
-        self.photos.iter().find(|r| r.file.id == id)
+        self.photos.get(*self.by_id.get(id)?)
     }
 
     fn record_mut(&mut self, id: &str) -> Option<&mut PhotoRecord> {
-        self.photos.iter_mut().find(|r| r.file.id == id)
+        self.revision += 1;
+        self.photos.get_mut(*self.by_id.get(id)?)
     }
 
     pub fn index_of(&self, id: &str) -> Option<usize> {
-        self.photos.iter().position(|r| r.file.id == id)
+        self.by_id.get(id).copied()
+    }
+
+    /// Changes whenever a photo's file, facts, state or error does, so views can keep what they derive from them.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The decoded thumbnail of `id`, when it is in memory; `want` asks for it.
+    pub fn picture(&self, id: &str) -> Option<&Picture> {
+        self.pictures.get(id)
+    }
+
+    /// How many embedded previews have been decoded to stand in for film thumbnails still rendering.
+    pub fn previews_shown(&self) -> usize {
+        self.previews
+    }
+
+    /// Starts a frame: what the views drew last frame stops being wanted until they want it again.
+    pub fn begin_frame(&mut self) {
+        self.pictures.begin_frame();
+    }
+
+    /// The views on screen show these photos, most important first; their thumbnails are decoded if they aren't in
+    /// memory, and their film renders come before the rest of the folder's.
+    pub fn want<'a>(&mut self, ids: impl IntoIterator<Item = &'a String>, cx: &mut Context<Library>) {
+        for id in ids {
+            self.pictures.want(id);
+        }
+        self.load_pictures(cx);
+    }
+
+    fn notify_soon(&mut self, cx: &mut Context<Library>) {
+        if self.notifying {
+            return;
+        }
+        self.notifying = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTIFY_EVERY).await;
+            let _ = this.update(cx, |library, cx| {
+                library.notifying = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn open(&mut self, folder: PathBuf, cx: &mut Context<Library>) {
         self.generation += 1;
         let run = self.generation;
-        for image in self.photos.iter_mut().filter_map(|r| r.thumbnail.take()) {
-            cx.drop_image(image, None);
-        }
-        self.photos = photos_in(&folder).into_iter().map(|file| PhotoRecord { file, refreshes: 0, probed: None, state: None, thumbnail: None, error: None }).collect();
+        self.pictures.clear(cx);
+        self.loading.clear();
+        self.previewless.clear();
+        self.unrendered.clear();
+        self.rendering.clear();
+        self.refreshing.clear();
+        self.probing = false;
+        self.renderers = 0;
+        self.photos = photos_in(&folder).into_iter().map(|file| PhotoRecord { file, probed: None, state: None, film: None, error: None }).collect();
+        self.by_id = self.photos.iter().enumerate().map(|(at, r)| (r.file.id.clone(), at)).collect();
+        self.revision += 1;
         self.folder = Some(folder);
         self.saving = Saving::Idle;
         self.failed.clear();
@@ -307,106 +438,255 @@ impl Library {
             let looked = cx
                 .background_spawn(async move {
                     use rayon::prelude::*;
-                    files.par_iter().map(|file| (file.clone(), warm(file))).collect::<Vec<_>>()
+                    files.par_iter().map(|file| (file.clone(), known(file))).collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |library, cx| {
                 if library.generation != run {
                     return;
                 }
-                let mut missed = Vec::new();
+                let mut unprobed = Vec::new();
                 for (file, hit) in looked {
                     match hit {
-                        Some(hit) => {
-                            if let Some(record) = library.record_mut(&hit.id) {
-                                record.probed = Some(hit.probed);
-                                record.state = Some(hit.state);
-                                record.thumbnail = Some(hit.thumbnail);
-                            }
-                        }
-                        None => missed.push(file),
+                        Some(hit) => library.learn(&file.id, hit.probed, hit.state, hit.film),
+                        None => unprobed.push(file),
                     }
                 }
                 cx.notify();
-                library.index_all(missed, run, cx);
+                library.probe_all(unprobed, run, cx);
+                library.render_all(run, cx);
+                library.load_pictures(cx);
             });
         })
         .detach();
         cx.notify();
     }
 
-    fn index_all(&mut self, files: Vec<PhotoFile>, run: usize, cx: &mut Context<Library>) {
-        let queue = Arc::new(Mutex::new(files.into_iter().collect::<std::collections::VecDeque<_>>()));
-        let working = Arc::new(std::sync::atomic::AtomicUsize::new(INDEXERS));
-        for slot in 0..INDEXERS {
-            let queue = queue.clone();
-            let working = working.clone();
+    fn learn(&mut self, id: &str, probed: Probed, state: PhotoState, film: Option<u64>) {
+        let Some(record) = self.record_mut(id) else { return };
+        record.probed = Some(probed);
+        record.state = Some(state);
+        record.film = film;
+        if film.is_none() {
+            self.unrendered.push_back(id.to_string());
+        }
+    }
+
+    fn fail(&mut self, id: &str, error: String) {
+        if let Some(record) = self.record_mut(id) {
+            record.error = Some(error);
+        }
+    }
+
+    fn probe_all(&mut self, files: Vec<PhotoFile>, run: usize, cx: &mut Context<Library>) {
+        if files.is_empty() {
+            return;
+        }
+        self.probing = true;
+        cx.spawn(async move |this, cx| {
+            for batch in files.chunks(PROBERS) {
+                let batch = batch.to_vec();
+                let probed = cx
+                    .background_spawn(async move {
+                        use rayon::prelude::*;
+                        batch.par_iter().map(|file| (file.id.clone(), probe_file(file))).collect::<Vec<_>>()
+                    })
+                    .await;
+                let alive = this.update(cx, |library, cx| {
+                    if library.generation != run {
+                        return false;
+                    }
+                    for (id, result) in probed {
+                        match result {
+                            Ok((probed, state)) => library.learn(&id, probed, state, None),
+                            Err(e) => library.fail(&id, e),
+                        }
+                    }
+                    library.notify_soon(cx);
+                    true
+                });
+                if !alive.unwrap_or(false) {
+                    return;
+                }
+            }
+            let _ = this.update(cx, |library, _| {
+                if library.generation == run {
+                    library.probing = false;
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn needs_render(&self, id: &str) -> bool {
+        !self.rendering.contains(id) && self.record(id).is_some_and(|r| r.film.is_none() && r.error.is_none() && r.probed.is_some())
+    }
+
+    /// The next film thumbnail to render: a photo on screen first, then the folder in order.
+    fn next_render(&mut self) -> Option<RenderJob> {
+        let id = match self.pictures.wanted().iter().find(|id| self.needs_render(id)) {
+            Some(id) => id.clone(),
+            None => loop {
+                let id = self.unrendered.pop_front()?;
+                if self.needs_render(&id) {
+                    break id;
+                }
+            },
+        };
+        let record = self.record(&id)?;
+        let job = RenderJob { id: id.clone(), file: record.file.clone(), probed: record.probed.clone()?, state: record.state.clone()? };
+        self.rendering.insert(id);
+        Some(job)
+    }
+
+    fn render_all(&mut self, run: usize, cx: &mut Context<Library>) {
+        while self.renderers < INDEXERS {
+            let slot = self.renderers;
+            self.renderers += 1;
             cx.spawn(async move |this, cx| {
                 loop {
-                    let Some(file) = queue.lock().ok().and_then(|mut q| q.pop_front()) else {
-                        // why: indexing decodes many photos; once the last indexer is done their memory goes back
-                        if working.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-                            crate::perf::give_back();
+                    let next = this.update(cx, |library, _| (library.generation == run).then(|| library.next_render()));
+                    let Ok(Some(next)) = next else { break };
+                    let Some(job) = next else {
+                        if !this.read_with(cx, |library, _| library.probing).unwrap_or(false) {
+                            break;
                         }
-                        break;
+                        cx.background_executor().timer(IDLE_POLL).await;
+                        continue;
                     };
-                    let id = file.id.clone();
-                    let result = cx.background_spawn(async move { index(slot, &file) }).await;
-                    let alive = this.update(cx, |library, cx| {
-                        if library.generation != run {
-                            return false;
+                    let id = job.id.clone();
+                    let result = cx.background_spawn(async move { index_render(slot, &job.file, &job.probed, &job.state) }).await;
+                    let _ = this.update(cx, |library, cx| {
+                        if library.generation == run {
+                            library.rendered(&id, result, cx);
                         }
-                        if let Some(record) = library.record_mut(&id) {
-                            match result {
-                                Ok(done) => {
-                                    record.probed = Some(done.probed);
-                                    record.state = Some(done.state);
-                                    if let Some(old) = record.thumbnail.replace(done.thumbnail) {
-                                        cx.drop_image(old, None);
-                                    }
-                                }
-                                Err(e) => record.error = Some(e),
-                            }
-                        }
-                        cx.notify();
-                        true
                     });
-                    if !alive.unwrap_or(false) {
-                        break;
-                    }
                 }
+                let _ = this.update(cx, |library, _| {
+                    if library.generation != run {
+                        return;
+                    }
+                    library.renderers -= 1;
+                    // why: indexing decodes many photos; once the last indexer is done their memory goes back
+                    if library.renderers == 0 {
+                        crate::perf::give_back();
+                    }
+                });
             })
             .detach();
         }
     }
 
+    fn rendered(&mut self, id: &str, result: Result<Rendered, String>, cx: &mut Context<Library>) {
+        self.rendering.remove(id);
+        match result {
+            Ok(rendered) if self.record(id).and_then(|r| r.state.as_ref()).map(look_of) == Some(rendered.look) => self.show_film(id, rendered, cx),
+            Ok(_) if !self.refreshing.contains_key(id) => self.unrendered.push_back(id.to_string()),
+            Ok(_) => {}
+            Err(e) => self.fail(id, e),
+        }
+        self.notify_soon(cx);
+    }
+
+    fn show_film(&mut self, id: &str, rendered: Rendered, cx: &mut Context<Library>) {
+        if let Some(at) = self.by_id.get(id) {
+            self.photos[*at].film = Some(rendered.look);
+        }
+        if self.pictures.is_wanted(id) || self.pictures.get(id).is_some() {
+            self.pictures.insert(id, Picture { image: rendered.image, film: Some(rendered.look) }, cx);
+        }
+    }
+
+    fn next_picture(&self) -> Option<(String, Source)> {
+        self.pictures.wanted().iter().filter(|id| !self.loading.contains(*id)).find_map(|id| {
+            let record = self.record(id)?;
+            let shown = self.pictures.get(id).map(|p| p.film);
+            let path = record.file.path.clone();
+            match record.film {
+                Some(look) if shown != Some(Some(look)) => Some((id.clone(), Source::Film { path, look })),
+                None if shown.is_none() && record.error.is_none() && !self.previewless.contains(id) => Some((id.clone(), Source::Preview { path })),
+                _ => None,
+            }
+        })
+    }
+
+    fn load_pictures(&mut self, cx: &mut Context<Library>) {
+        while self.loading.len() < LOADERS {
+            let Some((id, source)) = self.next_picture() else { break };
+            self.loading.insert(id.clone());
+            let run = self.generation;
+            let film = match &source {
+                Source::Film { look, .. } => Some(*look),
+                Source::Preview { .. } => None,
+            };
+            cx.spawn(async move |this, cx| {
+                let loaded = cx.background_spawn(async move { source.load(THUMBNAIL_EDGE) }).await;
+                let _ = this.update(cx, |library, cx| {
+                    if library.generation != run {
+                        return;
+                    }
+                    library.loading.remove(&id);
+                    library.loaded(&id, film, loaded, cx);
+                    library.load_pictures(cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn loaded(&mut self, id: &str, film: Option<u64>, loaded: Option<Picture>, cx: &mut Context<Library>) {
+        let current = self.record(id).and_then(|r| r.film);
+        match (film, loaded) {
+            (Some(look), Some(picture)) if current == Some(look) => self.pictures.insert(id, picture, cx),
+            (Some(_), Some(_)) => return,
+            (Some(look), None) if current == Some(look) => {
+                if let Some(at) = self.by_id.get(id) {
+                    self.photos[*at].film = None;
+                }
+                self.unrendered.push_front(id.to_string());
+                self.render_all(self.generation, cx);
+                return;
+            }
+            (Some(_), None) => return,
+            (None, Some(picture)) if self.pictures.get(id).is_none() => {
+                self.previews += 1;
+                self.pictures.insert(id, picture, cx);
+            }
+            (None, Some(_)) => return,
+            (None, None) => {
+                self.previewless.insert(id.to_string());
+                return;
+            }
+        }
+        self.notify_soon(cx);
+    }
+
     pub fn refresh_thumbnail(&mut self, id: &str, cx: &mut Context<Library>) {
-        let Some(record) = self.record_mut(id) else { return };
-        record.refreshes += 1;
-        let ticket = record.refreshes;
+        if let Some(again) = self.refreshing.get_mut(id) {
+            *again = true;
+            return;
+        }
+        let Some(record) = self.record(id) else { return };
         let (Some(probed), Some(state)) = (record.probed.clone(), record.state.clone()) else { return };
         let path = record.file.path.clone();
         let id = id.to_string();
+        let run = self.generation;
+        self.refreshing.insert(id.clone(), false);
         cx.spawn(async move |this, cx| {
-            let made = cx
-                .background_spawn(async move {
-                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    thumbnail(0, &probed.facts, &bytes, &state.settings, render_film(state.film().as_ref()).as_ref(), cache::key(&path).as_ref(), false)
-                })
-                .await;
-            if let Ok(image) = made {
-                let _ = this.update(cx, |library, cx| {
-                    if let Some(record) = library.record_mut(&id)
-                        && record.refreshes == ticket
-                    {
-                        // why: GPUI keeps every image it has drawn in its atlas until it is dropped
-                        if let Some(old) = record.thumbnail.replace(image) {
-                            cx.drop_image(old, None);
-                        }
-                        cx.notify();
-                    }
-                });
-            }
+            let made = cx.background_spawn(async move { refresh_render(&path, &probed, &state) }).await;
+            let _ = this.update(cx, |library, cx| {
+                if library.generation != run {
+                    return;
+                }
+                let again = library.refreshing.remove(&id).unwrap_or(false);
+                if let Ok(rendered) = made {
+                    library.show_film(&id, rendered, cx);
+                    cx.notify();
+                }
+                if again {
+                    library.refresh_thumbnail(&id, cx);
+                }
+            });
         })
         .detach();
     }

@@ -214,10 +214,45 @@ async fn script(run: &mut Run, cx: &mut AsyncApp) {
     leave(run, cx, &folder, &stem, &facts).await;
 }
 
+fn rgba_of(image: &RenderImage) -> Option<Vec<u8>> {
+    Some(image.as_bytes(0)?.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect())
+}
+
+async fn thumbnails(run: &mut Run, cx: &mut AsyncApp) {
+    let previews = run.read(cx, |a, cx| a.library.read(cx).previews_shown()).unwrap_or(0);
+    run.check("library: camera previews stand in while film thumbnails render", previews > 0, format!("{previews} previews shown"));
+    let filmed = run
+        .wait(cx, 10, |a, cx| {
+            let l = a.library.read(cx);
+            a.browse.order().iter().all(|id| l.record(id).is_some_and(|r| r.film.is_some() && l.picture(id).is_some_and(|p| p.film == r.film)))
+        })
+        .await;
+    run.check("library: every tile's preview is replaced by its film thumbnail", filmed, "");
+    let sample = run
+        .read(cx, |a, cx| {
+            let l = a.library.read(cx);
+            let id = a.browse.order().first()?;
+            let r = l.record(id)?;
+            Some((r.file.path.clone(), r.probed.clone()?, r.state.clone()?, l.picture(id)?.image.clone()))
+        })
+        .flatten();
+    let Some((path, probed, state, image)) = sample else {
+        run.check("library: the film thumbnail is identical to a fresh render", false, "no thumbnail on the first tile");
+        return;
+    };
+    let expected = cx.background_spawn(async move { crate::library::fresh_thumbnail(&path, &probed, &state) }).await;
+    let same = matches!((&expected, rgba_of(&image)), (Ok(e), Some(s)) if *e == s);
+    run.check("library: the film thumbnail is identical to a fresh render", same, match &expected {
+        Ok(_) if same => "identical".to_string(),
+        Ok(_) => "DIFFERS".to_string(),
+        Err(e) => format!("failed: {e}"),
+    });
+}
+
 async fn library(run: &mut Run, cx: &mut AsyncApp) {
     let loaded = run.wait(cx, 120, |a, cx| {
         let l = a.library.read(cx);
-        !l.photos.is_empty() && l.photos.iter().all(|r| r.thumbnail.is_some() || r.error.is_some())
+        !l.photos.is_empty() && l.photos.iter().all(crate::library::PhotoRecord::indexed)
     });
     let ready = loaded.await;
     let (count, errors) = run.read(cx, |a, cx| {
@@ -225,6 +260,7 @@ async fn library(run: &mut Run, cx: &mut AsyncApp) {
         (l.photos.len(), l.photos.iter().filter_map(|r| r.error.clone().map(|e| format!("{}: {e}", r.file.name))).collect::<Vec<_>>())
     }).unwrap_or_default();
     run.check("library: every photo indexed with a thumbnail", ready && errors.is_empty() && count > 1, format!("{count} photos, errors {errors:?}"));
+    thumbnails(run, cx).await;
     run.shoot(cx, "01-library").await;
 
     let order = run.read(cx, |a, _| a.browse.order().to_vec()).unwrap_or_default();
@@ -977,6 +1013,8 @@ async fn leave(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     run.key(cx, "g");
     let browse = run.wait(cx, 5, |a, _| a.mode == Mode::Browse).await;
     run.check("library: G returns to the library", browse, "");
+    let edited = edited_thumbnail(run, cx, stem).await;
+    run.check("library: the edited photo's thumbnail is identical to a fresh render of its edit", edited, "");
     run.shoot(cx, "11-library-after").await;
     let unloaded = run.wait(cx, 15, |a, cx| a.develop.read(cx).photo_id.is_none()).await;
     run.check("memory: Develop unloads after a while in the library", unloaded, "");
@@ -996,4 +1034,33 @@ async fn leave(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     })
     .await;
     run.check("persistence: reopening the folder reads the edit back", reread, "");
+    let cached = run
+        .wait(cx, 20, |a, cx| {
+            let l = a.library.read(cx);
+            l.photos.iter().all(crate::library::PhotoRecord::indexed) && a.browse.order().iter().all(|id| l.record(id).is_some_and(|r| r.film.is_some() && l.picture(id).is_some_and(|p| p.film == r.film)))
+        })
+        .await;
+    run.check("library: reopening shows the cached film thumbnails", cached, "");
+}
+
+async fn edited_thumbnail(run: &mut Run, cx: &mut AsyncApp, stem: &str) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        let sample = run
+            .read(cx, |a, cx| {
+                let l = a.library.read(cx);
+                let r = l.photos.iter().find(|r| r.file.stem == stem)?;
+                let picture = l.picture(&r.file.id).filter(|p| p.film.is_some() && p.film == r.film)?;
+                Some((r.file.path.clone(), r.probed.clone()?, r.state.clone()?, picture.image.clone()))
+            })
+            .flatten();
+        if let Some((path, probed, state, image)) = sample {
+            let expected = cx.background_spawn(async move { crate::library::fresh_thumbnail(&path, &probed, &state) }).await;
+            if expected.is_ok_and(|e| rgba_of(&image).is_some_and(|s| s == e)) {
+                return true;
+            }
+        }
+        run.pause(cx, 500).await;
+    }
+    false
 }
