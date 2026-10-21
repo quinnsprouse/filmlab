@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
@@ -8,7 +6,8 @@ use objc2_quartz_core::{CALayer, CAMetalLayer};
 
 use crate::camera::{Camera, Native, Rect, Region, Size, rect_of};
 use crate::glass::renderer_view;
-use crate::gpu::Gpu;
+use crate::develop::DisplayFrame;
+use crate::gpu::{Gpu, Screen};
 
 const SHADER: &str = r#"
 struct Quad { rect: vec4f, background: vec4f }
@@ -35,18 +34,13 @@ pub enum Layer {
     Detail,
 }
 
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-    pub region: Region,
-}
-
 struct Shown {
     region: Region,
     size: (u32, u32),
-    view: wgpu::TextureView,
+    texture: wgpu::Texture,
     uniform: wgpu::Buffer,
+    nearest: wgpu::BindGroup,
+    linear: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -65,7 +59,7 @@ struct Target {
 }
 
 pub struct Viewer {
-    gpu: Arc<Gpu>,
+    screen: Screen,
     view: Retained<NSView>,
     target: Option<Target>,
     parked: bool,
@@ -82,16 +76,17 @@ pub struct Viewer {
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 impl Viewer {
-    pub fn new(window: &gpui_kit::Window, gpu: Arc<Gpu>) -> Option<Viewer> {
+    pub fn new(window: &gpui_kit::Window, gpu: &Gpu) -> Option<Viewer> {
         let mtm = MainThreadMarker::new()?;
         let gpui = renderer_view(window)?;
         let parent = unsafe { gpui.superview() }?;
         let view = NSView::initWithFrame(NSView::alloc(mtm), parent.bounds());
-        let target = Target::new(&gpu, &view)?;
+        let screen = gpu.screen()?;
+        let target = Target::new(&screen, &view)?;
         view.setWantsLayer(true);
         view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
         parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
-        let device = &gpu.device;
+        let device = &screen.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("viewer"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let binds = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
@@ -133,20 +128,47 @@ impl Viewer {
             })
         };
         let (nearest, linear) = (sampler(wgpu::FilterMode::Nearest), sampler(wgpu::FilterMode::Linear));
-        Some(Viewer { gpu, view, target: Some(target), parked: false, pipeline, binds, nearest, linear, fit: None, detail: None, drawn: None, dirty: true })
+        Some(Viewer { screen, view, target: Some(target), parked: false, pipeline, binds, nearest, linear, fit: None, detail: None, drawn: None, dirty: true })
     }
 
-    pub fn show(&mut self, layer: Layer, frame: Option<Frame>) {
+    // why: a new frame of the size on screen is written into the texture it replaces; a texture, its uniform and
+    // bind groups are made only when the size changes
+    pub fn show(&mut self, layer: Layer, frame: Option<&DisplayFrame>) {
+        let slot = match layer {
+            Layer::Fit => self.fit.take(),
+            Layer::Detail => self.detail.take(),
+        };
+        let kept = slot.filter(|s| frame.is_some_and(|f| s.size == (f.width, f.height)));
         let shown = frame.map(|f| {
-            let texture = crate::gpu::texture_rgba(&self.gpu, f.width, f.height, &f.rgba);
-            let uniform = self.gpu.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            Shown { region: f.region, size: (f.width, f.height), view: texture.create_view(&Default::default()), uniform }
+            let mut shown = kept.unwrap_or_else(|| self.make((f.width, f.height)));
+            self.screen.write_rgba(&shown.texture, f.width, f.height, &f.rgba);
+            shown.region = f.region;
+            shown
         });
         match layer {
             Layer::Fit => self.fit = shown,
             Layer::Detail => self.detail = shown,
         }
         self.dirty = true;
+    }
+
+    fn make(&self, size: (u32, u32)) -> Shown {
+        let texture = self.screen.texture_rgba(size.0, size.1);
+        let view = texture.create_view(&Default::default());
+        let uniform = self.screen.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bind = |sampler: &wgpu::Sampler| {
+            self.screen.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.binds,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+                ],
+            })
+        };
+        let (nearest, linear) = (bind(&self.nearest), bind(&self.linear));
+        Shown { region: crate::camera::WHOLE, size, texture, uniform, nearest, linear }
     }
 
     pub fn has(&self, layer: Layer) -> bool {
@@ -182,7 +204,7 @@ impl Viewer {
             return;
         }
         if self.target.is_none() {
-            self.target = Target::new(&self.gpu, &self.view);
+            self.target = Target::new(&self.screen, &self.view);
         }
         let Some(target) = self.target.as_mut() else { return };
         if let Some(window) = self.view.window() {
@@ -191,7 +213,7 @@ impl Viewer {
         // why: before a photo's first frame the layer only shows the background, which a 1×1 drawable stretched
         // over it shows as well
         let empty = self.fit.is_none() && self.detail.is_none();
-        target.configure(&self.gpu, if empty { (1, 1) } else { scene.drawable });
+        target.configure(&self.screen, if empty { (1, 1) } else { scene.drawable });
         let output = match target.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
@@ -202,8 +224,8 @@ impl Viewer {
             _ => return,
         };
         let target = output.texture.create_view(&Default::default());
-        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
-        let binds: Vec<wgpu::BindGroup> = [&self.fit, &self.detail].into_iter().flatten().map(|shown| self.bind(shown, scene)).collect();
+        let mut encoder = self.screen.device.create_command_encoder(&Default::default());
+        let binds: Vec<&wgpu::BindGroup> = [&self.fit, &self.detail].into_iter().flatten().map(|shown| self.bind(shown, scene)).collect();
         {
             let [r, g, b] = scene.background;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -220,20 +242,20 @@ impl Viewer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for bind in &binds {
+            for bind in binds {
                 pass.set_bind_group(0, bind, &[]);
                 pass.draw(0..6, 0..1);
             }
         }
-        self.gpu.queue.submit([encoder.finish()]);
-        self.gpu.queue.present(output);
+        self.screen.queue.submit([encoder.finish()]);
+        self.screen.queue.present(output);
         // why: wgpu frees dropped textures and spent upload space only when the device is polled
-        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
+        let _ = self.screen.device.poll(wgpu::PollType::Poll);
         self.drawn = Some(scene);
         self.dirty = false;
     }
 
-    fn bind(&self, shown: &Shown, scene: Scene) -> wgpu::BindGroup {
+    fn bind<'a>(&self, shown: &'a Shown, scene: Scene) -> &'a wgpu::BindGroup {
         let viewport = Size { width: scene.stage.width, height: scene.stage.height };
         let r = rect_of(scene.camera, shown.region, scene.native, viewport);
         let (x, y) = (scene.stage.x + r.x, scene.stage.y + r.y);
@@ -242,19 +264,10 @@ impl Viewer {
         let [x0, y0] = ndc(x, y);
         let [x1, y1] = ndc(x + r.width, y + r.height);
         let words = [x0, y0, x1, y1, 0.0, 0.0, 0.0, 0.0];
-        self.gpu.queue.write_buffer(&shown.uniform, 0, bytemuck::cast_slice(&words));
+        self.screen.queue.write_buffer(&shown.uniform, 0, bytemuck::cast_slice(&words));
         // why: at 1:1 each texel lands on one device pixel, so nearest keeps the engine's exact values
         let exact = (r.width - f64::from(shown.size.0)).abs() < 0.5 && (r.height - f64::from(shown.size.1)).abs() < 0.5;
-        let sampler = if exact { &self.nearest } else { &self.linear };
-        self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.binds,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&shown.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: shown.uniform.as_entire_binding() },
-            ],
-        })
+        if exact { &shown.nearest } else { &shown.linear }
     }
 }
 
@@ -265,15 +278,15 @@ impl Drop for Viewer {
 }
 
 impl Target {
-    fn new(gpu: &Gpu, view: &NSView) -> Option<Target> {
+    fn new(screen: &Screen, view: &NSView) -> Option<Target> {
         let layer = CAMetalLayer::new();
         view.setLayer(Some(&layer));
         let target = wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(Retained::as_ptr(&layer) as *mut std::ffi::c_void);
-        let surface = unsafe { gpu.instance.create_surface_unsafe(target) }.ok()?;
+        let surface = unsafe { screen.instance.create_surface_unsafe(target) }.ok()?;
         Some(Target { layer, surface, configured: None })
     }
 
-    fn configure(&mut self, gpu: &Gpu, (w, h): (u32, u32)) {
+    fn configure(&mut self, screen: &Screen, (w, h): (u32, u32)) {
         if self.configured == Some((w, h)) || w == 0 || h == 0 {
             return;
         }
@@ -288,7 +301,7 @@ impl Target {
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Srgb,
         };
-        self.surface.configure(&gpu.device, &config);
+        self.surface.configure(&screen.device, &config);
         // why: the engine's pixels are sRGB; naming the layer's space lets macOS colour-manage them to the
         // display, rather than showing them as the panel's native (P3) values
         let srgb = CGColorSpace::with_name(Some(unsafe { objc2_core_graphics::kCGColorSpaceSRGB }));

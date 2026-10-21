@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use filmlab_engine::gpu::{Block, Program, Words};
-use wgpu::util::DeviceExt;
 
 const SHADER: &str = include_str!("film.wgsl");
 const PARAMS_SLOT: u64 = 512;
@@ -567,10 +566,26 @@ impl filmlab_engine::Runner for Runner {
     }
 }
 
-pub fn texture_rgba(gpu: &Gpu, width: u32, height: u32, rgba: &[u8]) -> wgpu::Texture {
-    gpu.device.create_texture_with_data(
-        &gpu.queue,
-        &wgpu::TextureDescriptor {
+// why: wgpu reconfigures a surface only once its device is idle, and fails if another thread submits meanwhile; the
+// viewer's own device is idle between its frames whatever the film renders and thumbnails are doing, and its frames
+// don't queue behind their work
+/// The device the viewer draws and presents with, apart from the one renders run on.
+pub struct Screen {
+    pub instance: wgpu::Instance,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+impl Gpu {
+    pub fn screen(&self) -> Option<Screen> {
+        let (device, queue) = pollster::block_on(self.adapter.request_device(&wgpu::DeviceDescriptor { label: Some("screen"), ..Default::default() })).ok()?;
+        Some(Screen { instance: self.instance.clone(), device, queue })
+    }
+}
+
+impl Screen {
+    pub fn texture_rgba(&self, width: u32, height: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("photo"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -579,8 +594,15 @@ pub fn texture_rgba(gpu: &Gpu, width: u32, height: u32, rgba: &[u8]) -> wgpu::Te
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        },
-        wgpu::util::TextureDataOrder::LayerMajor,
-        rgba,
-    )
+        })
+    }
+
+    pub fn write_rgba(&self, texture: &wgpu::Texture, width: u32, height: u32, rgba: &[u8]) {
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+    }
 }

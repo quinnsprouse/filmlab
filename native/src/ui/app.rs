@@ -16,7 +16,7 @@ use crate::develop::{Compare, Develop, DisplayFrame, Status, Tool};
 use crate::gpu::Gpu;
 use crate::library::Library;
 use crate::stocks::{self, Stock};
-use crate::viewer::{Frame, Layer, Scene, Viewer};
+use crate::viewer::{Layer, Scene, Viewer};
 
 actions!(
     filmlab,
@@ -121,7 +121,7 @@ impl FilmlabApp {
         })
         .detach();
         cx.observe(&develop, |_, _, cx| cx.notify()).detach();
-        let viewer = Rc::new(RefCell::new(gpu.clone().and_then(|g| Viewer::new(window, g))));
+        let viewer = Rc::new(RefCell::new(gpu.as_deref().and_then(|g| Viewer::new(window, g))));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut app = FilmlabApp {
@@ -409,7 +409,7 @@ impl FilmlabApp {
             let slot = if layer == Layer::Fit { &mut pushed.fit } else { &mut pushed.detail };
             if *slot != id {
                 *slot = id;
-                viewer.show(layer, frame.map(|f: &Arc<DisplayFrame>| Frame { width: f.width, height: f.height, rgba: f.rgba.clone(), region: f.region }));
+                viewer.show(layer, frame.map(|f: &Arc<DisplayFrame>| &**f));
             }
         }
         let (stage, s) = self.device_stage(window);
