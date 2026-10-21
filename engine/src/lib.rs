@@ -8,6 +8,7 @@ mod gpu;
 pub use gpu::{Runner, install as install_gpu};
 pub mod grain;
 pub mod halation;
+pub mod preview;
 mod halation_tables;
 mod pyramid;
 mod grain_tables;
