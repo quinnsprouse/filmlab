@@ -164,6 +164,6 @@ pub fn sample_color(app: &mut FilmlabApp, mask: u32, at: Pt, add: bool, cx: &mut
 
 /// The component's shape as it is right now, for drags that continue past a re-render.
 pub fn current_shape(app: &FilmlabApp, id: u32, component: usize, cx: &Cx) -> Option<Shape> {
-    let masks = super::model::read_masks(app.develop.read(cx).settings.as_ref());
-    masks.into_iter().find(|mask| mask.id == id)?.components.into_iter().nth(component).map(|c| c.shape)
+    let masks = super::model::masks_of(app, cx);
+    masks.iter().find(|mask| mask.id == id)?.components.get(component).map(|c| c.shape.clone())
 }

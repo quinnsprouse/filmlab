@@ -6,7 +6,7 @@ use super::brush_panel::brush_controls;
 use super::components::component_list;
 use super::create::create_grid;
 use super::list::mask_list;
-use super::model::read_masks;
+use super::model::masks_of;
 use super::state::Interaction;
 use super::widgets::{folder, on_flag};
 use crate::ui::app::FilmlabApp;
@@ -40,14 +40,14 @@ fn sync_overlay(app: &FilmlabApp, active: Option<u32>, cx: &mut Context<FilmlabA
 }
 
 pub fn panel(app: &mut FilmlabApp, window: &mut Window, cx: &mut Context<FilmlabApp>) -> AnyElement {
-    let (photo, settings) = {
+    let (photo, open) = {
         let d = app.develop.read(cx);
-        (d.photo_id.clone(), d.settings.clone())
+        (d.photo_id.clone(), d.settings.is_some())
     };
-    let Some(settings) = settings else {
+    if !open {
         return div().p_4().text_size(px(12.)).text_color(theme::tertiary()).child("Open a photo to develop it.").into_any_element();
-    };
-    let masks = read_masks(Some(&settings));
+    }
+    let masks = masks_of(app, cx);
     let active = app.tools.masks.active_for(photo.as_ref()).filter(|id| masks.iter().any(|m| m.id == *id));
     sync_overlay(app, active, cx);
     let app: &FilmlabApp = app;

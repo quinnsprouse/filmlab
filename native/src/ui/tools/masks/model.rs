@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
+use gpui_kit::App;
 use serde_json::{Map, Value, json};
 
 use crate::settings::Settings;
+use crate::ui::app::FilmlabApp;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pt {
@@ -342,7 +345,17 @@ fn parse_mask(value: &Value) -> Option<Mask> {
     })
 }
 
-pub fn read_masks(settings: Option<&Settings>) -> Vec<Mask> {
+fn read_masks(settings: Option<&Settings>) -> Vec<Mask> {
     let masks = settings.and_then(|s| serde_json::to_value(&s.masks).ok());
     masks.as_ref().and_then(Value::as_array).map(|list| list.iter().filter_map(parse_mask).collect()).unwrap_or_default()
+}
+
+/// The open photo's masks, read again only when its settings change.
+pub fn masks_of(app: &FilmlabApp, cx: &App) -> Rc<Vec<Mask>> {
+    let d = app.develop.read(cx);
+    let mut seen = app.tools.masks.seen.borrow_mut();
+    match seen.as_ref().filter(|(revision, _)| *revision == d.revision) {
+        Some((_, masks)) => masks.clone(),
+        None => seen.insert((d.revision, Rc::new(read_masks(d.settings.as_ref())))).1.clone(),
+    }
 }

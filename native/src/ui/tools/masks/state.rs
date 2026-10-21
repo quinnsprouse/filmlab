@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui_kit::{Bounds, FocusHandle, Pixels, Subscription};
 
@@ -52,7 +54,7 @@ pub struct Pointer {
     pub over_grip: bool,
     pub scene: Scene,
     pub space: Option<ViewSpace>,
-    pub masks: Vec<Mask>,
+    pub masks: Rc<Vec<Mask>>,
     pub active: Option<u32>,
     pub frame: Bounds<Pixels>,
 }
@@ -72,6 +74,8 @@ pub struct State {
     pub rename: Option<Rename>,
     pub pointer: Pointer,
     pub focus: Option<FocusHandle>,
+    /// The open photo's masks as of a develop revision.
+    pub seen: RefCell<Option<(u64, Rc<Vec<Mask>>)>>,
 }
 
 impl State {
