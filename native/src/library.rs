@@ -92,6 +92,10 @@ pub struct Library {
     // why: one sidecar write at a time per file, with only the newest waiting behind it, so two quick saves of a
     // photo can't land on disk out of order
     writing: HashMap<PathBuf, Option<Write>>,
+    /// The newest write asked of each sidecar, until it or a newer one is on disk.
+    unsaved: HashMap<PathBuf, Write>,
+    writes: u64,
+    disk: Disk,
     /// Photos whose last write failed.
     failed: HashSet<String>,
     by_id: HashMap<String, usize>,
@@ -110,12 +114,36 @@ pub struct Library {
     previews: usize,
 }
 
+#[derive(Clone)]
 struct Write {
     id: String,
     target: PathBuf,
     facts: String,
     state: PhotoState,
     refresh: bool,
+    /// Later writes have higher numbers.
+    order: u64,
+}
+
+/// The newest write on disk for each sidecar, so that one landing after a newer one (a save made on quit while an
+/// earlier one was still running) leaves the newer one in place.
+#[derive(Clone, Default)]
+struct Disk(Arc<Mutex<HashMap<PathBuf, Arc<Mutex<u64>>>>>);
+
+impl Disk {
+    fn write(&self, write: &Write) -> Result<(), String> {
+        let slot = self.0.lock().map_err(|e| e.to_string())?.entry(write.target.clone()).or_default().clone();
+        let mut newest = slot.lock().map_err(|e| e.to_string())?;
+        if *newest >= write.order {
+            return Ok(());
+        }
+        let existing = std::fs::read_to_string(&write.target).ok();
+        let state = serde_json::to_string(&write.state).map_err(|e| e.to_string())?;
+        let text = core::write_sidecar(&write.facts, &state, existing)?;
+        crate::files::write_atomic(&write.target, text.as_bytes()).map_err(|e| e.to_string())?;
+        *newest = write.order;
+        Ok(())
+    }
 }
 
 fn extension(name: &str) -> String {
@@ -343,6 +371,9 @@ impl Library {
             save_error: None,
             generation: 0,
             writing: HashMap::new(),
+            unsaved: HashMap::new(),
+            writes: 0,
+            disk: Disk::default(),
             failed: HashSet::new(),
             by_id: HashMap::new(),
             revision: 0,
@@ -748,7 +779,10 @@ impl Library {
         let Some(record) = self.record_mut(id) else { return };
         record.state = Some(state.clone());
         let Some(probed) = record.probed.as_ref() else { return };
-        let write = Write { id: id.to_string(), target, facts: probed.facts.to_string(), state, refresh };
+        let facts = probed.facts.to_string();
+        self.writes += 1;
+        let write = Write { id: id.to_string(), target, facts, state, refresh, order: self.writes };
+        self.unsaved.insert(write.target.clone(), write.clone());
         self.saving = Saving::Saving;
         if let Some(queued) = self.writing.get_mut(&write.target) {
             let refresh = write.refresh || queued.as_ref().is_some_and(|q| q.refresh);
@@ -759,22 +793,31 @@ impl Library {
         self.start_write(write, cx);
     }
 
+    // why: quitting stops the app's tasks, so the writes still waiting or running are done here, on this thread
+    /// Writes every sidecar whose newest state isn't on disk yet, before returning.
+    pub fn save_now(&mut self) {
+        for write in std::mem::take(&mut self.unsaved).into_values() {
+            if let Err(e) = self.disk.write(&write) {
+                eprintln!("saving {} on quit failed: {e}", write.target.display());
+                self.save_error = Some(e);
+                self.failed.insert(write.id.clone());
+            }
+        }
+    }
+
     fn start_write(&mut self, write: Write, cx: &mut Context<Library>) {
         cx.spawn(async move |this, cx| {
             let written = {
-                let (target, facts, state) = (write.target.clone(), write.facts.clone(), write.state.clone());
-                cx.background_spawn(async move {
-                    let existing = std::fs::read_to_string(&target).ok();
-                    let state = serde_json::to_string(&state).map_err(|e| e.to_string())?;
-                    let text = core::write_sidecar(&facts, &state, existing)?;
-                    crate::files::write_atomic(&target, text.as_bytes()).map_err(|e| e.to_string())
-                })
-                .await
+                let (disk, write) = (this.read_with(cx, |l, _| l.disk.clone()).unwrap_or_default(), write.clone());
+                cx.background_spawn(async move { disk.write(&write) }).await
             };
             let _ = this.update(cx, |library, cx| {
                 let here = library.folder.as_deref() == write.target.parent();
                 match written {
                     Ok(()) => {
+                        if library.unsaved.get(&write.target).is_some_and(|u| u.order <= write.order) {
+                            library.unsaved.remove(&write.target);
+                        }
                         library.save_error = None;
                         library.failed.remove(&write.id);
                         if here && let Some(record) = library.record_mut(&write.id) {

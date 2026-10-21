@@ -121,6 +121,7 @@ impl FilmlabApp {
         })
         .detach();
         cx.observe(&develop, |_, _, cx| cx.notify()).detach();
+        super::quit::install(&develop, &library, window, cx);
         let viewer = Rc::new(RefCell::new(gpu.as_deref().and_then(|g| Viewer::new(window, g))));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -892,7 +893,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-\\", ToggleRail, None),
     ]);
     super::curve::bind(cx);
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| super::quit::quit(cx));
     cx.set_menus([
         Menu { name: "Filmlab".into(), items: vec![MenuItem::action("Quit Filmlab", Quit)], disabled: false },
         Menu { name: "File".into(), items: vec![MenuItem::action("Open Folder…", OpenFolder), MenuItem::action("Export…", Export)], disabled: false },

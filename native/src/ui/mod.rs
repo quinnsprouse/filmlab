@@ -16,6 +16,7 @@ pub mod motion;
 pub mod oklch;
 pub mod panel;
 pub mod parity;
+pub mod quit;
 pub mod rail;
 pub mod range;
 pub mod slider;

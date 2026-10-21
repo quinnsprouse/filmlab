@@ -198,22 +198,30 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
     let parity = std::env::var("FILMLAB_E2E").is_ok_and(|v| v == "parity");
     cx.spawn(async move |cx| {
         let mut run = run;
+        let mut quit_by_key = false;
         if parity {
+            reopened(&mut run, cx).await;
             for (name, ok, detail) in cx.background_spawn(async { super::parity::compare() }).await {
                 run.check(&name, ok, detail);
             }
         } else {
-            script(&mut run, cx).await;
+            quit_by_key = script(&mut run, cx).await;
         }
         eprintln!("e2e done: {} passed, {} failed {:?}", run.passed, run.failed.len(), run.failed);
+        if quit_by_key {
+            run.key(cx, "cmd-q");
+            run.pause(cx, 5000).await;
+            run.check("quit: Cmd-Q quits the app", false, "still running 5 s after Cmd-Q");
+        }
         cx.update(|cx| cx.quit());
     })
     .detach();
 }
 
-async fn script(run: &mut Run, cx: &mut AsyncApp) {
+/// Runs every check; true when the run should end the way Cmd-Q does, leaving an edit for the relaunch to find.
+async fn script(run: &mut Run, cx: &mut AsyncApp) -> bool {
     library(run, cx).await;
-    let Some((id, folder, stem, facts)) = open_first(run, cx).await else { return };
+    let Some((id, folder, stem, facts)) = open_first(run, cx).await else { return false };
     let photo = run.read(cx, |a, cx| a.library.read(cx).record(&id).map(|r| r.file.path.clone())).flatten().unwrap_or_default();
     for (name, ok, detail) in cx.background_spawn(async move { super::parity::record(&photo) }).await {
         run.check(&name, ok, detail);
@@ -228,6 +236,52 @@ async fn script(run: &mut Run, cx: &mut AsyncApp) {
     export(run, cx).await;
     leave(run, cx, &folder, &stem, &facts).await;
     torn_writes(run, cx, &folder, &stem, &facts).await;
+    edit_before_quit(run, cx, &id, &stem).await
+}
+
+const QUIT_EXPOSURE: f64 = 0.42;
+
+fn quit_note() -> Option<PathBuf> {
+    std::env::var_os("FILMLAB_E2E_QUIT").map(PathBuf::from)
+}
+
+/// Opens the photo and edits it, so the edit is still waiting on its save delay when the run quits.
+async fn edit_before_quit(run: &mut Run, cx: &mut AsyncApp, id: &str, stem: &str) -> bool {
+    let Some(note) = quit_note() else { return false };
+    let open = id.to_string();
+    run.act(cx, move |a, cx| a.open_photo(&open, cx));
+    run.wait(cx, 30, |a, cx| a.develop.read(cx).status == crate::develop::Status::Ready).await;
+    run.develop(cx, |d, cx| d.edit_controls(&[("light.exposure", QUIT_EXPOSURE)], "Exposure", cx));
+    let waiting = run.read(cx, |a, cx| a.develop.read(cx).unsaved()).unwrap_or(false);
+    run.check("quit: the edit is still waiting to be saved when Cmd-Q comes", waiting, "");
+    let _ = std::fs::write(note, json!({"stem": stem}).to_string());
+    waiting
+}
+
+/// After a relaunch, the edit the last run made just before Cmd-Q is in the photo's sidecar and in the library.
+async fn reopened(run: &mut Run, cx: &mut AsyncApp) {
+    let Some(stem) = quit_note().and_then(|n| std::fs::read_to_string(n).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["stem"].as_str().map(str::to_string)) else {
+        return run.check("quit: the run before left an edit to find", false, "no note from the run before");
+    };
+    let found = run.wait(cx, 60, {
+        let stem = stem.clone();
+        move |a, cx| a.library.read(cx).photos.iter().find(|r| r.file.stem == stem).is_some_and(|r| r.probed.is_some() && r.state.is_some())
+    })
+    .await;
+    let (state, on_disk) = run
+        .read(cx, |a, cx| {
+            let l = a.library.read(cx);
+            let r = l.photos.iter().find(|r| r.file.stem == stem)?;
+            let facts = r.probed.as_ref()?.facts.clone();
+            let xmp = std::fs::read_to_string(r.file.sidecar.as_ref()?).ok()?;
+            let on_disk: Value = serde_json::from_str(&core::read_sidecar(&facts.to_string(), &xmp).ok()?).ok()?;
+            Some((r.state.as_ref()?.settings.to_value(), on_disk["settings"].clone()))
+        })
+        .flatten()
+        .unwrap_or_default();
+    let (loaded, saved) = (exposure_of(&state), exposure_of(&on_disk));
+    let kept = found && (loaded - QUIT_EXPOSURE).abs() < 1e-6 && (saved - QUIT_EXPOSURE).abs() < 1e-6;
+    run.check("quit: an edit made just before Cmd-Q is in the sidecar after relaunch", kept, format!("library {loaded}, sidecar {saved}"));
 }
 
 /// Reads `path` as a sidecar until `stop`: how many reads, and how many found anything but a whole sidecar.
