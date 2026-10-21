@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::app::strip;
-use super::{Answer, Output, args, look};
+use super::look::State;
+use super::{Answer, Output, args, effect, look};
 use crate::film::{Dust, FilmSettings, GAUGES, Gauge, Halation, STOCK_DUST};
-use crate::mcp::session::{Edit, Held, Hub, NO_PHOTO};
+use crate::mcp::session::{Edit, Held, Hub, NO_PHOTO, control_values};
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
 use crate::ui::driver::Driver;
 use crate::ui::rail::store::{self, LOOK_GROUPS, PER_PHOTO_GROUPS};
@@ -20,9 +21,9 @@ use crate::ui::rail::store::{self, LOOK_GROUPS, PER_PHOTO_GROUPS};
 const GONE: &str = "Filmlab's window is gone";
 
 #[derive(Deserialize)]
-struct Spec {
+pub struct Spec {
     id: String,
-    label: String,
+    pub label: String,
     section: String,
     min: f64,
     max: f64,
@@ -36,12 +37,12 @@ fn specs() -> &'static [Spec] {
     SPECS.get_or_init(|| core::controls().ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
 }
 
-fn spec(id: &str) -> Option<&'static Spec> {
+pub fn spec(id: &str) -> Option<&'static Spec> {
     specs().iter().find(|s| s.id == id)
 }
 
 // why: every agent edit is its own undo step; a shared key would let two quick calls coalesce into one
-fn next_key(kind: &str) -> String {
+pub fn next_key(kind: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     format!("agent.{kind}.{}", N.fetch_add(1, Ordering::Relaxed))
 }
@@ -56,7 +57,32 @@ fn shown(spec: &Spec, v: f64) -> Value {
     num(v, spec.decimals + 1)
 }
 
-fn text(v: f64) -> String {
+/// `v` at the precision the control is shown at.
+pub fn rounded(spec: &Spec, v: f64) -> f64 {
+    shown(spec, v).as_f64().unwrap_or(v)
+}
+
+/// The smallest step the control is shown in.
+pub fn step(spec: &Spec) -> f64 {
+    10f64.powi(-(spec.decimals + 1))
+}
+
+/// `v` at the control's precision and inside `min..=max`, rounding toward the inside at an end; none when no value
+/// at that precision lies inside.
+pub fn rounded_within(spec: &Spec, v: f64, min: f64, max: f64) -> Option<f64> {
+    let (r, step) = (rounded(spec, v), step(spec));
+    let inside = if r > max {
+        (max / step + 1e-9).floor() * step
+    } else if r < min {
+        (min / step - 1e-9).ceil() * step
+    } else {
+        r
+    };
+    let inside = rounded(spec, inside);
+    (min - 1e-9..=max + 1e-9).contains(&inside).then_some(inside)
+}
+
+pub fn text(v: f64) -> String {
     num(v, 4).to_string()
 }
 
@@ -219,6 +245,7 @@ fn summarize(settings: &Value, before: Option<&Value>, facts: Option<&Value>, fi
     let profile = settings["profile"]["id"].as_str().filter(|id| all || before.is_none_or(|b| b["profile"]["id"].as_str() != Some(id)));
     strip(json!({
         "controls": controls,
+        "curve": super::curve::summary(settings, facts, all),
         "wb": wb,
         "profile": profile,
         "treatment": (settings["treatment"].as_str() == Some("bw")).then_some("bw"),
@@ -254,6 +281,8 @@ struct SetControls {
     values: Map<String, Value>,
     label: Option<String>,
     preview: Option<Value>,
+    if_state: Option<String>,
+    watch: Option<Vec<String>>,
 }
 
 /// What the user sees for a control, in the units set_controls takes (white balance as the inspector shows it).
@@ -288,53 +317,96 @@ fn sentence(title: &str) -> String {
         .join(" ")
 }
 
-pub async fn set_controls(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
-    let p: SetControls = args(value)?;
-    if p.values.is_empty() {
+fn known(values: &Map<String, Value>) -> Result<(), String> {
+    if values.is_empty() {
         return Err("values is empty; give e.g. {\"light.exposure\": 0.3}".into());
     }
-    let unknown: Vec<&String> = p.values.keys().filter(|id| spec(id).is_none()).collect();
+    let unknown: Vec<&String> = values.keys().filter(|id| spec(id).is_none()).collect();
     if !unknown.is_empty() {
         let hints: Vec<String> = unknown.iter().map(|id| format!("{id} (close: {})", close(id, specs().iter().map(|s| s.id.as_str())))).collect();
-        return Err(format!("unknown control {}; catalog controls lists ids", hints.join("; ")));
+        return Err(format!("unknown control {}; guide controls lists ids", hints.join("; ")));
     }
-    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
-    let read = |e: Edit<'_>| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)), e.facts.map(Value::to_string).unwrap_or_default());
-    let (values, wb, facts) = held.read(driver, cx, read).ok_or(NO_PHOTO)?;
-    let relative_wb = wb.as_ref().is_some_and(|w| !w.kelvin);
+    Ok(())
+}
+
+/// A control's value on `settings` in the units set_controls takes, and its range in them: white balance is in kelvin
+/// on raw photos and -100..100 on rendered ones.
+pub struct Slider {
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    pub kelvin: bool,
+}
+
+pub fn slider(id: &str, settings: &Value, facts: Option<&Value>) -> Result<Slider, String> {
+    let s = spec(id).ok_or_else(|| format!("unknown control {id} (close: {}); guide controls lists ids", close(id, specs().iter().map(|s| s.id.as_str()))))?;
+    let wb = facts.and_then(|f| white_balance(f, settings));
+    let value = current(&control_values(settings), wb.as_ref(), id).unwrap_or(s.default);
+    let is_wb = id == "wb.temp" || id == "wb.tint";
+    let (min, max) = if is_wb && wb.as_ref().is_some_and(|w| !w.kelvin) { (-100.0, 100.0) } else { (s.min, s.max) };
+    Ok(Slider { value, min, max, kelvin: id == "wb.temp" && wb.as_ref().is_some_and(|w| w.kelvin) })
+}
+
+/// What `develop.set` takes to set controls to `wanted` on top of `settings`: each value made absolute, clamped to its
+/// range and in the engine's units, with a note for each one clamped.
+pub fn targets(wanted: &Map<String, Value>, settings: &Value, facts: Option<&Value>) -> Result<(Map<String, Value>, Vec<String>), String> {
+    known(wanted)?;
+    let facts_text = facts.map(Value::to_string).unwrap_or_default();
     let mut targets = Map::new();
     let mut clamped = Vec::new();
-    for (id, raw) in &p.values {
-        let s = spec(id).ok_or("unknown control")?;
-        let base = current(&values, wb.as_ref(), id).unwrap_or(s.default);
+    for (id, raw) in wanted {
+        let slider = slider(id, settings, facts)?;
         let wanted = match raw {
             Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
             Value::String(t) => {
                 let t = t.trim();
                 let n: f64 = t.parse().map_err(|_| format!("{id}: \"{t}\" isn't a number; use 0.4 (absolute) or \"+0.4\" / \"-10\" (relative)"))?;
-                if t.starts_with(['+', '-']) { base + n } else { n }
+                if t.starts_with(['+', '-']) { slider.value + n } else { n }
             }
             _ => f64::NAN,
         };
         if !wanted.is_finite() {
             return Err(format!("{id}: give a number or a relative string like \"+0.3\""));
         }
-        let (min, max) = if relative_wb && (id == "wb.temp" || id == "wb.tint") { (-100.0, 100.0) } else { (s.min, s.max) };
-        let v = wanted.clamp(min, max);
+        let v = wanted.clamp(slider.min, slider.max);
         if (v - wanted).abs() > 1e-9 {
             clamped.push(format!("{id} to {}", text(v)));
         }
-        let v = if id == "wb.temp" { core::temp_setting(&facts, v)? } else { v };
+        let v = if id == "wb.temp" { core::temp_setting(&facts_text, v)? } else { v };
         targets.insert(id.clone(), json!(v));
     }
+    Ok((targets, clamped))
+}
+
+/// `settings` with controls set to `values` as set_controls would set them, without saving, and a note for each value
+/// clamped to its range.
+pub fn with_values(settings: &Value, values: &Map<String, Value>, facts: &Value) -> Result<(Value, Vec<String>), String> {
+    let (targets, clamped) = targets(values, settings, Some(facts))?;
+    let mut commands = core::Commands::new();
+    commands.open(&facts.to_string(), &settings.to_string())?;
+    let out: Value = serde_json::from_str(&commands.run("develop.set", &json!({"values": targets}).to_string())?).map_err(|e| e.to_string())?;
+    Ok((out["settings"].clone(), clamped))
+}
+
+pub async fn set_controls(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+    let p: SetControls = args(value)?;
+    known(&p.values)?;
+    let watch = effect::watching(p.watch.clone())?;
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    held.expect(p.if_state.clone());
+    let before = State::now(&held, driver, cx)?;
+    let facts = held.read(driver, cx, |e| e.facts.cloned()).ok_or(NO_PHOTO)?;
+    let (targets, clamped) = targets(&p.values, &before.settings, facts.as_ref())?;
     let ids: Vec<String> = targets.keys().cloned().collect();
     let label = p.label.unwrap_or_else(|| controls_label(&ids));
     let key = next_key("controls");
     held.command(driver, cx, "develop.set", json!({"values": targets}), &label, &key).await?;
-    let (values, wb, _) = held.read(driver, cx, read).ok_or(NO_PHOTO)?;
-    let set: Map<String, Value> = ids.iter().filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
-    let output = Output::json(strip(json!({"photo": held.id(driver, cx), "set": set, "clamped": clamped})));
-    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
+    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)))).ok_or(NO_PHOTO)?;
+    let relative = |id: &String| p.values[id].as_str().is_some_and(|t| t.trim().starts_with(['+', '-']));
+    let set: Map<String, Value> = ids.iter().filter(|id| relative(id)).filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
+    let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "set": set, "clamped": clamped}));
+    let out = effect::report(hub, &held, driver, cx, &before, out, &watch).await;
+    look::attach(&held, driver, cx, out, p.preview.as_ref()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -368,7 +440,8 @@ struct DustArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetFilm {
-    photo: Option<String>,
+    #[serde(rename = "photo")]
+    _photo: Option<Value>,
     #[serde(rename = "negative")]
     _negative: Option<Value>,
     #[serde(rename = "print")]
@@ -380,7 +453,14 @@ struct SetFilm {
     grain: Option<GrainArgs>,
     blur: Option<f64>,
     dust: Option<DustArgs>,
-    preview: Option<Value>,
+    #[serde(rename = "preview")]
+    _preview: Option<Value>,
+    #[serde(rename = "if_state")]
+    _if_state: Option<Value>,
+    #[serde(rename = "watch")]
+    _watch: Option<Value>,
+    #[serde(rename = "label")]
+    _label: Option<Value>,
 }
 
 fn kind_name(kind: StockKind) -> &'static str {
@@ -413,7 +493,7 @@ fn stock_id(stocks: &[Stock], kind: StockKind, wanted: &str) -> Result<String, S
     let named: Vec<&&Stock> = of_kind.iter().filter(|s| [s.name.clone(), s.label(), s.id.rsplit('/').next().unwrap_or_default().to_string()].iter().any(|n| n.to_lowercase() == w)).collect();
     match named.as_slice() {
         [one] => Ok(one.id.clone()),
-        [] => Err(format!("unknown {} stock \"{wanted}\"; close: {}. catalog stocks lists ids", kind_name(kind), close(wanted, of_kind.iter().map(|s| s.id.as_str())))),
+        [] => Err(format!("unknown {} stock \"{wanted}\"; close: {}. guide film lists ids", kind_name(kind), close(wanted, of_kind.iter().map(|s| s.id.as_str())))),
         many => Err(format!("\"{wanted}\" names several {} stocks: {}; give the id", kind_name(kind), many.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "))),
     }
 }
@@ -429,18 +509,34 @@ fn stock_field(raw: Option<&Value>, stocks: &[Stock], kind: StockKind) -> Result
     }
 }
 
-pub async fn set_film(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+/// A film look worked out from set_film's fields on top of `film`, without saving it.
+pub struct FilmChange {
+    pub film: FilmSettings,
+    pub label: String,
+    pub clamped: Vec<String>,
+    pub off: bool,
+    /// The stocks were chosen for the agent, so the answer names them.
+    pub defaulted: bool,
+}
+
+/// A film object given inside another request (an edit's film beside its values, a trial): only film fields, so a
+/// photo, guard or label there is refused rather than quietly ignored.
+pub fn bare_film(film: &Value) -> Result<(), String> {
+    let Value::Object(fields) = film else { return Err("film is an object of film fields".into()) };
+    match fields.keys().find(|k| ["photo", "preview", "if_state", "watch", "label", "values"].contains(&k.as_str())) {
+        Some(key) => Err(format!("{key} goes outside film, not inside it")),
+        None => Ok(()),
+    }
+}
+
+pub fn film_change(value: &Value, film: Option<&FilmSettings>, stocks: &[Stock]) -> Result<FilmChange, String> {
     // why: serde reads a null as an absent field, and null here means "no stock"
-    let stock_args = ["negative", "print", "utility"].map(|k| value.get(k).cloned());
-    let p: SetFilm = args(value)?;
-    let stocks = driver.read(cx, |a, _| a.stocks.clone()).ok_or(GONE)?;
-    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
-    let film = held.read(driver, cx, |e| e.film.cloned()).ok_or(NO_PHOTO)?;
-    let [negative, print, utility] = stock_args;
-    let negative = stock_field(negative.as_ref(), &stocks, StockKind::Negative)?;
-    let print = stock_field(print.as_ref(), &stocks, StockKind::Print)?;
-    let utility = stock_field(utility.as_ref(), &stocks, StockKind::Utility)?;
-    let mut f = film.as_ref().map(FilmSettings::normalized).unwrap_or_default();
+    let [negative, print, utility] = ["negative", "print", "utility"].map(|k| value.get(k).cloned());
+    let p: SetFilm = args(value.clone())?;
+    let negative = stock_field(negative.as_ref(), stocks, StockKind::Negative)?;
+    let print = stock_field(print.as_ref(), stocks, StockKind::Print)?;
+    let utility = stock_field(utility.as_ref(), stocks, StockKind::Utility)?;
+    let mut f = film.map(FilmSettings::normalized).unwrap_or_default();
     let mut changed: Vec<&str> = Vec::new();
     let mut clamped: Vec<String> = Vec::new();
     let mut fit = |name: &str, v: f64, min: f64, max: f64| {
@@ -547,18 +643,94 @@ pub async fn set_film(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: 
         }
     }
     let label = if off { "Film off".to_string() } else if parts.is_empty() { "Film look".to_string() } else { named(&parts) };
-    let key = next_key("film");
-    held.set_film(driver, cx, f.clone(), &label, &key).await?;
-    let note = (!off && !f.is_on()).then(|| format!("film is off: no default stocks are installed in {}", crate::stocks::folder().display()));
-    let output = Output::json(strip(json!({"photo": held.id(driver, cx), "film": film_summary(Some(&f)), "clamped": clamped, "note": note})));
-    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
+    let defaulted = negative.is_none() && print.is_none() && !film.is_some_and(FilmSettings::is_on) && f.is_on();
+    Ok(FilmChange { film: f, label, clamped, off, defaulted })
+}
+
+pub async fn set_film(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+    let stocks = driver.read(cx, |a, _| a.stocks.clone()).ok_or(GONE)?;
+    let photo = value["photo"].as_str().map(str::to_string);
+    let preview = value.get("preview").cloned();
+    let watch = effect::watching(serde_json::from_value(value["watch"].clone()).map_err(|_| "watch is a list of measures")?)?;
+    film_change(&value, None, &stocks)?;
+    let held = hub.hold(driver, cx, photo.as_deref()).await?;
+    held.expect(value["if_state"].as_str().map(str::to_string));
+    let before = State::now(&held, driver, cx)?;
+    let change = film_change(&value, before.film.as_ref(), &stocks)?;
+    let f = change.film;
+    let label = value["label"].as_str().map_or(change.label, str::to_string);
+    held.set_film(driver, cx, f.clone(), &label, &next_key("film")).await?;
+    let note = (!change.off && !f.is_on()).then(|| format!("film is off: no default stocks are installed in {}", crate::stocks::folder().display()));
+    let out = strip(json!({"photo": photo.is_none().then(|| held.id(driver, cx)), "film": change.defaulted.then(|| film_summary(Some(&f))), "clamped": change.clamped, "note": note}));
+    let out = effect::report(hub, &held, driver, cx, &before, out, &watch).await;
+    look::attach(&held, driver, cx, out, preview.as_ref()).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Change {
+    photo: Option<String>,
+    values: Option<Map<String, Value>>,
+    film: Option<Value>,
+    curve: Option<Value>,
+    label: Option<String>,
+    preview: Option<Value>,
+    if_state: Option<String>,
+    watch: Option<Vec<String>>,
+}
+
+/// Controls, the tone curve and film changed together, as one undo step.
+pub async fn change(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
+    let p: Change = args(value)?;
+    if let Some(values) = &p.values {
+        known(values)?;
+    }
+    let stocks = driver.read(cx, |a, _| a.stocks.clone()).ok_or(GONE)?;
+    if let Some(film) = &p.film {
+        bare_film(film)?;
+        film_change(film, None, &stocks)?;
+    }
+    if let Some(shape) = &p.curve {
+        super::curve::check(shape)?;
+    }
+    let watch = effect::watching(p.watch.clone())?;
+    let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    held.expect(p.if_state.clone());
+    let before = State::now(&held, driver, cx)?;
+    let facts = held.read(driver, cx, |e| e.facts.cloned()).flatten().ok_or(NO_PHOTO)?;
+    let (settings, clamped) = match &p.values {
+        Some(values) => with_values(&before.settings, values, &facts)?,
+        None => (before.settings.clone(), Vec::new()),
+    };
+    let curved = p.curve.as_ref().map(|shape| super::curve::with_curve(&settings, shape, &facts)).transpose()?;
+    let film = p.film.as_ref().map(|f| film_change(f, before.film.as_ref(), &stocks)).transpose()?;
+    let ids: Vec<String> = p.values.iter().flat_map(|v| v.keys().cloned()).collect();
+    let parts: Vec<String> = [(!ids.is_empty()).then(|| controls_label(&ids)), curved.as_ref().map(|c| c.label.clone()), film.as_ref().map(|f| f.label.clone())].into_iter().flatten().collect();
+    let label = p.label.unwrap_or_else(|| named(&parts));
+    let (settings, tally) = match curved {
+        Some(c) => (c.settings, c.tally),
+        None => (settings, super::curve::Tally::default()),
+    };
+    if film.is_some() || settings != before.settings {
+        let next = film.as_ref().map_or_else(|| before.film.clone(), |f| Some(f.film.clone()));
+        held.restore(driver, cx, settings, next, &label, &next_key("edit")).await?;
+    }
+    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)))).ok_or(NO_PHOTO)?;
+    let relative = |id: &String| p.values.as_ref().is_some_and(|v| v[id].as_str().is_some_and(|t| t.trim().starts_with(['+', '-'])));
+    let mut set: Map<String, Value> = ids.iter().filter(|id| relative(id)).filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
+    set.extend(tally.set);
+    let clamped: Vec<String> = clamped.into_iter().chain(tally.clamped).chain(film.iter().flat_map(|f| f.clamped.clone())).collect();
+    let defaulted = film.as_ref().filter(|f| f.defaulted).map(|f| film_summary(Some(&f.film)));
+    let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "set": set, "film": defaulted, "clamped": clamped}));
+    let out = effect::report(hub, &held, driver, cx, &before, out, &watch).await;
+    look::attach(&held, driver, cx, out, p.preview.as_ref()).await
 }
 
 const EDITING: [&str; 8] = ["develop.", "crop.", "mask.", "spot.", "redeye.", "pointColor.", "geometry.", "curve."];
 const ORIENT: [&str; 4] = ["photo.rotateLeft", "photo.rotateRight", "photo.flipHorizontal", "photo.flipVertical"];
-// why: the app's LightCraft session holds only the open photo and keeps no clipboard, catalog or undo stack of its
-// own (history lives in Develop), so these do nothing useful or fight the app's state
-const HELD: [&str; 9] = [
+// why: the app's LightCraft session holds only the open photo and keeps no clipboard, catalog, undo stack or saved
+// curve presets of its own (history lives in Develop), so these do nothing useful or fight the app's state
+const HELD: [&str; 11] = [
     "develop.copy",
     "develop.paste",
     "develop.pastePrevious",
@@ -568,6 +740,8 @@ const HELD: [&str; 9] = [
     "develop.beginInteraction",
     "develop.endInteraction",
     "develop.cancelInteraction",
+    "curve.savePreset",
+    "curve.deletePreset",
 ];
 
 fn editing(id: &str) -> bool {
@@ -579,11 +753,13 @@ fn refuse(name: &str) -> Option<String> {
         return None;
     }
     Some(if name.starts_with("edit.") || name.starts_with("history.") {
-        "use the history tool for undo, redo and steps".into()
+        "use edit action undo, redo or go_to".into()
     } else if ["photo.rate", "photo.flag", "photo.pick", "photo.reject", "photo.unflag", "photo.label", "photo.cycleFlag"].iter().any(|p| name.starts_with(p)) || name.contains("Rating") || name.contains("Flag") {
-        "use set_flags for flags, ratings and labels".into()
+        "use photos action flags for flags, ratings and labels".into()
     } else if name.starts_with("export.") {
-        "use the export tool".into()
+        "use photos action export".into()
+    } else if name == "curve.savePreset" || name == "curve.deletePreset" {
+        "a curve is kept as the user's profile: profiles save {name, groups: [\"toneCurve\"]} or profiles delete, only when the user asks".into()
     } else {
         format!("{name} isn't an editing command; command runs develop.*, crop.*, mask.*, spot.*, redeye.*, pointColor.*, geometry.*, curve.* and photo rotate/flip on the open photo")
     })
@@ -596,6 +772,8 @@ struct Command {
     name: String,
     params: Option<Value>,
     preview: Option<Value>,
+    if_state: Option<String>,
+    watch: Option<Vec<String>>,
 }
 
 pub async fn command(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
@@ -603,15 +781,27 @@ pub async fn command(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: V
     let name = p.name.trim().to_string();
     let catalog = driver.read(cx, |a, cx| a.develop.read(cx).command_catalog()).ok_or(GONE)?;
     if !catalog.iter().any(|(id, _)| *id == name) {
-        return Err(format!("unknown command {name}; close: {}. catalog commands lists them", close(&name, catalog.iter().map(|(id, _)| *id).filter(|id| editing(id)))));
+        return Err(format!("unknown command {name}; close: {}. guide schema command.<prefix> lists them", close(&name, catalog.iter().map(|(id, _)| *id).filter(|id| editing(id)))));
     }
     if let Some(why) = refuse(&name) {
         return Err(why);
     }
     let params = p.params.unwrap_or_else(|| json!({}));
-    let label = driver.read(cx, |a, cx| a.develop.read(cx).command_label(&name)).flatten().map_or_else(|| name.clone(), sentence);
+    let Value::Object(fields) = &params else { return Err("params is an object".into()) };
+    // why: LightCraft's commands can address other photos of its catalog by `ids`; here a command acts on the one
+    // photo the call names, and the call's own guards belong outside params, so either inside is refused
+    if let Some(key) = fields.keys().find(|k| ["ids", "photo", "photos", "if_state", "watch", "request_id", "retry"].contains(&k.as_str())) {
+        return Err(format!("{key} isn't a command param here: name the photo with edit photo, and put guards beside action, outside args"));
+    }
+    let label = match super::curve::command_label(&name, &params) {
+        Some(label) => label,
+        None => driver.read(cx, |a, cx| a.develop.read(cx).command_label(&name)).flatten().map_or_else(|| name.clone(), sentence),
+    };
     let key = next_key("command");
+    let watch = effect::watching(p.watch.clone())?;
     let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    held.expect(p.if_state.clone());
+    let before = State::now(&held, driver, cx)?;
     let (result, _) = held.command(driver, cx, &name, params.clone(), &label, &key).await?;
     if held.is_ui() && name.starts_with("mask.") {
         let active = if name == "mask.select" { Some(params["id"].as_u64()) } else { result.get("activeMask").map(Value::as_u64) };
@@ -626,8 +816,9 @@ pub async fn command(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: V
             });
         }
     }
-    let output = Output::json(json!({"photo": held.id(driver, cx), "result": result}));
-    look::attach(&held, driver, cx, output, p.preview.as_ref()).await
+    let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "result": result}));
+    let out = effect::report(hub, &held, driver, cx, &before, out, &watch).await;
+    look::attach(&held, driver, cx, out, p.preview.as_ref()).await
 }
 
 #[derive(Deserialize)]
@@ -659,7 +850,7 @@ pub fn catalog(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
             }
             let mut out = json!(sections);
             if filter.is_none() || filter.as_deref().is_some_and(|f| f.starts_with("wb")) {
-                out["note"] = json!("wb.temp is kelvin on raw photos and -100..100 on rendered ones; values as set_controls takes them");
+                out["note"] = json!("wb.temp is kelvin on raw photos and -100..100 on rendered ones; values as edit takes them");
             }
             Ok(Output::json(out))
         }
@@ -702,7 +893,7 @@ pub fn catalog(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
                 return Err(format!("no stock matches \"{}\"", filter.unwrap_or_default()));
             }
             out.insert("default".into(), json!({"negative": DEFAULT_NEGATIVE, "print": DEFAULT_PRINT}));
-            out.insert("note".into(), json!("set_film takes these ids with or without their Negative/, Print/, Utility/ folder"));
+            out.insert("note".into(), json!("edit film takes these ids with or without their Negative/, Print/, Utility/ folder"));
             Ok(Output::json(Value::Object(out)))
         }
         other => Err(format!("no catalog {other}; kinds: controls, commands, stocks")),
@@ -715,6 +906,8 @@ struct History {
     photo: Option<String>,
     action: String,
     step: Option<usize>,
+    if_state: Option<String>,
+    watch: Option<Vec<String>>,
 }
 
 fn history_at(held: &Held, driver: &Driver, cx: &mut AsyncApp) -> Option<(usize, usize, String)> {
@@ -723,7 +916,10 @@ fn history_at(held: &Held, driver: &Driver, cx: &mut AsyncApp) -> Option<(usize,
 
 pub async fn history(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: History = args(value)?;
+    let watch = effect::watching(p.watch.clone())?;
     let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    held.expect(p.if_state.clone());
+    let before = State::now(&held, driver, cx)?;
     let (step, steps, _) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
     let target = match p.action.as_str() {
         "list" => {
@@ -750,7 +946,8 @@ pub async fn history(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: V
     };
     held.go_to(driver, cx, target).await?;
     let (step, steps, label) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
-    Ok(Output::json(json!({"photo": held.id(driver, cx), "step": step, "steps": steps, "label": label})))
+    let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "step": step, "steps": steps, "label": label}));
+    Ok(Output::json(effect::report(hub, &held, driver, cx, &before, out, &watch).await))
 }
 
 #[derive(Deserialize)]
@@ -768,17 +965,36 @@ fn profile_list(profiles: &[store::Profile]) -> Vec<Value> {
     profiles.iter().map(|p| json!({"id": p.id, "name": p.name, "groups": p.groups})).collect()
 }
 
-/// The index of the profile an agent named, by id or (case-insensitive) name.
+/// The index of the profile an agent named: by its id exactly, or by its name (in any case), one or the other.
 fn find_profile(profiles: &[store::Profile], id: Option<&str>, name: Option<&str>) -> Result<usize, String> {
-    let wanted = id.or(name).ok_or("give the profile's id or name; profiles list gives them")?;
-    profiles
-        .iter()
-        .position(|p| p.id == wanted || p.name.eq_ignore_ascii_case(wanted.trim()))
-        .ok_or_else(|| if profiles.is_empty() { "no profiles are saved; save one first".into() } else { format!("no profile {wanted}; saved: {}", profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")) })
+    let found = match (id, name) {
+        (Some(id), None) => profiles.iter().position(|p| p.id == id),
+        (None, Some(name)) => profiles.iter().position(|p| p.name.eq_ignore_ascii_case(name.trim())),
+        (Some(_), Some(_)) => return Err("give the profile's id or its name, not both".into()),
+        (None, None) => return Err("give the profile's id or name; profiles action list gives them".into()),
+    };
+    found.ok_or_else(|| if profiles.is_empty() { "no profiles are saved".into() } else { format!("no profile {}; saved: {}", id.or(name).unwrap_or_default(), profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")) })
+}
+
+/// Refuses the fields `action` doesn't read, so a profile call never quietly does less than it was asked.
+fn profile_fields(p: &Profiles) -> Result<(), String> {
+    let given = [("photo", p.photo.is_some()), ("id", p.id.is_some()), ("name", p.name.is_some()), ("groups", p.groups.is_some()), ("amount", p.amount.is_some())];
+    let reads: &[&str] = match p.action.as_str() {
+        "list" => &[],
+        "save" => &["photo", "name", "groups"],
+        "apply" => &["photo", "id", "name", "amount"],
+        "delete" => &["id", "name"],
+        other => return Err(format!("unknown action {other}; list, save, apply, delete")),
+    };
+    match given.iter().find(|(field, set)| *set && !reads.contains(field)) {
+        Some((field, _)) => Err(format!("profiles {} doesn't read {field}", p.action)),
+        None => Ok(()),
+    }
 }
 
 pub async fn profiles(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Profiles = args(value)?;
+    profile_fields(&p)?;
     match p.action.as_str() {
         "list" => {
             let (list, applied) = driver
@@ -816,9 +1032,12 @@ pub async fn profiles(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: 
             Ok(Output::json(strip(saved)))
         }
         "apply" => {
-            let amount = p.amount.unwrap_or(100.0).clamp(0.0, 200.0);
+            let amount = p.amount.unwrap_or(100.0);
+            if !(0.0..=200.0).contains(&amount) {
+                return Err("amount is 0-200 (%)".into());
+            }
             let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
-            held.read(driver, cx, |_| ()).ok_or(NO_PHOTO)?;
+            let before = State::now(&held, driver, cx)?;
             let profile = driver
                 .act(cx, |a, _| {
                     let list = store::shown(&mut a.rail);
@@ -826,8 +1045,8 @@ pub async fn profiles(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: 
                 })
                 .ok_or(GONE)??;
             held.apply_profile(driver, cx, &profile, amount / 100.0).await?;
-            let edit = held.read(driver, cx, |e| describe(&e, false)).unwrap_or_default();
-            Ok(Output::json(json!({"photo": held.id(driver, cx), "applied": profile.name, "amount": num(amount, 1), "edit": edit})))
+            let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "applied": profile.name, "amount": num(amount, 1)}));
+            Ok(Output::json(effect::report(hub, &held, driver, cx, &before, out, &[]).await))
         }
         "delete" => {
             let deleted = driver
@@ -877,21 +1096,45 @@ struct Snapshots {
     photo: Option<String>,
     action: String,
     name: Option<String>,
+    if_state: Option<String>,
+    watch: Option<Vec<String>>,
 }
 
 fn snapshot_list(list: &[Snapshot]) -> Vec<Value> {
     list.iter().map(|s| json!([s.name, s.at.chars().take(19).collect::<String>()])).collect()
 }
 
+/// Where a photo's snapshots are filed: its canonical path.
+fn snapshot_key(driver: &Driver, cx: &mut AsyncApp, id: &str) -> Result<String, String> {
+    let path = driver.read(cx, |a, cx| a.library.read(cx).record(id).map(|r| r.file.path.clone())).flatten().ok_or(NO_PHOTO)?;
+    Ok(std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().to_string())
+}
+
+/// A photo's snapshot by name: its settings and film.
+pub fn snapshot(driver: &Driver, cx: &mut AsyncApp, id: &str, name: &str) -> Result<(Value, Option<FilmSettings>), String> {
+    let photo = snapshot_key(driver, cx, id)?;
+    let all = load_snapshots();
+    let list = all.get(&photo).map_or(&[][..], Vec::as_slice);
+    let snap = list.iter().find(|s| s.name == name).ok_or_else(|| format!("no snapshot {name}; saved: {}", list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+    Ok((snap.settings.clone(), snap.film.as_ref().and_then(FilmSettings::of)))
+}
+
 pub async fn snapshots(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: Snapshots = args(value)?;
+    let watch = effect::watching(p.watch.clone())?;
     let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
+    held.expect(p.if_state.clone());
     let (id, settings, film) = held.read(driver, cx, |e| (e.id.to_string(), e.settings.clone(), e.film.cloned())).ok_or(NO_PHOTO)?;
-    let path = driver.read(cx, |a, cx| a.library.read(cx).record(&id).map(|r| r.file.path.clone())).flatten().ok_or(NO_PHOTO)?;
-    let photo = std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().to_string();
+    let photo = snapshot_key(driver, cx, &id)?;
     let mut all = load_snapshots();
     let name = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
     let list = all.entry(photo.clone()).or_default();
+    if p.action != "restore" && !watch.is_empty() {
+        return Err("watch reads the photo after a change, and snapshot list, save and delete don't change it".into());
+    }
+    if matches!(p.action.as_str(), "save" | "delete") {
+        held.ready(driver, cx)?;
+    }
     match p.action.as_str() {
         "list" => Ok(Output::json(json!({"snapshots": snapshot_list(list)}))),
         "save" => {
@@ -903,14 +1146,16 @@ pub async fn snapshots(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value:
             Ok(Output::json(json!({"saved": name, "snapshots": names})))
         }
         "restore" => {
-            let name = name.ok_or("restore needs a name; snapshots list gives them")?;
+            let name = name.ok_or("snapshot.restore needs args.name; status part snapshots lists them")?;
             let snap = list.iter().find(|s| s.name == name).cloned().ok_or_else(|| format!("no snapshot {name}; saved: {}", list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+            let before = State { settings, film };
             let film = snap.film.as_ref().and_then(FilmSettings::of);
             let label = format!("Snapshot {name}");
             let key = next_key("snapshot");
             held.restore(driver, cx, snap.settings, film, &label, &key).await?;
             let (step, _, _) = history_at(&held, driver, cx).ok_or(NO_PHOTO)?;
-            Ok(Output::json(json!({"photo": id, "restored": name, "step": step})))
+            let out = strip(json!({"photo": p.photo.is_none().then_some(id), "restored": name, "step": step}));
+            Ok(Output::json(effect::report(hub, &held, driver, cx, &before, out, &watch).await))
         }
         "delete" => {
             let name = name.ok_or("delete needs a name")?;

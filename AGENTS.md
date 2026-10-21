@@ -5,7 +5,8 @@ Filmlab is a macOS desktop app: a GPUI interface in `native/` over the Rust engi
 - `cd native && cargo run --release` starts the app.
 - `scripts/check.sh` runs clippy with warnings denied and the tests for both crates. Run it while you work; the pre-push hook runs it.
 - `scripts/fixtures.sh` downloads the raw photo the engine's parity test needs.
-- `native/scripts/e2e.sh <photo folder>` drives the real app end to end; `node native/scripts/mcp_e2e.mjs <photo folder>` exercises the MCP server against a release build.
+- `native/scripts/e2e.sh <photo folder>` drives the real app end to end; `node native/scripts/mcp_e2e.mjs <photo folder>` exercises the MCP server against a release build, including a sweep that checks every control changes the photo.
+- `node native/scripts/mcp.mjs <tool> '<json args>'` calls one MCP tool on a running app (`FILMLAB_MCP_PORT` picks it). Verify a rendering change with `look` mode `compare`: it diffs two states of a photo, or tries controls without saving, and says what moved, where and by how much.
 - `native/scripts/bundle.sh` builds `Filmlab.app`, a zip and a DMG.
 - `scripts/setup.sh` installs the Git hooks after `git init`.
 

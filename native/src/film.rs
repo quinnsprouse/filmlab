@@ -191,6 +191,28 @@ impl FilmSettings {
     }
 }
 
+/// The film a look applied at `t` (1 = fully) leaves, the way LightCraft blends a look's other settings: the stocks
+/// and switches from whichever side `t` is nearer, the texture's amounts in between, an unfilmed photo having none.
+pub fn blend(target: Option<&FilmSettings>, source: Option<&FilmSettings>, t: f64) -> Option<FilmSettings> {
+    let on = |f: Option<&FilmSettings>| f.filter(|f| f.is_on()).map(FilmSettings::normalized);
+    let (a, b) = (on(target), on(source));
+    if (t - 1.0).abs() < 1e-9 {
+        return b;
+    }
+    let mut out = if t >= 0.5 { b.clone() } else { a.clone() }?;
+    let bare = |f: &FilmSettings| FilmSettings { halation: Halation { amount: 0.0, ..f.halation }, grain: Grain { amount: 0.0, ..f.grain }, blur: 0.0, ..f.clone() };
+    let (from, to) = (a.unwrap_or_else(|| bare(&out)), b.unwrap_or_else(|| bare(&out)));
+    let mix = |x: f64, y: f64, lo: f64, hi: f64| (x + (y - x) * t).clamp(lo, hi);
+    out.halation.amount = mix(from.halation.amount, to.halation.amount, 0.0, 2.0);
+    out.halation.radius = mix(from.halation.radius, to.halation.radius, 1.0, 10.0);
+    out.grain.amount = mix(from.grain.amount, to.grain.amount, 0.0, 1.0);
+    out.grain.size = mix(from.grain.size, to.grain.size, 0.0, 4.0);
+    out.grain.softness = mix(from.grain.softness, to.grain.softness, 0.0, 1.0);
+    out.grain.defocus = mix(from.grain.defocus, to.grain.defocus, 0.5, 1.0);
+    out.blur = mix(from.blur, to.blur, 0.0, 0.2);
+    Some(out)
+}
+
 pub fn render_film(film: Option<&FilmSettings>) -> Option<FilmSettings> {
     film.filter(|f| f.is_on()).map(FilmSettings::normalized)
 }

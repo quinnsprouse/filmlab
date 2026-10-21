@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -8,23 +8,30 @@ use std::time::{Duration, Instant};
 use filmlab_engine::core::{self, Commands, Engine};
 use gpui_kit::{AppContext, AsyncApp};
 use serde_json::Value;
-use tokio::sync::{Mutex as Queue, OwnedMutexGuard};
+use tokio::sync::{Mutex as Queue, OwnedMutexGuard, Semaphore, SemaphorePermit};
 
 use crate::develop::plans::{Level, PREVIEW_EDGE};
 use crate::develop::{Applied, RenderJob, Step};
 use crate::film::{FilmSettings, render_film};
 use crate::library::{PhotoRecord, PhotoState};
+use crate::mcp::tools::Output;
+use crate::mcp::tools::look::Shot;
 use crate::ui::driver::Driver;
 
-/// How many photos agents may hold open off screen at once, and how long an idle one (or its decodes) lives.
+/// How many photos agents may hold open off screen at once, how many of those keep their decodes, and how long an
+/// idle one (or its decodes) lives. A session without its decodes costs little and keeps the photo's history.
+const SESSIONS: usize = 16;
 const LIVE: usize = 4;
-const IDLE: Duration = Duration::from_secs(60);
+const IDLE: Duration = Duration::from_secs(600);
 const FULL_IDLE: Duration = Duration::from_secs(10);
 const PREVIEW_IDLE: Duration = Duration::from_secs(10);
 const SWEEP: Duration = Duration::from_secs(5);
 const COALESCE: Duration = Duration::from_millis(900);
+const KEPT: usize = 24;
+/// How many photos calls on several photos work on at once, across every caller: as many as keep their decodes.
+const AT_ONCE: usize = LIVE;
 const GONE: &str = "Filmlab's window is gone";
-pub const NO_PHOTO: &str = "no photo is open; open_photo first, or pass photo";
+pub const NO_PHOTO: &str = "no photo is open; photos open first, or pass photo";
 const NO_PIXELS: &str = "pixels aren't available";
 
 fn source_key(id: &str, level: Level) -> String {
@@ -127,20 +134,36 @@ impl Session {
 
     // why: port of Develop::apply_profile; re-applying the same profile at the same step starts from the settings it
     // first saw, so the amount replaces the earlier application
-    fn apply_profile(&mut self, profile_id: &str, partial: &Value, amount: f64, label: &str, film: Option<FilmSettings>) -> Result<(), String> {
-        let before = match &self.applied {
-            Some(a) if a.profile_id == profile_id && a.step == self.cursor => a.before.clone(),
-            _ => self.settings.clone(),
+    fn apply_profile(&mut self, profile_id: &str, partial: &Value, amount: f64, label: &str, film: Option<Option<FilmSettings>>) -> Result<(), String> {
+        let (before, before_film) = match &self.applied {
+            Some(a) if a.profile_id == profile_id && a.step == self.cursor => (a.before.clone(), a.before_film.clone()),
+            _ => (self.settings.clone(), self.film.clone()),
         };
         let next: Value = serde_json::from_str(&core::apply_profile(&before.to_string(), &partial.to_string(), amount)?).map_err(|e| e.to_string())?;
-        let film = film.or_else(|| self.film.clone());
-        self.commit(next, label, &format!("profile:{profile_id}"), film);
-        self.applied = Some(Applied { profile_id: profile_id.to_string(), before, step: self.cursor, photo_id: Some(self.id.clone()) });
+        let applied = film.map_or_else(|| before_film.clone(), |film| crate::film::blend(before_film.as_ref(), film.as_ref(), amount));
+        self.commit(next, label, &format!("profile:{profile_id}"), applied);
+        self.applied = Some(Applied { profile_id: profile_id.to_string(), before, before_film, step: self.cursor, photo_id: Some(self.id.clone()) });
         Ok(())
     }
 
     fn small(&self) -> bool {
         long_edge(&self.facts) <= PREVIEW_EDGE
+    }
+
+    fn decoded(&self) -> bool {
+        self.preview || self.full
+    }
+
+    /// Frees the session's decodes at `levels` (the full one always goes); the next call decodes again.
+    fn let_go(&mut self, levels: &[Level]) {
+        self.full = false;
+        self.preview &= !levels.contains(&Level::Preview);
+        if let Ok(mut engine) = self.engine.lock() {
+            for level in levels {
+                engine.release(&source_key(&self.id, *level));
+            }
+        }
+        crate::perf::give_back();
     }
 }
 
@@ -157,13 +180,18 @@ pub struct Edit<'a> {
 
 impl Edit<'_> {
     pub fn values(&self) -> HashMap<String, f64> {
-        core::control_values(&self.settings.to_string()).ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+        control_values(self.settings)
     }
 }
 
-/// What a call works on: the photo open in the window (through Develop), or an agent's own session of another photo.
+pub fn control_values(settings: &Value) -> HashMap<String, f64> {
+    core::control_values(&settings.to_string()).ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+}
+
+/// What a call works on: the photo open in the window when the call took it (through Develop), or an agent's own
+/// session of another photo.
 pub enum On {
-    Ui,
+    Ui(Option<String>),
     Agent(Rc<RefCell<Session>>),
 }
 
@@ -173,6 +201,17 @@ pub struct Held {
     pub on: On,
     _photo: Option<OwnedMutexGuard<()>>,
     _ui: Option<Viewing>,
+    expected: RefCell<Option<String>>,
+}
+
+/// A short name for exactly one photo's edit, for a change to require that it hasn't moved on since (`if_state`).
+pub fn digest(id: &str, settings: &Value, film: Option<&FilmSettings>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    settings.to_string().hash(&mut hasher);
+    render_film(film).map(|f| f.to_value().to_string()).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// The window's lock, held by calls that drive what the user sees.
@@ -212,7 +251,7 @@ fn persist(driver: &Driver, cx: &mut AsyncApp, s: &Session) -> Result<(), String
         .act(cx, move |a, cx| {
             a.library.update(cx, |l, cx| {
                 if l.folder.as_ref() != Some(&folder) {
-                    return Err(format!("the library moved to another folder, so {id} wasn't saved; open_folder {} again", folder.display()));
+                    return Err(format!("the library moved to another folder, so {id} wasn't saved; photos folder {} again", folder.display()));
                 }
                 let state = l.record(&id).and_then(|r| r.state.clone()).ok_or_else(|| format!("{id} left the library"))?;
                 l.persist(&id, PhotoState { settings, film, ..state }, cx);
@@ -224,20 +263,62 @@ fn persist(driver: &Driver, cx: &mut AsyncApp, s: &Session) -> Result<(), String
 
 impl Held {
     pub fn is_ui(&self) -> bool {
-        matches!(self.on, On::Ui)
+        matches!(self.on, On::Ui(_))
     }
 
     /// The id of the photo this call acts on.
-    pub fn id(&self, driver: &Driver, cx: &mut AsyncApp) -> Option<String> {
+    pub fn id(&self, _driver: &Driver, _cx: &mut AsyncApp) -> Option<String> {
         match &self.on {
-            On::Ui => ui_photo(driver, cx),
+            On::Ui(id) => id.clone(),
             On::Agent(s) => Some(s.borrow().id.clone()),
+        }
+    }
+
+    // why: the user can open another photo while a call on the open one waits on a render or a solve; the call's
+    // reads and changes stop there rather than land on the photo now in the window
+    fn still_shown(&self, driver: &Driver, cx: &mut AsyncApp) -> Result<(), String> {
+        let On::Ui(taken) = &self.on else { return Ok(()) };
+        let taken = taken.as_deref().ok_or(NO_PHOTO)?;
+        if ui_photo(driver, cx).as_deref() == Some(taken) {
+            return Ok(());
+        }
+        Err(format!("the window moved off {taken} during this call, so nothing more was changed; call again with photo={taken}"))
+    }
+
+    /// Holds this call's changes to `state`: each fails, changing nothing, if the photo is then in any other state. Its
+    /// own changes move the expectation along, so a call that changes the photo twice isn't stopped by itself.
+    pub fn expect(&self, state: Option<String>) {
+        *self.expected.borrow_mut() = state;
+    }
+
+    fn digest_now(&self, driver: &Driver, cx: &mut AsyncApp) -> Option<String> {
+        self.read(driver, cx, |e| digest(e.id, e.settings, e.film))
+    }
+
+    // why: checked in the same main-thread turn as the change it guards, so nothing lands between the two
+    pub fn ready(&self, driver: &Driver, cx: &mut AsyncApp) -> Result<(), String> {
+        self.still_shown(driver, cx)?;
+        let Some(expected) = self.expected.borrow().clone() else { return Ok(()) };
+        let now = self.digest_now(driver, cx).ok_or(NO_PHOTO)?;
+        if now == expected {
+            return Ok(());
+        }
+        Err(format!("conflict: the photo is no longer in state {expected} (now {now}), so nothing was changed; read it again"))
+    }
+
+    fn committed(&self, driver: &Driver, cx: &mut AsyncApp) {
+        if self.expected.borrow().is_some() {
+            let now = self.digest_now(driver, cx);
+            *self.expected.borrow_mut() = now;
         }
     }
 
     pub fn read<R>(&self, driver: &Driver, cx: &mut AsyncApp, f: impl FnOnce(Edit<'_>) -> R) -> Option<R> {
         match &self.on {
-            On::Ui => develop_edit(driver, cx, f),
+            On::Ui(_) => {
+                self.still_shown(driver, cx).ok()?;
+                develop_edit(driver, cx, f)
+            }
             On::Agent(s) => Some(session_edit(&s.borrow(), f)),
         }
     }
@@ -249,10 +330,13 @@ impl Held {
 
     /// Runs a LightCraft command as one history step when it changes the photo; returns its result and whether it did.
     pub async fn command(&self, driver: &Driver, cx: &mut AsyncApp, command: &str, params: Value, label: &str, key: &str) -> Result<(Value, bool), String> {
+        self.ready(driver, cx)?;
         let s = match &self.on {
-            On::Ui => {
+            On::Ui(_) => {
                 let (command, label, key) = (command.to_string(), label.to_string(), key.to_string());
-                return driver.develop(cx, move |d, cx| d.try_command(&command, params, &label, &key, cx)).ok_or(GONE)?;
+                let out = driver.develop(cx, move |d, cx| d.try_command(&command, params, &label, &key, cx)).ok_or(GONE)?;
+                self.committed(driver, cx);
+                return out;
             }
             On::Agent(s) => s.clone(),
         };
@@ -263,6 +347,7 @@ impl Held {
             Err(e) if e.contains(NO_PIXELS) => {
                 let path = s.borrow().path.clone();
                 let bytes = cx.background_spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()) }).await?;
+                self.ready(driver, cx)?;
                 let mut session = s.borrow_mut();
                 session.reopen()?;
                 session.commands.attach(bytes);
@@ -273,20 +358,24 @@ impl Held {
             other => other,
         }?;
         if out.1 {
+            self.committed(driver, cx);
             self.changed(driver, cx).await?;
         }
         Ok(out)
     }
 
     pub async fn set_film(&self, driver: &Driver, cx: &mut AsyncApp, film: FilmSettings, label: &str, key: &str) -> Result<(), String> {
+        self.ready(driver, cx)?;
         match &self.on {
-            On::Ui => {
+            On::Ui(_) => {
                 let (label, key) = (label.to_string(), key.to_string());
                 driver.develop(cx, move |d, cx| d.edit_film(film, &label, &key, cx)).ok_or(GONE)?;
+                self.committed(driver, cx);
             }
             On::Agent(s) => {
                 let settings = s.borrow().settings.clone();
                 s.borrow_mut().commit(settings, label, key, Some(film));
+                self.committed(driver, cx);
                 self.changed(driver, cx).await?;
             }
         }
@@ -294,10 +383,15 @@ impl Held {
     }
 
     pub async fn go_to(&self, driver: &Driver, cx: &mut AsyncApp, index: usize) -> Result<(), String> {
+        self.ready(driver, cx)?;
         match &self.on {
-            On::Ui => driver.develop(cx, |d, cx| d.go_to(index, cx)).ok_or(GONE)?,
+            On::Ui(_) => {
+                driver.develop(cx, |d, cx| d.go_to(index, cx)).ok_or(GONE)?;
+                self.committed(driver, cx);
+            }
             On::Agent(s) => {
                 s.borrow_mut().go_to(index)?;
+                self.committed(driver, cx);
                 self.changed(driver, cx).await?;
             }
         }
@@ -305,10 +399,12 @@ impl Held {
     }
 
     pub async fn restore(&self, driver: &Driver, cx: &mut AsyncApp, settings: Value, film: Option<FilmSettings>, label: &str, key: &str) -> Result<(), String> {
+        self.ready(driver, cx)?;
         match &self.on {
-            On::Ui => {
+            On::Ui(_) => {
                 let (label, key) = (label.to_string(), key.to_string());
                 driver.develop(cx, move |d, cx| d.restore(settings, film, &label, &key, cx)).ok_or(GONE)??;
+                self.committed(driver, cx);
             }
             On::Agent(s) => {
                 {
@@ -317,6 +413,7 @@ impl Held {
                     session.commands.open(&facts, &settings.to_string())?;
                     session.commit(settings, label, key, film);
                 }
+                self.committed(driver, cx);
                 self.changed(driver, cx).await?;
             }
         }
@@ -324,10 +421,11 @@ impl Held {
     }
 
     pub async fn apply_profile(&self, driver: &Driver, cx: &mut AsyncApp, profile: &crate::ui::rail::store::Profile, amount: f64) -> Result<(), String> {
-        let film = profile.film.as_ref().and_then(FilmSettings::of);
+        let film = profile.film_look();
         let label = format!("Profile {}", profile.name);
+        self.ready(driver, cx)?;
         match &self.on {
-            On::Ui => {
+            On::Ui(_) => {
                 let (id, partial) = (profile.id.clone(), profile.partial.clone());
                 driver
                     .act(cx, move |a, cx| {
@@ -336,9 +434,11 @@ impl Held {
                         cx.notify();
                     })
                     .ok_or(GONE)?;
+                self.committed(driver, cx);
             }
             On::Agent(s) => {
                 s.borrow_mut().apply_profile(&profile.id, &profile.partial, amount, &label, film)?;
+                self.committed(driver, cx);
                 self.changed(driver, cx).await?;
             }
         }
@@ -347,8 +447,13 @@ impl Held {
 
     /// What an off-screen render of the photo needs, decoding it first if it isn't yet (`full`: at full size).
     pub async fn render_job(&self, driver: &Driver, cx: &mut AsyncApp, before: bool, full: bool) -> Result<RenderJob, String> {
+        self.still_shown(driver, cx)?;
         let s = match &self.on {
-            On::Ui => return develop_job(driver, cx, before, full).await,
+            On::Ui(_) => {
+                let job = develop_job(driver, cx, before, full).await?;
+                self.still_shown(driver, cx)?;
+                return Ok(job);
+            }
             On::Agent(s) => s.clone(),
         };
         let level = if full && !s.borrow().small() { Level::Full } else { Level::Preview };
@@ -419,6 +524,27 @@ pub struct Hub {
     locks: RefCell<HashMap<String, Arc<Queue<()>>>>,
     sessions: RefCell<Vec<Rc<RefCell<Session>>>>,
     sweeping: Cell<bool>,
+    shots: RefCell<VecDeque<(String, u64, Arc<Shot>)>>,
+    budget: Budget,
+    requests: RefCell<VecDeque<Request>>,
+}
+
+/// A call that named itself with a request id: its arguments, and its answer once it has one.
+struct Request {
+    key: String,
+    body: String,
+    answer: Option<Output>,
+}
+
+/// How many named requests' answers are kept for a repeat.
+const REMEMBERED: usize = 256;
+
+struct Budget(Semaphore);
+
+impl Default for Budget {
+    fn default() -> Budget {
+        Budget(Semaphore::new(AT_ONCE))
+    }
 }
 
 impl Hub {
@@ -436,6 +562,47 @@ impl Hub {
         self.lock_of(id).lock_owned().await
     }
 
+    /// Waits for a turn at the work on several photos, which every caller shares, so two batches don't decode twice
+    /// as many photos as fit; calls on one photo don't take a turn.
+    pub async fn turn(&self) -> Option<SemaphorePermit<'_>> {
+        self.budget.0.acquire().await.ok()
+    }
+
+    /// A named request: its arguments and, once it has finished, its answer.
+    pub fn request(&self, key: &str) -> Option<(String, Option<Output>)> {
+        self.requests.borrow().iter().find(|r| r.key == key).map(|r| (r.body.clone(), r.answer.clone()))
+    }
+
+    pub fn start_request(&self, key: &str, body: &str) {
+        let mut requests = self.requests.borrow_mut();
+        requests.push_back(Request { key: key.to_string(), body: body.to_string(), answer: None });
+        while requests.len() > REMEMBERED {
+            let Some(done) = requests.iter().position(|r| r.answer.is_some()) else { break };
+            requests.remove(done);
+        }
+    }
+
+    pub fn finish_request(&self, key: &str, answer: Output) {
+        if let Some(r) = self.requests.borrow_mut().iter_mut().find(|r| r.key == key) {
+            r.answer = Some(answer);
+        }
+    }
+
+    /// A render the hub kept of a photo, by the hash of its decode, edit and size.
+    pub fn kept(&self, id: &str, look: u64) -> Option<Arc<Shot>> {
+        self.shots.borrow().iter().find(|(i, l, _)| i == id && *l == look).map(|(_, _, shot)| shot.clone())
+    }
+
+    /// Keeps a render for the next call that needs the same one, such as the state before an agent's next change.
+    pub fn keep(&self, id: &str, look: u64, shot: Arc<Shot>) {
+        let mut shots = self.shots.borrow_mut();
+        shots.retain(|(i, l, _)| !(i == id && *l == look));
+        shots.push_back((id.to_string(), look, shot));
+        while shots.len() > KEPT {
+            shots.pop_front();
+        }
+    }
+
     /// The photos agents have open off screen, most recently used last.
     pub fn live(&self) -> Vec<String> {
         self.sessions.borrow().iter().map(|s| s.borrow().id.clone()).collect()
@@ -445,6 +612,19 @@ impl Hub {
         self.sessions.borrow().iter().find(|s| s.borrow().id == id).cloned()
     }
 
+    /// The photo's session, if it belongs to the open folder. Ids are file names, so a session left from another
+    /// folder can carry the same id; it is closed instead of being read, written or handed over.
+    fn current(&self, driver: &Driver, cx: &mut AsyncApp, id: &str) -> Option<Rc<RefCell<Session>>> {
+        let s = self.find(id)?;
+        let folder = driver.read(cx, |a, cx| a.library.read(cx).folder.clone()).flatten();
+        if folder.as_ref() == Some(&s.borrow().folder) {
+            return Some(s);
+        }
+        drop(s);
+        self.close(cx, id, "the folder changed");
+        None
+    }
+
     /// Takes the call's photo: the open one (`photo` omitted or naming it) through Develop, any other through its
     /// own session. Locks go window first, then photo, so two calls never wait on each other; a call on the open
     /// photo also waits for a session call on it that was running when the user opened it, and takes over its history.
@@ -452,7 +632,7 @@ impl Hub {
         if let Some(id) = photo {
             let known = driver.read(cx, |a, cx| a.library.read(cx).record(id).is_some()).ok_or(GONE)?;
             if !known {
-                return Err(format!("no photo {id} in the open folder; list_photos gives the ids"));
+                return Err(format!("no photo {id} in the open folder; photos list gives the ids"));
             }
         }
         loop {
@@ -468,17 +648,17 @@ impl Hub {
                 if let Some(id) = &now {
                     self.hand_over(driver, cx, id);
                 }
-                return Ok(Held { on: On::Ui, _photo: lock, _ui: ui });
+                return Ok(Held { on: On::Ui(now), _photo: lock, _ui: ui, expected: RefCell::default() });
             }
             if let (Some(id), false) = (photo, now == target) {
                 let session = self.session(driver, cx, id)?;
-                return Ok(Held { on: On::Agent(session), _photo: lock, _ui: None });
+                return Ok(Held { on: On::Agent(session), _photo: lock, _ui: None, expected: RefCell::default() });
             }
         }
     }
 
     fn session(self: &Rc<Self>, driver: &Driver, cx: &mut AsyncApp, id: &str) -> Result<Rc<RefCell<Session>>, String> {
-        if let Some(s) = self.find(id) {
+        if let Some(s) = self.current(driver, cx, id) {
             s.borrow_mut().used = Instant::now();
             let mut sessions = self.sessions.borrow_mut();
             sessions.retain(|x| !Rc::ptr_eq(x, &s));
@@ -488,7 +668,7 @@ impl Hub {
         let opened = driver
             .read(cx, |a, cx| {
                 let l = a.library.read(cx);
-                let folder = l.folder.clone().ok_or("no folder is open; open_folder first")?;
+                let folder = l.folder.clone().ok_or("no folder is open; photos folder first")?;
                 Session::open(l.record(id).ok_or_else(|| format!("no photo {id} in the open folder"))?, folder)
             })
             .ok_or(GONE)??;
@@ -502,10 +682,16 @@ impl Hub {
 
     // why: the least recently used idle sessions go first; a busy one stays until its call ends and the sweep sees it
     fn evict(&self, cx: &mut AsyncApp) {
-        let over = self.sessions.borrow().len().saturating_sub(LIVE);
-        let idle: Vec<String> = self.sessions.borrow().iter().map(|s| s.borrow().id.clone()).filter(|id| self.lock_of(id).try_lock().is_ok()).take(over).collect();
-        for id in idle {
+        let idle = |s: &Rc<RefCell<Session>>| self.lock_of(&s.borrow().id).try_lock().is_ok();
+        let over = self.sessions.borrow().len().saturating_sub(SESSIONS);
+        let closing: Vec<String> = self.sessions.borrow().iter().filter(|s| idle(s)).take(over).map(|s| s.borrow().id.clone()).collect();
+        for id in closing {
             self.close(cx, &id, "over the limit");
+        }
+        let decoded: Vec<Rc<RefCell<Session>>> = self.sessions.borrow().iter().filter(|s| s.borrow().decoded()).cloned().collect();
+        let over = decoded.len().saturating_sub(LIVE);
+        for s in decoded.iter().filter(|s| idle(s)).take(over) {
+            s.borrow_mut().let_go(&[Level::Preview, Level::Full]);
         }
     }
 
@@ -527,7 +713,7 @@ impl Hub {
     /// the agent's steps, and its latest state if a change landed after Develop read the library. The caller holds
     /// the photo's lock (or knows no call is running on it).
     pub fn hand_over(&self, driver: &Driver, cx: &mut AsyncApp, id: &str) {
-        let Some(s) = self.find(id) else { return };
+        let Some(s) = self.current(driver, cx, id) else { return };
         let (history, cursor, settings, film) = {
             let s = s.borrow();
             (s.history.clone(), s.cursor, s.settings.clone(), s.film.as_ref().map(FilmSettings::normalized))
@@ -552,6 +738,7 @@ impl Hub {
 
     /// Ends every session (their edits are already saved), waiting for each one's running call; for a folder change.
     pub async fn close_all(&self, cx: &mut AsyncApp) {
+        self.shots.borrow_mut().clear();
         for id in self.live() {
             let _lock = self.photo(&id).await;
             self.close(cx, &id, "the folder changed");
@@ -584,25 +771,17 @@ impl Hub {
                 let s = s.borrow();
                 (s.used.elapsed() > IDLE, folder.as_ref() != Some(&s.folder), s.full && s.full_used.elapsed() > FULL_IDLE, s.preview && s.used.elapsed() > PREVIEW_IDLE)
             };
-            if shown.as_deref() == Some(id.as_str()) {
-                self.hand_over(driver, cx, &id);
-            } else if stale {
+            if stale {
                 self.close(cx, &id, "the folder changed");
+            } else if shown.as_deref() == Some(id.as_str()) {
+                self.hand_over(driver, cx, &id);
             } else if idle {
                 self.close(cx, &id, "idle");
             } else if full_idle || preview_idle {
                 // why: an agent's session keeps its history until it closes, but its decodes (tens of MB, hundreds
-                // at full size) only while it's being worked on; the next call decodes again
-                let mut s = s.borrow_mut();
+                // at full size) only while it's being worked on
                 let gone: &[Level] = if preview_idle { &[Level::Preview, Level::Full] } else { &[Level::Full] };
-                s.full = false;
-                s.preview &= !preview_idle;
-                if let Ok(mut engine) = s.engine.lock() {
-                    for level in gone {
-                        engine.release(&source_key(&id, *level));
-                    }
-                }
-                crate::perf::give_back();
+                s.borrow_mut().let_go(gone);
             }
         }
         self.locks.borrow_mut().retain(|_, lock| Arc::strong_count(lock) > 1 || lock.try_lock().is_err());
@@ -632,12 +811,12 @@ impl Hub {
         let Some(id) = photo.filter(|id| ui_photo(driver, cx).as_deref() != Some(*id)) else {
             return develop_edit(driver, cx, f).ok_or_else(|| NO_PHOTO.into());
         };
-        if let Some(s) = self.find(id) {
+        if let Some(s) = self.current(driver, cx, id) {
             return Ok(session_edit(&s.borrow(), f));
         }
         driver
             .read(cx, |a, cx| {
-                let record = a.library.read(cx).record(id).ok_or_else(|| format!("no photo {id} in the open folder; list_photos gives the ids"))?;
+                let record = a.library.read(cx).record(id).ok_or_else(|| format!("no photo {id} in the open folder; photos list gives the ids"))?;
                 let (Some(probed), Some(state)) = (&record.probed, &record.state) else { return Err(format!("{id} is still being indexed; try again in a moment")) };
                 let film = state.film();
                 Ok(f(Edit { id, settings: &state.settings, before: Some(&probed.defaults), facts: Some(&probed.facts), film: film.as_ref(), history: &[], cursor: 0 }))

@@ -65,7 +65,7 @@ pub async fn open_folder(hub: &Hub, driver: &Driver, cx: &mut AsyncApp, value: V
                 "photos": l.photos.len(),
                 "indexing": l.photos.iter().filter(|r| r.thumbnail.is_none() && r.error.is_none()).count(),
                 "errors": errors,
-                "next": if l.photos.is_empty() { "the folder has no photos" } else { "list_photos, then open_photo" },
+                "note": l.photos.is_empty().then_some("the folder has no photos"),
             })
         })
         .ok_or("Filmlab's window is gone")?;
@@ -86,7 +86,7 @@ pub async fn open_photo(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value
     let p: OpenPhoto = args(value)?;
     let known = driver.read(cx, |a, cx| a.library.read(cx).record(&p.id).is_some()).unwrap_or(false);
     if !known {
-        return Err(format!("no photo {} in the open folder; list_photos gives the ids", p.id));
+        return Err(format!("no photo {} in the open folder; photos list gives the ids", p.id));
     }
     let _window = hub.window().await;
     // why: an agent's running call on this photo finishes, and is saved, before Develop reads the library
@@ -197,7 +197,7 @@ pub async fn set_flags(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answ
         })
         .ok_or(gone)?;
     if known.is_empty() {
-        return Err(format!("no photo {} in the open folder; list_photos gives the ids", unknown.join(", ")));
+        return Err(format!("no photo {} in the open folder; photos list gives the ids", unknown.join(", ")));
     }
     let ids = known.clone();
     let (rating, label) = (p.rating, p.label);
@@ -225,6 +225,6 @@ pub async fn set_flags(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answ
         "updated": known.len() - waiting.len(),
         "unknown": unknown,
         "still_indexing": waiting,
-        "error": error.or_else(|| (!saved).then(|| "saving to the sidecars is slow; check list_photos".to_string())),
+        "error": error.or_else(|| (!saved).then(|| "saving to the sidecars is slow; check photos list".to_string())),
     }))))
 }

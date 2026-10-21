@@ -7,6 +7,8 @@ use filmlab_engine::core;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::film::FilmSettings;
+
 pub const LOOK_GROUPS: [&str; 10] = ["film", "profile", "treatment", "toneCurve", "color", "colorMixer", "colorGrading", "effects", "vignette", "calibration"];
 pub const PER_PHOTO_GROUPS: [&str; 8] = ["whiteBalance", "light", "detail", "optics", "geometry", "crop", "masks", "spots"];
 
@@ -73,6 +75,18 @@ impl Profile {
     /// A saved tone curve: a profile that keeps the Tone curve and nothing else, which the curve menu lists.
     pub fn is_curve(&self) -> bool {
         self.groups.len() == 1 && self.groups[0] == "toneCurve"
+    }
+
+    /// The film the profile carries: none when it leaves film alone; when its groups include film, the source's film,
+    /// or nothing (a source without film), which turns film off. Profiles saved before groups were kept carry their
+    /// film when they have one.
+    pub fn film_look(&self) -> Option<Option<FilmSettings>> {
+        let film = self.film.as_ref().and_then(FilmSettings::of);
+        match (self.groups.iter().any(|g| g == "film"), self.groups.is_empty()) {
+            (true, _) => Some(film),
+            (false, true) => film.map(Some),
+            (false, false) => None,
+        }
     }
 }
 

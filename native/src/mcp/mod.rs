@@ -84,9 +84,7 @@ fn agent_name(client: &str) -> String {
 fn edits(name: &str, args: &Value) -> bool {
     let action = args["action"].as_str().unwrap_or_default();
     match name {
-        "set_controls" | "set_film" | "command" => true,
-        "history" => matches!(action, "undo" | "redo" | "go_to"),
-        "snapshots" => action == "restore",
+        "edit" => !matches!(action, "snapshot.save" | "snapshot.delete"),
         "profiles" => action == "apply",
         _ => false,
     }
@@ -115,8 +113,18 @@ pub fn url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/mcp")
 }
 
+/// The photos a call names, when it names any: `photo` (one id or several) or a paste's `to`.
+fn named(args: &Value) -> Option<Vec<String>> {
+    let ids = |v: &Value| match v {
+        Value::String(id) => Some(vec![id.clone()]),
+        Value::Array(ids) => Some(ids.iter().filter_map(Value::as_str).map(str::to_string).collect()),
+        _ => None,
+    };
+    ids(&args["photo"]).or_else(|| ids(&args["to"]))
+}
+
 /// Keeps a stretch of work going: an agent previewing or measuring between edits is still developing.
-fn extend(photo: Option<&str>, driver: &Driver, cx: &mut AsyncApp) {
+fn extend(photos: Option<&[String]>, driver: &Driver, cx: &mut AsyncApp) {
     if presence() != Some(Presence::Developing) {
         return;
     }
@@ -126,7 +134,7 @@ fn extend(photo: Option<&str>, driver: &Driver, cx: &mut AsyncApp) {
     }
     let shown = driver.read(cx, |a, cx| a.develop.read(cx).photo_id.clone()).flatten();
     if on_view() == Some(Presence::Developing)
-        && photo.is_none_or(|p| Some(p) == shown.as_deref())
+        && photos.is_none_or(|ids| shown.as_ref().is_some_and(|s| ids.contains(s)))
         && let Ok(mut last) = LAST_VIEW.lock()
     {
         *last = now;
@@ -148,9 +156,9 @@ fn settle(driver: &Driver, cx: &mut AsyncApp) {
 
 async fn answer(hub: &Rc<session::Hub>, driver: &Driver, cx: &mut AsyncApp, call: Call) {
     if !edits(&call.name, &call.args) {
-        let photo = call.args["photo"].as_str().map(str::to_string);
+        let photos = named(&call.args);
         let output = tools::run(hub, driver, cx, &call.name, call.args).await;
-        extend(photo.as_deref(), driver, cx);
+        extend(photos.as_deref(), driver, cx);
         let _ = call.reply.send(output);
         return;
     }
@@ -158,7 +166,7 @@ async fn answer(hub: &Rc<session::Hub>, driver: &Driver, cx: &mut AsyncApp, call
         *agent = agent_name(client);
     }
     let shown = driver.read(cx, |a, cx| a.develop.read(cx).photo_id.clone()).flatten();
-    let on_view = call.args["photo"].as_str().is_none_or(|p| Some(p) == shown.as_deref());
+    let on_view = named(&call.args).is_none_or(|ids| shown.as_ref().is_some_and(|s| ids.contains(s)));
     EDITING.fetch_add(1, Ordering::Relaxed);
     if on_view {
         VIEWERS.fetch_add(1, Ordering::Relaxed);

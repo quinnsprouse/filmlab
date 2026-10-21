@@ -14,11 +14,10 @@ use serde_json::Value;
 
 use super::{Call, prompts, tools, url};
 
-const INSTRUCTIONS: &str = "Filmlab is the photo editor open on this Mac; these tools drive it live. Loop: status → open_folder → \
-list_photos → open_photo → change (set_controls, set_film, command) → look (preview, analyze) → repeat. Control ids, \
-commands and stocks come from catalog. Every change is one undo step and is saved to the photo's XMP sidecar. Editing \
-and look tools take an optional photo (an id) to work on any photo without opening it; calls on different photos run \
-at once, so several agents can each take their own.";
+const INSTRUCTIONS: &str = "Filmlab is the photo editor open on this Mac; these tools drive it live. Read guide \
+workflow first. Every edit answers with its effect in words and only the numbers that moved; look shows photos and \
+their numbers without changing them. Tools take photo (an id, or a list) to work on any photo without opening it. \
+Every change is one undo step and is saved to the photo's XMP sidecar.";
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -62,12 +61,13 @@ impl ServerHandler for Filmlab {
         let output = match tokio::time::timeout(CALL_TIMEOUT, answer).await {
             Ok(Ok(output)) => output,
             Ok(Err(_)) => return Err(ErrorData::internal_error("Filmlab dropped the call", None)),
-            Err(_) => tools::Output::error(format!("timed out after {} s", CALL_TIMEOUT.as_secs())),
+            Err(_) => tools::Output::error(format!("timed out after {} s; the call may still finish and change the photo, so read status before repeating it, or send it again with the same request_id and retry: true", CALL_TIMEOUT.as_secs())),
         };
         let mut content = vec![ContentBlock::text(output.text)];
-        content.extend(output.images.into_iter().map(|jpeg| {
+        content.extend(output.images.into_iter().map(|bytes| {
             use base64::Engine as _;
-            ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(jpeg), "image/jpeg")
+            let kind = if bytes.starts_with(b"\x89PNG") { "image/png" } else { "image/jpeg" };
+            ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(bytes), kind)
         }));
         Ok(if output.error { CallToolResult::error(content) } else { CallToolResult::success(content) }.into())
     }

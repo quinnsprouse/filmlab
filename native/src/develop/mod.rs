@@ -1265,23 +1265,28 @@ impl Develop {
 
     // why: re-applying the same profile at the same step starts again from
     // the settings it first saw, so the amount replaces the earlier application instead of stacking
-    pub fn apply_profile(&mut self, profile_id: &str, partial: &Value, amount: f64, label: &str, film: Option<FilmSettings>, cx: &mut Context<Develop>) {
+    /// Applies a profile's look at `amount`; `film` is none when the profile leaves film alone, and holds no film when
+    /// it carries film off.
+    pub fn apply_profile(&mut self, profile_id: &str, partial: &Value, amount: f64, label: &str, film: Option<Option<FilmSettings>>, cx: &mut Context<Develop>) {
         let Some(settings) = self.settings.clone() else { return };
-        let before = match &self.applied {
-            Some(a) if a.profile_id == profile_id && a.step == self.cursor && a.photo_id == self.photo_id => a.before.clone(),
-            _ => settings,
+        let (before, before_film) = match &self.applied {
+            Some(a) if a.profile_id == profile_id && a.step == self.cursor && a.photo_id == self.photo_id => (a.before.clone(), a.before_film.clone()),
+            _ => (settings, self.film.clone()),
         };
         let Ok(out) = core::apply_profile(&before.to_string(), &partial.to_string(), amount) else { return };
         let Ok(next) = serde_json::from_str::<Value>(&out) else { return };
-        let film = film.or_else(|| self.film.clone());
-        self.commit(next, label, &format!("profile:{profile_id}"), film, cx);
-        self.applied = Some(Applied { profile_id: profile_id.to_string(), before, step: self.cursor, photo_id: self.photo_id.clone() });
+        let applied = film.map_or_else(|| before_film.clone(), |film| crate::film::blend(before_film.as_ref(), film.as_ref(), amount));
+        self.commit(next, label, &format!("profile:{profile_id}"), applied, cx);
+        self.applied = Some(Applied { profile_id: profile_id.to_string(), before, before_film, step: self.cursor, photo_id: self.photo_id.clone() });
     }
 }
 
+/// A profile applied at the current step: the settings and film it started from, so applying it again at another
+/// amount starts from them rather than stacking.
 pub struct Applied {
     pub profile_id: String,
     pub before: Value,
+    pub before_film: Option<FilmSettings>,
     pub step: usize,
     pub photo_id: Option<String>,
 }

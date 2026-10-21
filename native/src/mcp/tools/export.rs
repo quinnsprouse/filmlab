@@ -36,7 +36,13 @@ pub async fn export(driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer 
         None => PathBuf::from(f),
     });
     let given = p.ids;
-    let name = p.name.map(|n| n.trim().trim_end_matches(&['.', ' '][..]).to_string()).filter(|n| !n.is_empty() && !n.contains('/'));
+    let name = p.name.map(|n| n.trim().trim_end_matches(&['.', ' '][..]).to_string());
+    if name.as_deref().is_some_and(|n| n.is_empty() || n.contains('/')) {
+        return Err("name is a file name, without folders; folder picks where it goes".into());
+    }
+    if name.is_some() && given.as_ref().is_some_and(|ids| ids.len() > 1) {
+        return Err("name is for exporting one photo; several keep their own names".into());
+    }
     let planned = driver
         .act(cx, move |a, cx| {
             let ids = match given {

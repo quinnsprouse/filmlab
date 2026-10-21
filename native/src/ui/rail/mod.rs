@@ -9,7 +9,6 @@ use gpui_kit::*;
 use super::app::FilmlabApp;
 use super::slider::ParamSlider;
 use super::{icon, motion, theme};
-use crate::film::FilmSettings;
 use crate::library::Saving;
 use store::Profile;
 
@@ -71,7 +70,7 @@ fn heading(title: &'static str, count: String) -> Div {
 }
 
 fn apply(app: &mut FilmlabApp, profile: &Profile, percent: f64, cx: &mut Context<FilmlabApp>) {
-    let film = profile.film.as_ref().and_then(FilmSettings::of);
+    let film = profile.film_look();
     let label = format!("Profile {}", profile.name);
     app.develop.update(cx, |develop, cx| develop.apply_profile(&profile.id, &profile.partial, percent / 100.0, &label, film, cx));
 }

@@ -45,10 +45,10 @@ screenshots.
 
 ## Agents
 
-While Filmlab runs, it serves MCP at `http://127.0.0.1:47428/mcp`. An agent can open folders and photos, change
-controls and film stocks, preview, analyze and export. Each change is one undo step and goes into the sidecar,
-the same as an edit by hand. The server only listens on loopback and refuses requests that carry a browser
-`Origin` header.
+While Filmlab runs, it serves MCP at `http://127.0.0.1:47428/mcp`. Seven tools let an agent open folders and photos,
+grade them and export: `guide`, `status`, `photos`, `edit`, `look`, `view` and `profiles`. Each change is one undo
+step and goes into the sidecar, the same as an edit by hand. The server only listens on loopback and refuses requests
+that carry a browser `Origin` header.
 
 To add it to Claude Code:
 
@@ -56,8 +56,16 @@ To add it to Claude Code:
 claude mcp add --transport http filmlab http://127.0.0.1:47428/mcp
 ```
 
-Set `FILMLAB_MCP_PORT` to move it, or `FILMLAB_MCP=0` to turn it off. `node native/scripts/mcp_e2e.mjs <photo folder>`
-tests the tools against a release build.
+Every edit answers with what it did, in words (brighter, warmer, more texture) and with only the numbers that moved,
+so an agent checks its work without a second call. `look` shows photos without changing them: previews, a numbered
+contact sheet of several, colourist scopes (tonal zones, hues, skin, clipping, highlight tail, waveform), alternatives
+side by side, and `compare`, which diffs any two states of a photo and says where the change is and by how much. A
+region renders at actual size, losslessly. `edit` can also fit one control until a measurement hits a target, and
+paste one photo's look onto others without saving a profile.
+
+Set `FILMLAB_MCP_PORT` to move it, or `FILMLAB_MCP=0` to turn it off. `node native/scripts/mcp.mjs <tool> '<json>'`
+calls one tool from a shell. `node native/scripts/mcp_e2e.mjs <photo folder>` tests the tools against a release build
+and checks that every control changes the photo.
 
 ## Layout
 

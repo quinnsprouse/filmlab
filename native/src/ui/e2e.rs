@@ -898,7 +898,7 @@ async fn compare_and_profiles(run: &mut Run, cx: &mut AsyncApp) {
     run.check("profiles: the profile is saved and reloads", stored, "");
     run.develop(cx, |d, cx| d.edit_controls(&[("light.exposure", -1.0)], "Exposure", cx));
     run.settled(cx, false).await;
-    let film = profile.film.as_ref().and_then(FilmSettings::of);
+    let film = profile.film_look();
     run.develop(cx, |d, cx| d.apply_profile(&profile.id, &profile.partial, 1.0, "Profile E2E look", film, cx));
     run.verify(cx, "profiles: applying the profile renders and matches", false).await;
     let exposure = run.read(cx, |a, cx| a.develop.read(cx).control_values().get("light.exposure").copied()).flatten().unwrap_or(f64::NAN);

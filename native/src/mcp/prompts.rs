@@ -17,21 +17,23 @@ fn grade(args: &Map<String, Value>) -> String {
     let photo = arg(args, "photo").map_or("the photo open in Filmlab (status shows it)".to_string(), |p| format!("photo {p}"));
     let look = arg(args, "look").map_or(String::new(), |l| format!(" The look to aim for: {l}."));
     format!(
-        "Grade {photo} in Filmlab.{look} First read guide workflow and guide qa. Then loop: preview and analyze, change one \
-         thing (exposure and white balance first, then the film look with set_film, then local fixes with masks), check \
-         again. Save a snapshot whenever a state is worth keeping. Inspect faces, skies and highlights at full detail with a \
-         region preview. Finish with a before/after comparison (preview before=true) and a short note of what you changed and \
-         why."
+        "Grade {photo} in Filmlab.{look} Read guide workflow first. Look at it with look preview, then work one idea at a \
+         time: exposure and white balance, then the film, then local fixes with masks, editing values and film together \
+         when you know both. Each edit answers with its effect, so read that rather than measuring again; use look trials \
+         when choosing between options, and fit to land a number. Check faces, skies and highlights at full detail with \
+         a region. Finish with look compare from \"before\" (image pair) and a short note of what you changed and why."
     )
 }
 
 fn cull(args: &Map<String, Value>) -> String {
-    let folder = arg(args, "folder").map_or("the folder open in Filmlab".to_string(), |f| format!("the folder {f} (open_folder)"));
+    let folder = arg(args, "folder").map_or("the folder open in Filmlab".to_string(), |f| format!("the folder {f} (photos action folder)"));
     let keep = arg(args, "keep").map_or(String::new(), |k| format!(" Keep about {k}."));
     format!(
-        "Cull {folder}.{keep} Look at each photo with preview (small, around 512 px) and analyze; flag the best as pick and the \
-         failures (missed focus, blur, closed eyes, duplicates) as reject with set_flags, and rate keepers 1-5. Compare near \
-         duplicates side by side before choosing. End with list_photos filter=picks and one line per pick saying why."
+        "Cull {folder}.{keep} Look at the photos a dozen at a time in contact sheets (look preview with a list of ids); \
+         look at one alone, with a region at full detail, only to check focus or eyes. Flag the best as pick and the \
+         failures (missed focus, blur, closed eyes, duplicates) as reject, and rate keepers 1-5, with photos action flags. \
+         Put near duplicates in a sheet together before choosing. End with photos action list (filter picks) and one line \
+         per pick saying why."
     )
 }
 
@@ -39,9 +41,10 @@ fn match_look(args: &Map<String, Value>) -> String {
     let source = arg(args, "source").unwrap_or("the photo open in Filmlab");
     let targets = arg(args, "targets").map_or("the other photos in the folder".to_string(), |t| format!("photos {t}"));
     format!(
-        "Carry the look of {source} to {targets}. Save its look as a profile (profiles action=save, default look groups), \
-         apply it to each target (profiles action=apply photo=<id>; no need to open it), then fix each one's own exposure and white balance so \
-         they sit together, checking every photo with preview and analyze against the source. Report what differed."
+        "Carry the look of {source} to {targets} with edit paste (photo: the targets); it keeps each photo's own exposure \
+         and white balance. Use match only for photos of the same scene and light. Don't save a profile unless the user \
+         asks for one. Check them together in one contact sheet with the source, fix any that stand out, and report what \
+         differed."
     )
 }
 
@@ -63,7 +66,7 @@ const TEMPLATES: &[Template] = &[
     Template {
         name: "match_look",
         title: "Match a look",
-        description: "Save one photo's look as a profile and fit it to other photos.",
+        description: "Paste one photo's look onto other photos and fit each to it.",
         arguments: &[("source", "photo id whose look to copy", false), ("targets", "photo ids, comma separated; default the rest", false)],
         text: match_look,
     },

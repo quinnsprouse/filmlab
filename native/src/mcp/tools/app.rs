@@ -58,6 +58,7 @@ pub fn status(hub: &Hub, driver: &Driver, cx: &mut AsyncApp) -> Answer {
                 "history": {"step": d.cursor, "steps": d.history.len(), "last": last},
                 "render": render,
                 "error": d.error,
+                "save_error": library.save_error,
                 "sessions": sessions,
             })
         })
@@ -102,10 +103,16 @@ fn zoom_of(value: &Value, at: Option<[f64; 2]>, current: Camera) -> Result<Zoom,
         Value::String(s) if s.trim_end_matches('x').parse::<f64>().is_ok() => scale(s.trim_end_matches('x').parse().unwrap_or(1.0)),
         Value::Number(n) => scale(n.as_f64().unwrap_or(1.0)),
         Value::Object(o) => {
+            if let Some(key) = o.keys().find(|k| !["scale", "x", "y"].contains(&k.as_str())) {
+                return Err(format!("zoom {{scale, x, y}} has no {key}"));
+            }
             let number = |key: &str, default: f64| o.get(key).map_or(Some(default), Value::as_f64);
-            let (Some(scale), Some(x), Some(y)) = (number("scale", 1.0), number("x", 0.5), number("y", 0.5)) else {
+            let (Some(scale), Some(x), Some(y)) = (number("scale", 1.0), number("x", cx), number("y", cy)) else {
                 return Err("zoom {scale,x,y} takes numbers".into());
             };
+            if scale <= 0.0 {
+                return Err("zoom scale must be above 0".into());
+            }
             Ok(Zoom::At { scale, cx: x, cy: y })
         }
         _ => Err("zoom is \"fit\", \"100\" or a scale like \"2\"".into()),
@@ -115,10 +122,13 @@ fn zoom_of(value: &Value, at: Option<[f64; 2]>, current: Camera) -> Result<Zoom,
 pub async fn view(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Value) -> Answer {
     let p: View = args(value)?;
     let gone = "Filmlab's window is gone";
+    if p.at.is_some() && p.zoom.is_none() {
+        return Err("at centres a zoom; give zoom with it".into());
+    }
     if let Some(ids) = &p.select {
         let unknown = driver.read(cx, |a, cx| ids.iter().filter(|id| a.library.read(cx).record(id).is_none()).cloned().collect::<Vec<_>>()).ok_or(gone)?;
         if !unknown.is_empty() {
-            return Err(format!("no photo {} in the open folder; list_photos gives the ids", unknown.join(", ")));
+            return Err(format!("no photo {} in the open folder; photos list gives the ids", unknown.join(", ")));
         }
     }
     let mode = match p.mode.as_deref() {
@@ -146,7 +156,7 @@ pub async fn view(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Valu
     if develops {
         let opens = driver.read(cx, |a, cx| a.develop.read(cx).photo_id.is_none().then(|| a.selected.clone())).ok_or(gone)?;
         if opens == Some(None) {
-            return Err("no photo is open or selected; open_photo first".into());
+            return Err("no photo is open or selected; photos open first".into());
         }
         // why: a photo an agent has open off screen finishes its running call and is saved before Develop reads it
         let adopting = match opens.flatten() {
@@ -165,7 +175,7 @@ pub async fn view(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Valu
     }
     let in_develop = driver.read(cx, |a, _| a.mode == Mode::Develop).ok_or(gone)?;
     if (tool.is_some() || p.zoom.is_some() || compare.is_some()) && !(develops || (mode.is_none() && in_develop)) {
-        return Err("tool, zoom and compare need a photo in Develop; view mode develop, or open_photo".into());
+        return Err("tool, zoom and compare need a photo in Develop; view mode develop, or photos open".into());
     }
     let zoom = match &p.zoom {
         Some(z) => {
