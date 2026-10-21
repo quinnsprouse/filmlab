@@ -1,5 +1,3 @@
-use serde::Serialize;
-
 use crate::film::{CubeLut, Developer, Scan, Scene, Textured, Toned, contrast_slope, next_id};
 use crate::dust;
 use crate::grain::{self, Field, GrainParams};
@@ -36,84 +34,114 @@ const SINGLE: u32 = 512;
 const SAMPLES: usize = 60_000;
 const GROUP: usize = 16;
 
-#[derive(Serialize)]
-struct Block {
-    id: String,
-    at: usize,
-    len: usize,
+/// Engine memory a program hands the runner, borrowed for the length of the call.
+#[derive(Clone, Copy)]
+pub enum Words<'a> {
+    Float(&'a [f32]),
+    Bits(&'a [u32]),
 }
 
-impl Block {
-    fn of<T>(id: String, data: &[T]) -> Block {
-        Block { id, at: data.as_ptr() as usize, len: std::mem::size_of_val(data) / 4 }
+impl Words<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Words::Float(w) => w.len(),
+            Words::Bits(w) => w.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
-#[derive(Serialize)]
-struct Buffer {
-    name: String,
-    words: usize,
-    upload: Option<Block>,
-    pack: bool,
+impl<'a> From<&'a [f32]> for Words<'a> {
+    fn from(w: &'a [f32]) -> Words<'a> {
+        Words::Float(w)
+    }
 }
 
-#[derive(Serialize)]
-struct Write {
-    buffer: &'static str,
-    offset: usize,
-    block: Block,
+impl<'a> From<&'a [u32]> for Words<'a> {
+    fn from(w: &'a [u32]) -> Words<'a> {
+        Words::Bits(w)
+    }
 }
 
-#[derive(Serialize)]
-struct Pass {
-    entry: &'static str,
-    params: Vec<u32>,
-    bind: Vec<(u32, String)>,
-    groups: [usize; 2],
+impl<'a> From<&'a [[f32; 3]]> for Words<'a> {
+    fn from(w: &'a [[f32; 3]]) -> Words<'a> {
+        Words::Float(w.as_flattened())
+    }
 }
 
-#[derive(Serialize)]
-struct Read {
-    buffer: String,
-    at: usize,
-    len: usize,
+pub struct Block<'a> {
+    pub id: String,
+    pub words: Words<'a>,
 }
 
-#[derive(Serialize)]
-struct Copy {
-    from: String,
-    to: &'static str,
-    offset: usize,
+impl<'a> Block<'a> {
+    fn of(id: impl Into<String>, data: impl Into<Words<'a>>) -> Block<'a> {
+        Block { id: id.into(), words: data.into() }
+    }
 }
 
-// why: a buffer the runner keeps between programs, named for its contents: a program that needs it fails unless the
-// buffer still holds `id`, and one that makes it marks it so once it has run
-#[derive(Serialize)]
-struct Keep {
-    buffer: &'static str,
-    id: String,
-    need: bool,
+pub struct Buffer<'a> {
+    pub name: String,
+    pub words: usize,
+    pub upload: Option<Block<'a>>,
+    pub pack: bool,
 }
 
-#[derive(Default, Serialize)]
-struct Program {
-    buffers: Vec<Buffer>,
-    copies: Vec<Copy>,
-    writes: Vec<Write>,
-    passes: Vec<Pass>,
-    reads: Vec<Read>,
-    keep: Vec<Keep>,
+pub struct Write<'a> {
+    pub buffer: &'static str,
+    pub offset: usize,
+    pub block: Block<'a>,
 }
 
-impl Program {
+pub struct Pass {
+    pub entry: &'static str,
+    pub params: Vec<u32>,
+    pub bind: Vec<(u32, String)>,
+    pub groups: [usize; 2],
+}
+
+/// A buffer read back into engine memory once the program has run.
+pub struct Read<'a> {
+    pub buffer: String,
+    pub into: &'a mut [f32],
+}
+
+pub struct Copy {
+    pub from: String,
+    pub to: &'static str,
+    pub offset: usize,
+}
+
+/// A buffer the runner keeps between programs, named for its contents: a program that needs it fails unless the
+/// buffer still holds `id`, and one that makes it marks it so once it has run.
+pub struct Keep {
+    pub buffer: &'static str,
+    pub id: String,
+    pub need: bool,
+}
+
+#[derive(Default)]
+pub struct Program<'a> {
+    pub buffers: Vec<Buffer<'a>>,
+    pub copies: Vec<Copy>,
+    pub writes: Vec<Write<'a>>,
+    pub passes: Vec<Pass>,
+    pub reads: Vec<Read<'a>>,
+    pub keep: Vec<Keep>,
+}
+
+impl<'a> Program<'a> {
     fn buffer(&mut self, name: &str, words: usize) {
         self.buffers.push(Buffer { name: name.to_string(), words, upload: None, pack: false });
     }
 
-    fn upload<T>(&mut self, name: String, data: &[T], pack: bool) -> String {
-        let words = std::mem::size_of_val(data) / 4;
-        let words = if pack { words / 3 * 4 } else { words };
-        self.buffers.push(Buffer { name: name.clone(), words, upload: Some(Block::of(name.clone(), data)), pack });
+    fn upload(&mut self, name: String, data: impl Into<Words<'a>>, pack: bool) -> String {
+        let block = Block::of(name.clone(), data);
+        let words = if pack { block.words.len() / 3 * 4 } else { block.words.len() };
+        self.buffers.push(Buffer { name: name.clone(), words, upload: Some(block), pack });
         name
     }
 
@@ -163,7 +191,7 @@ impl Program {
 
     fn run(mut self) -> bool {
         self.alias();
-        serde_json::to_string(&self).is_ok_and(|json| bridge::run(&json))
+        bridge::run(self)
     }
 }
 
@@ -264,10 +292,10 @@ fn indexes() -> &'static [Vec<f32>; 3] {
     INDEXES.get_or_init(|| [index(&DOMAIN), index(&BASE), index(&F_GRID)])
 }
 
-fn tables(program: &mut Program, dev: &Developer, scan: Option<&Scan>, weights: &[f32]) {
+fn tables<'a>(program: &mut Program<'a>, dev: &'a Developer, scan: Option<&'a Scan>, weights: &'a [f32]) {
     program.buffer("tables", TABLE_WORDS + weights.len().max(1));
     let chain = &dev.chain;
-    let mut put = |offset: usize, id: &str, data: &[f32]| program.writes.push(Write { buffer: "tables", offset, block: Block::of(id.to_string(), data) });
+    let mut put = |offset: usize, id: &str, data: &'a [f32]| program.writes.push(Write { buffer: "tables", offset, block: Block::of(id, data) });
     put(0, "log2", chain.log2);
     put(4097, "exp2", chain.exp2);
     if let Some(scan) = scan {
@@ -291,7 +319,7 @@ fn tables(program: &mut Program, dev: &Developer, scan: Option<&Scan>, weights: 
     }
 }
 
-fn luts(program: &mut Program, dev: &Developer) -> String {
+fn luts<'a>(program: &mut Program<'a>, dev: &'a Developer) -> String {
     let chain = &dev.chain;
     let [u, n, p] = lut_offsets(dev);
     let mut parts: Vec<(&CubeLut, usize)> = vec![(&chain.negative, n), (&chain.print, p)];
@@ -301,7 +329,7 @@ fn luts(program: &mut Program, dev: &Developer) -> String {
     let total = p + chain.print.data.len();
     program.buffer("tmp:luts", total * 4);
     for (lut, offset) in parts {
-        let name = program.upload(format!("lut:{}", lut.id), &lut.data, true);
+        let name = program.upload(format!("lut:{}", lut.id), &lut.data[..], true);
         program.copies.push(Copy { from: name, to: "tmp:luts", offset: offset * 4 });
     }
     "tmp:luts".to_string()
@@ -326,9 +354,7 @@ pub(crate) fn forget_texture(id: u64) {
 }
 
 pub fn prefetch(scene: &Scene) {
-    if let Ok(block) = serde_json::to_string(&Block::of(scene_name(scene), &scene.rgb)) {
-        bridge::upload(&block);
-    }
+    bridge::upload(Block::of(scene_name(scene), &scene.rgb[..]));
 }
 
 struct Plan<'a> {
@@ -418,7 +444,7 @@ fn local(w: usize, h: usize) -> Region {
 const KEPT: &str = "keep:detail";
 
 #[allow(clippy::too_many_arguments)]
-fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &str, tex: &str, taps: &[u32], weights: &Weights, keep: Option<(String, bool)>) {
+fn texture_passes<'a>(program: &mut Program<'a>, dev: &Developer, plan: &Plan<'a>, code: &str, tex: &str, taps: &'a [u32], weights: &Weights, keep: Option<(String, bool)>) {
     let Some(p) = plan.texture else { return };
     let frame = plan.frame;
     let (region, out) = (plan.region, plan.out);
@@ -451,7 +477,7 @@ fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &st
     if !plan.dust.is_empty() {
         let count = plan.dust.len() / 2;
         program.buffer("tmp:dust", plan.dust.len());
-        program.writes.push(Write { buffer: "tmp:dust", offset: 0, block: Block::of("dust".into(), plan.dust) });
+        program.writes.push(Write { buffer: "tmp:dust", offset: 0, block: Block::of("dust", plan.dust) });
         let mut bind = vec![(5, "tmp:dust".into()), (2, code.into())];
         let flags = if blurred {
             bind.push((7, "tmp:luma".into()));
@@ -475,7 +501,7 @@ fn texture_passes(program: &mut Program, dev: &Developer, plan: &Plan, code: &st
     let (dx, dy, ux) = (0u32, guide.down_x.len() as u32, (guide.down_x.len() + guide.down_y.len()) as u32);
     let uy = ux + guide.up_x.len() as u32;
     program.buffer("tmp:taps", taps.len());
-    program.writes.push(Write { buffer: "tmp:taps", offset: 0, block: Block::of("taps".into(), taps) });
+    program.writes.push(Write { buffer: "tmp:taps", offset: 0, block: Block::of("taps", taps) });
     let rb = [guide.reduced.w as u32, guide.reduced.h as u32, 0, 0];
     let reduce = Frame { src: region, dst: reduced, taps: [dx, dy, ux, uy], ..base };
     program.passes.push(Pass { entry: "reduce", params: reduce.words(), bind: vec![(6, "tmp:luma".into()), (5, "tmp:taps".into()), (9, "tmp:moments".into())], groups: groups(reduced) });
@@ -525,8 +551,8 @@ fn grid_groups((x, y): Grid) -> [usize; 2] {
     [x.len().div_ceil(GROUP), y.len().div_ceil(GROUP)]
 }
 
-struct Planner<'a> {
-    program: &'a mut Program,
+struct Planner<'a, 'p> {
+    program: &'a mut Program<'p>,
     base: Frame<'a>,
     next: usize,
     weights: &'a [f32],
@@ -537,7 +563,7 @@ struct Planner<'a> {
 // an octave's sum so far (halation::apply's add_into): the octave's weights and the running sum, if any
 type Sum<'s> = (u32, Option<&'s (String, Grid)>);
 
-impl Planner<'_> {
+impl Planner<'_, '_> {
     fn name(&mut self) -> String {
         self.next += 1;
         format!("tmp:hp{}", self.next)
@@ -699,7 +725,7 @@ fn region_words(r: Region) -> [u32; 4] {
     region(r)
 }
 
-fn sample_pass(program: &mut Program, dev: &Developer, tex: &str, luts: &str, textured: Region, out: &mut [f32]) {
+fn sample_pass<'a>(program: &mut Program<'a>, dev: &Developer, tex: &str, luts: &str, textured: Region, out: &'a mut [f32]) {
     let len = textured.w * textured.h;
     let step = (len / SAMPLES).max(1);
     let count = len.div_ceil(step);
@@ -711,7 +737,7 @@ fn sample_pass(program: &mut Program, dev: &Developer, tex: &str, luts: &str, te
         bind: vec![(1, tex.into()), (3, luts.into()), (7, "tmp:samples".into())],
         groups: [count.div_ceil(256), 1],
     });
-    program.reads.push(Read { buffer: "tmp:samples".into(), at: out.as_mut_ptr() as usize, len: count });
+    program.reads.push(Read { buffer: "tmp:samples".into(), into: out });
 }
 
 fn sample_count(r: Region) -> usize {
@@ -785,7 +811,7 @@ fn texture_run(dev: &Developer, scene: &Scene, out: Region, lumas: bool, weights
         sample_pass(&mut program, dev, &tex, &luts, out, &mut samples);
         return program.run().then(|| (Textured { id, region: out, rgb: Vec::new(), gpu: true, lumas: None }, lumas.then_some(samples)));
     }
-    let scene_buffer = program.upload(scene_name(scene), &scene.rgb, false);
+    let scene_buffer = program.upload(scene_name(scene), &scene.rgb[..], false);
     program.buffer(&code, region.w * region.h * 3);
     let mut flags = 0;
     if dev.light.contrast != 0.0 {
@@ -849,20 +875,20 @@ pub fn finish_into(dev: &Developer, textured: &Textured, scan: &Scan, out: &mut 
         bind: vec![(1, format!("tex:{}", textured.id)), (3, luts), (4, "tables".into()), (2, "tmp:toned".into())],
         groups: groups(r),
     });
-    program.reads.push(Read { buffer: "tmp:toned".into(), at: out.as_mut_ptr() as usize, len: r.w * r.h * 3 });
+    program.reads.push(Read { buffer: "tmp:toned".into(), into: out.as_flattened_mut() });
     program.run()
 }
 
-pub use bridge::{Runner, install};
+pub use bridge::{Runner, install, installed};
 
 mod bridge {
     use std::sync::OnceLock;
 
-    // why: programs name engine memory by address and length; the runner reads
-    // those addresses during the call, while the engine keeps the blocks alive
+    use super::{Block, Program};
+
     pub trait Runner: Send + Sync {
-        fn run(&self, program: &str) -> bool;
-        fn upload(&self, block: &str);
+        fn run(&self, program: Program<'_>) -> bool;
+        fn upload(&self, block: Block<'_>);
         fn forget(&self, _name: &str) {}
     }
 
@@ -872,11 +898,15 @@ mod bridge {
         RUNNER.set(runner).is_ok()
     }
 
-    pub fn run(json: &str) -> bool {
-        RUNNER.get().is_some_and(|r| r.run(json))
+    pub fn installed() -> bool {
+        RUNNER.get().is_some()
     }
 
-    pub fn upload(block: &str) {
+    pub fn run(program: Program<'_>) -> bool {
+        RUNNER.get().is_some_and(|r| r.run(program))
+    }
+
+    pub fn upload(block: Block<'_>) {
         if let Some(r) = RUNNER.get() {
             r.upload(block);
         }

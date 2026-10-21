@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use filmlab_engine::gpu::{Block, Program, Words};
 use wgpu::util::DeviceExt;
 
 const SHADER: &str = include_str!("film.wgsl");
@@ -9,6 +11,8 @@ const PARAMS_SLOT: u64 = 512;
 const SPARE: usize = 4;
 // uploads smaller than this (the tables, dust and taps) go through queue.write_buffer
 const STAGED: usize = 1 << 20;
+const SLICE: Duration = Duration::from_millis(2);
+const STALL: Duration = Duration::from_secs(10);
 const STORAGE: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const WRITABLE: [u32; 3] = [2, 7, 9];
 const ENTRIES: [&str; 23] = [
@@ -36,68 +40,6 @@ const ENTRIES: [&str; 23] = [
     "pyramidExpand",
     "pyramidCombine",
 ];
-
-#[derive(Deserialize)]
-struct Block {
-    id: String,
-    at: usize,
-    len: usize,
-}
-
-#[derive(Deserialize)]
-struct BufferSpec {
-    name: String,
-    words: usize,
-    upload: Option<Block>,
-    pack: bool,
-}
-
-#[derive(Deserialize)]
-struct Write {
-    buffer: String,
-    offset: usize,
-    block: Block,
-}
-
-#[derive(Deserialize)]
-struct Pass {
-    entry: String,
-    params: Vec<u32>,
-    bind: Vec<(u32, String)>,
-    groups: [usize; 2],
-}
-
-#[derive(Deserialize)]
-struct Read {
-    buffer: String,
-    at: usize,
-    len: usize,
-}
-
-#[derive(Deserialize)]
-struct Copy {
-    from: String,
-    to: String,
-    offset: usize,
-}
-
-#[derive(Deserialize)]
-struct Keep {
-    buffer: String,
-    id: String,
-    need: bool,
-}
-
-#[derive(Deserialize)]
-struct Program {
-    buffers: Vec<BufferSpec>,
-    copies: Vec<Copy>,
-    writes: Vec<Write>,
-    passes: Vec<Pass>,
-    reads: Vec<Read>,
-    #[serde(default)]
-    keep: Vec<Keep>,
-}
 
 struct Stored {
     buffer: wgpu::Buffer,
@@ -159,19 +101,18 @@ pub struct Gpu {
     dummies: Vec<(u32, wgpu::Buffer)>,
     store: Mutex<Store>,
     mappable: bool,
+    stalled: AtomicBool,
 }
 
-// why: engine programs name its memory by address; the engine keeps every named block alive for the
-// duration of the call that hands us the program
-fn memory(at: usize, len: usize) -> &'static [u32] {
-    if len == 0 {
-        return &[];
+fn bits<'a>(words: &Words<'a>) -> &'a [u32] {
+    match *words {
+        Words::Float(w) => bytemuck::cast_slice(w),
+        Words::Bits(w) => w,
     }
-    unsafe { std::slice::from_raw_parts(at as *const u32, len) }
 }
 
-fn packed(block: &Block) -> Vec<u32> {
-    memory(block.at, block.len).chunks(3).flat_map(|c| [c[0], c.get(1).copied().unwrap_or(0), c.get(2).copied().unwrap_or(0), 0]).collect()
+fn packed(words: &Words) -> Vec<u32> {
+    bits(words).chunks(3).flat_map(|c| [c[0], c.get(1).copied().unwrap_or(0), c.get(2).copied().unwrap_or(0), 0]).collect()
 }
 
 impl Gpu {
@@ -223,7 +164,7 @@ impl Gpu {
             .map(|&b| (b, device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })))
             .collect();
         let mappable = features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-        Some(Arc::new(Gpu { instance, adapter, device, queue, layout, pipelines, dummies, store: Mutex::default(), mappable }))
+        Some(Arc::new(Gpu { instance, adapter, device, queue, layout, pipelines, dummies, store: Mutex::default(), mappable, stalled: AtomicBool::new(false) }))
     }
 
     fn ensure(&self, store: &mut Store, name: &str, size: usize) {
@@ -259,11 +200,12 @@ impl Gpu {
     }
 
     fn upload_into(&self, store: &mut Store, name: &str, block: &Block, pack: bool) {
-        self.ensure(store, name, if pack { block.len / 3 * 4 } else { block.len });
+        let len = block.words.len();
+        self.ensure(store, name, if pack { len / 3 * 4 } else { len });
         if store.buffers.get(name).is_none_or(|t| t.holds.as_deref() == Some(block.id.as_str())) {
             return;
         }
-        let data = if pack { std::borrow::Cow::Owned(packed(block)) } else { std::borrow::Cow::Borrowed(memory(block.at, block.len)) };
+        let data = if pack { std::borrow::Cow::Owned(packed(&block.words)) } else { std::borrow::Cow::Borrowed(bits(&block.words)) };
         let bytes: &[u8] = bytemuck::cast_slice(&data);
         if bytes.len() < STAGED || !self.stage(store, name, bytes) {
             let Some(target) = store.buffers.get(name) else { return };
@@ -292,12 +234,7 @@ impl Gpu {
             store.upload = Some(Upload { buffer, after });
         }
         let Some(upload) = store.upload.as_mut() else { return false };
-        let (tx, rx) = std::sync::mpsc::channel();
-        upload.buffer.slice(..size).map_async(wgpu::MapMode::Write, move |r| {
-            let _ = tx.send(r);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: Some(upload.after.clone()), timeout: None });
-        if !rx.try_recv().is_ok_and(|r| r.is_ok()) {
+        if self.map(&upload.buffer.slice(..size), wgpu::MapMode::Write).is_none() {
             return false;
         }
         match upload.buffer.slice(..size).get_mapped_range_mut() {
@@ -311,25 +248,53 @@ impl Gpu {
         true
     }
 
-    fn execute(&self, program: &Program) -> Option<()> {
-        let started = std::time::Instant::now();
+    // why: a wait holds wgpu's device lock, so each is a short slice and a GPU that stops answering is given up on
+    // (the engine then finishes the frame on the CPU) rather than waited on for good
+    fn settle<T>(&self, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+        let started = Instant::now();
+        loop {
+            if let Some(done) = ready() {
+                return Some(done);
+            }
+            if started.elapsed() > STALL {
+                self.stalled.store(true, Ordering::Relaxed);
+                return None;
+            }
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(SLICE) });
+        }
+    }
+
+    fn map(&self, slice: &wgpu::BufferSlice, mode: wgpu::MapMode) -> Option<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(mode, move |r| {
+            let _ = tx.send(r);
+        });
+        self.settle(|| rx.try_recv().ok())?.ok()
+    }
+
+    fn execute(&self, program: Program) -> Option<()> {
+        if self.stalled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let started = Instant::now();
+        let entries: Vec<&str> = program.passes.iter().map(|p| p.entry).collect();
+        let buffers: Vec<(String, usize)> = program.buffers.iter().map(|b| (b.name.clone(), b.words)).collect();
         let traced = self.execute_inner(program);
         if std::env::var_os("FILMLAB_GPU_TRACE").is_some() {
-            let entries: Vec<&str> = program.passes.iter().map(|p| p.entry.as_str()).collect();
-            let mb = |f: &dyn Fn(&str) -> bool| program.buffers.iter().filter(|b| f(&b.name)).map(|b| b.words * 4).sum::<usize>() as f64 / 1_048_576.0;
+            let mb = |f: &dyn Fn(&str) -> bool| buffers.iter().filter(|b| f(&b.0)).map(|b| b.1 * 4).sum::<usize>() as f64 / 1_048_576.0;
             let failed = if traced.is_none() { " failed" } else { "" };
-            eprintln!("gpu {:.1} ms {} passes {:?}{failed} scratch {:.0} MB in {} slots, other {:.0} MB", started.elapsed().as_secs_f64() * 1000.0, entries.len(), entries.first(), mb(&|n| n.starts_with("tmp:")), program.buffers.iter().filter(|b| b.name.starts_with("tmp:slot")).count(), mb(&|n| !n.starts_with("tmp:")));
-            for b in program.buffers.iter().filter(|b| b.words > 1_000_000) {
-                eprintln!("    {} {:.0} MB", b.name, (b.words * 4) as f64 / 1_048_576.0);
+            eprintln!("gpu {:.1} ms {} passes {:?}{failed} scratch {:.0} MB in {} slots, other {:.0} MB", started.elapsed().as_secs_f64() * 1000.0, entries.len(), entries.first(), mb(&|n| n.starts_with("tmp:")), buffers.iter().filter(|b| b.0.starts_with("tmp:slot")).count(), mb(&|n| !n.starts_with("tmp:")));
+            for (name, words) in buffers.iter().filter(|b| b.1 > 1_000_000) {
+                eprintln!("    {name} {:.0} MB", (words * 4) as f64 / 1_048_576.0);
             }
         }
         traced
     }
 
-    fn execute_inner(&self, program: &Program) -> Option<()> {
+    fn execute_inner(&self, mut program: Program) -> Option<()> {
         let mut store = self.store.lock().ok()?;
         let store = &mut *store;
-        if program.keep.iter().any(|k| k.need && store.buffers.get(&k.buffer).and_then(|b| b.holds.as_deref()) != Some(k.id.as_str())) {
+        if program.keep.iter().any(|k| k.need && store.buffers.get(k.buffer).and_then(|b| b.holds.as_deref()) != Some(k.id.as_str())) {
             return None;
         }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -340,9 +305,9 @@ impl Gpu {
             }
         }
         for w in &program.writes {
-            let target = store.buffers.get_mut(&w.buffer)?;
+            let target = store.buffers.get_mut(w.buffer)?;
             target.holds = None;
-            self.queue.write_buffer(&target.buffer, (w.offset * 4) as u64, bytemuck::cast_slice(memory(w.block.at, w.block.len)));
+            self.queue.write_buffer(&target.buffer, (w.offset * 4) as u64, bytemuck::cast_slice(bits(&w.block.words)));
         }
         let bytes = (program.passes.len().max(1) as u64) * PARAMS_SLOT;
         if store.params.as_ref().is_none_or(|(_, size)| *size < bytes) {
@@ -355,7 +320,7 @@ impl Gpu {
         }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         // why: a copy target (the frame's LUTs side by side) that already holds these sources at these offsets is left as it is
-        let mut targets: Vec<&str> = program.copies.iter().map(|c| c.to.as_str()).collect();
+        let mut targets: Vec<&str> = program.copies.iter().map(|c| c.to).collect();
         targets.dedup();
         for to in targets {
             let copies = program.copies.iter().filter(|c| c.to == to);
@@ -396,7 +361,7 @@ impl Gpu {
         // why: one compute pass holds every dispatch (a serial Metal encoder orders them), instead of an encoder each
         let mut compute = (!profile).then(|| encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()).forget_lifetime());
         for (pass, bind) in program.passes.iter().zip(&binds) {
-            let pipeline = self.pipelines.get(pass.entry.as_str())?;
+            let pipeline = self.pipelines.get(pass.entry)?;
             let groups = (pass.groups[0].max(1) as u32, pass.groups[1].max(1) as u32);
             if let Some(compute) = compute.as_mut() {
                 compute.set_pipeline(pipeline);
@@ -412,39 +377,23 @@ impl Gpu {
             }
             let t = std::time::Instant::now();
             self.queue.submit([std::mem::replace(&mut encoder, self.device.create_command_encoder(&Default::default())).finish()]);
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.done()?;
             eprintln!("  {:>18} {:>5}x{:<5} {:.2} ms", pass.entry, pass.groups[0], pass.groups[1], t.elapsed().as_secs_f64() * 1000.0);
         }
         drop(compute);
-        let total: u64 = program.reads.iter().map(|r| (r.len * 4) as u64).sum();
+        let total: u64 = program.reads.iter().map(|r| (r.into.len() * 4) as u64).sum();
         if self.mappable {
             self.queue.submit([encoder.finish()]);
             if pollster::block_on(scope.pop()).is_some() {
                 return None;
             }
-            mark(store, program);
-            let reads: Vec<(&Read, &wgpu::Buffer)> = program.reads.iter().filter(|r| r.len > 0).map(|r| store.buffers.get(&r.buffer).map(|b| (r, &b.buffer))).collect::<Option<_>>()?;
-            let mapped: Vec<_> = reads
-                .iter()
-                .map(|(r, b)| {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    b.slice(..(r.len * 4) as u64).map_async(wgpu::MapMode::Read, move |m| {
-                        let _ = tx.send(m);
-                    });
-                    rx
-                })
-                .collect();
-            if !reads.is_empty() {
-                self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-            }
-            for ((r, b), rx) in reads.iter().zip(mapped) {
-                rx.recv().ok()?.ok()?;
-                {
-                    let view = b.slice(..(r.len * 4) as u64).get_mapped_range().ok()?;
-                    let dst = unsafe { std::slice::from_raw_parts_mut(r.at as *mut u8, r.len * 4) };
-                    dst.copy_from_slice(&view);
-                }
-                b.unmap();
+            mark(store, &program);
+            for read in program.reads.iter_mut().filter(|r| !r.into.is_empty()) {
+                let buffer = store.buffers.get(&read.buffer)?.buffer.clone();
+                let slice = buffer.slice(..(read.into.len() * 4) as u64);
+                self.map(&slice, wgpu::MapMode::Read)?;
+                bytemuck::cast_slice_mut(read.into).copy_from_slice(&slice.get_mapped_range().ok()?);
+                buffer.unmap();
             }
             return Some(());
         }
@@ -454,45 +403,48 @@ impl Gpu {
         }
         let mut offset = 0u64;
         for r in &program.reads {
+            let bytes = (r.into.len() * 4) as u64;
             if let Some((out, _)) = &store.staging {
-                encoder.copy_buffer_to_buffer(&store.buffers.get(&r.buffer)?.buffer, 0, out, offset, Some((r.len * 4) as u64));
+                encoder.copy_buffer_to_buffer(&store.buffers.get(&r.buffer)?.buffer, 0, out, offset, Some(bytes));
             }
-            offset += (r.len * 4) as u64;
+            offset += bytes;
         }
         self.queue.submit([encoder.finish()]);
         if pollster::block_on(scope.pop()).is_some() {
             return None;
         }
-        mark(store, program);
+        mark(store, &program);
         if total == 0 {
             return Some(());
         }
-        let (out, _) = store.staging.as_ref()?;
+        let out = store.staging.as_ref()?.0.clone();
         let slice = out.slice(..total);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        rx.recv().ok()?.ok()?;
+        self.map(&slice, wgpu::MapMode::Read)?;
         {
             let mapped = slice.get_mapped_range().ok()?;
             let mut at = 0usize;
-            for r in &program.reads {
-                let bytes = r.len * 4;
-                let dst = unsafe { std::slice::from_raw_parts_mut(r.at as *mut u8, bytes) };
-                dst.copy_from_slice(&mapped[at..at + bytes]);
+            for r in program.reads.iter_mut() {
+                let bytes = r.into.len() * 4;
+                bytemuck::cast_slice_mut(r.into).copy_from_slice(&mapped[at..at + bytes]);
                 at += bytes;
             }
         }
         out.unmap();
         Some(())
     }
+
+    fn done(&self) -> Option<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.queue.on_submitted_work_done(move || {
+            let _ = tx.send(());
+        });
+        self.settle(|| rx.try_recv().ok())
+    }
 }
 
 fn mark(store: &mut Store, program: &Program) {
     for k in program.keep.iter().filter(|k| !k.need) {
-        if let Some(b) = store.buffers.get_mut(&k.buffer) {
+        if let Some(b) = store.buffers.get_mut(k.buffer) {
             b.holds = Some(k.id.clone());
         }
     }
@@ -526,7 +478,7 @@ fn shader() -> String {
 static SHARED: std::sync::OnceLock<Arc<Gpu>> = std::sync::OnceLock::new();
 
 impl Gpu {
-    fn release(&self, keep: impl Fn(&str) -> bool) {
+    fn release(&self, keep: fn(&str) -> bool) {
         let Ok(mut store) = self.store.lock() else { return };
         let gone: Vec<String> = store.buffers.keys().filter(|k| !keep(k)).cloned().collect();
         for name in gone {
@@ -548,29 +500,39 @@ impl Gpu {
         store.params = None;
         drop(store);
         // why: destroyed buffers are freed once the device sees their last submission finish
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = self.done();
     }
+}
+
+// why: a render holds the store while it runs, and freeing waits for the GPU, so neither happens on the thread that
+// asked (the main thread, between frames)
+fn release_later(keep: fn(&str) -> bool, then: fn(&Gpu)) {
+    let Some(gpu) = SHARED.get().cloned() else { return };
+    std::thread::spawn(move || {
+        gpu.release(keep);
+        then(&gpu);
+    });
 }
 
 // why: scratch buffers grow to the largest render (a zoomed window, an export band) and would stay that size; once
 // rendering settles they're dropped and the next render makes them again at its own size
 pub fn trim() {
-    if let Some(gpu) = SHARED.get() {
-        gpu.release(|name| !name.starts_with("tmp:") && !name.starts_with("keep:"));
-        if std::env::var_os("FILMLAB_TRACE").is_some()
-            && let Ok(store) = gpu.store.lock()
-        {
-            let words: usize = store.buffers.values().map(|b| b.words).sum();
-            eprintln!("gpu trim: {} buffers, {:.0} MB kept {:?}", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, store.order);
-        }
-    }
+    release_later(
+        |name| !name.starts_with("tmp:") && !name.starts_with("keep:"),
+        |gpu| {
+            if std::env::var_os("FILMLAB_TRACE").is_some()
+                && let Ok(store) = gpu.store.lock()
+            {
+                let words: usize = store.buffers.values().map(|b| b.words).sum();
+                eprintln!("gpu trim: {} buffers, {:.0} MB kept {:?}", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, store.order);
+            }
+        },
+    );
 }
 
 /// Drops every buffer, film textures included, for when no photo is open.
 pub fn reset() {
-    if let Some(gpu) = SHARED.get() {
-        gpu.release(|name| name.starts_with("lut:"));
-    }
+    release_later(|name| name.starts_with("lut:"), |_| ());
 }
 
 pub fn share(gpu: &Arc<Gpu>) {
@@ -580,14 +542,16 @@ pub fn share(gpu: &Arc<Gpu>) {
 pub struct Runner(pub Arc<Gpu>);
 
 impl filmlab_engine::Runner for Runner {
-    fn run(&self, program: &str) -> bool {
-        serde_json::from_str::<Program>(program).ok().and_then(|p| self.0.execute(&p)).is_some()
+    fn run(&self, program: Program) -> bool {
+        self.0.execute(program).is_some()
     }
 
-    fn upload(&self, block: &str) {
-        let Ok(block) = serde_json::from_str::<Block>(block) else { return };
+    fn upload(&self, block: Block) {
+        if self.0.stalled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Ok(mut store) = self.0.store.lock() {
-            self.0.upload_into(&mut store, &block.id.clone(), &block, false);
+            self.0.upload_into(&mut store, &block.id, &block, false);
             // why: an upload waits for the next submit; flushing it here keeps its staging memory from piling up
             self.0.queue.submit(std::iter::empty());
             let _ = self.0.device.poll(wgpu::PollType::Poll);
