@@ -150,7 +150,7 @@ pub fn same_plan(a: Option<&Plan>, b: &Plan) -> bool {
 }
 
 fn still_covers(previous: Option<&Plan>, wanted: &Plan, camera: Camera, native: Native, viewport: Size) -> bool {
-    previous.is_some_and(|p| same_look(p, wanted) && p.view["maxW"] == wanted.view["maxW"] && covers(p.region, visible_region(camera, native, viewport)))
+    previous.is_some_and(|p| !super::pan::pieced(p) && same_look(p, wanted) && p.view["maxW"] == wanted.view["maxW"] && covers(p.region, visible_region(camera, native, viewport)))
 }
 
 pub fn plans(inputs: &Inputs, zoom: Zoom, viewport: Size, shown_detail: Option<&Plan>) -> Vec<Plan> {

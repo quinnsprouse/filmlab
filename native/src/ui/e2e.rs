@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use filmlab_engine::core::{self, Engine};
@@ -11,6 +12,7 @@ use super::driver::Driver;
 use super::inspector::Ui;
 use super::tools::crop;
 use super::wheels::GradingWheels;
+use crate::camera::Zoom;
 use crate::develop::plans::Plan;
 use crate::develop::{Compare, DisplayFrame, Tool};
 use crate::film::{FilmSettings, Gauge};
@@ -859,6 +861,7 @@ async fn zoom(run: &mut Run, cx: &mut AsyncApp) {
     let panned = run.read(cx, |a, cx| a.develop.read(cx).camera);
     run.check("zoom: dragging pans the 1:1 view", camera.zip(panned).is_some_and(|(a, b)| (a.cx - b.cx).abs() > 1e-4 || (a.cy - b.cy).abs() > 1e-4), "");
     run.verify(cx, "zoom: the panned window matches an independent render", true).await;
+    slow_pan(run, cx).await;
 
     run.key(cx, "z");
     let back = run.wait(cx, 5, move |a, cx| (a.develop.read(cx).camera.scale - fit).abs() < 1e-6).await;
@@ -869,6 +872,26 @@ async fn zoom(run: &mut Run, cx: &mut AsyncApp) {
     run.key(cx, "space");
     run.wait(cx, 5, move |a, cx| (a.develop.read(cx).camera.scale - fit).abs() < 1e-6).await;
     run.verify(cx, "zoom: fit again matches", false).await;
+}
+
+async fn slow_pan(run: &mut Run, cx: &mut AsyncApp) {
+    let Some((camera, native)) = run.read(cx, |a, cx| (a.develop.read(cx).camera, a.develop.read(cx).native)) else { return };
+    let (mut pieced, mut landed) = (false, 0);
+    let mut last = run.read(cx, |a, cx| a.develop.read(cx).detail.as_ref().map(|f| Arc::as_ptr(f) as usize)).flatten();
+    for i in 0..90 {
+        let at = camera.cx + 6.0 * f64::from(i) / native.0;
+        run.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: camera.scale, cx: at, cy: camera.cy }, false, true, cx));
+        run.pause(cx, 16).await;
+        let (now, strip) = run.read(cx, |a, cx| {
+            let d = a.develop.read(cx);
+            (d.detail.as_ref().map(|f| Arc::as_ptr(f) as usize), d.shown_plan(true).is_some_and(crate::develop::pan::pieced))
+        }).unwrap_or((None, false));
+        pieced |= strip;
+        landed += usize::from(now != last);
+        last = now;
+    }
+    run.check("zoom: a slow pan joins newly rendered strips onto the 1:1 view while it moves", pieced, format!("{landed} detail frames while moving"));
+    run.verify(cx, "zoom: where a slow pan stops matches an independent render", true).await;
 }
 
 async fn pointer_sweep(run: &mut Run, cx: &mut AsyncApp) -> (f64, f64) {

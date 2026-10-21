@@ -1,3 +1,4 @@
+pub mod pan;
 pub mod plans;
 mod shared;
 
@@ -633,7 +634,10 @@ impl Develop {
 
     pub fn pump(&mut self, cx: &mut Context<Develop>) {
         self.stop_unwanted();
-        if self.running.is_some() || self.settle.is_some() {
+        if self.running.is_some() {
+            return;
+        }
+        if self.settle.is_some() && self.pan_ahead(cx) {
             return;
         }
         self.drop_stale_detail();
@@ -974,9 +978,8 @@ impl Develop {
                     develop.pump(cx);
                 });
             }));
-        } else {
-            self.pump(cx);
         }
+        self.pump(cx);
         cx.notify();
     }
 
