@@ -14,6 +14,9 @@ printf '{"folder":"%s","photo":null}' "$roll" >"$home/Library/Application Suppor
 
 cd "$(dirname "$0")/.."
 cargo build --release --quiet
-HOME="$home" FILMLAB_MCP=0 FILMLAB_E2E=1 FILMLAB_E2E_SHOTS="$out/shots" ./target/release/filmlab 2>&1 | tee "$out/full.log" | grep '^e2e' | tee "$out/e2e.log"
+rm -rf "$out/parity"
+HOME="$home" FILMLAB_MCP=0 FILMLAB_E2E=1 FILMLAB_E2E_SHOTS="$out/shots" FILMLAB_E2E_PARITY="$out/parity" ./target/release/filmlab 2>&1 | tee "$out/full.log" | grep '^e2e' | tee "$out/e2e.log"
+HOME="$home" FILMLAB_MCP=0 FILMLAB_E2E=parity FILMLAB_CPU=1 FILMLAB_E2E_PARITY="$out/parity" ./target/release/filmlab 2>&1 | tee "$out/parity.log" | grep '^e2e' | tee -a "$out/e2e.log"
+rm -rf "$out/parity"
 echo "screenshots: $out/shots"
 ! grep -q ' FAIL ' "$out/e2e.log"

@@ -193,9 +193,16 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         .ok()
         .flatten();
     let run = Run { driver: Driver { app: app.downgrade(), window }, shots, number, started: Instant::now(), passed: 0, failed: Vec::new() };
+    let parity = std::env::var("FILMLAB_E2E").is_ok_and(|v| v == "parity");
     cx.spawn(async move |cx| {
         let mut run = run;
-        script(&mut run, cx).await;
+        if parity {
+            for (name, ok, detail) in cx.background_spawn(async { super::parity::compare() }).await {
+                run.check(&name, ok, detail);
+            }
+        } else {
+            script(&mut run, cx).await;
+        }
         eprintln!("e2e done: {} passed, {} failed {:?}", run.passed, run.failed.len(), run.failed);
         cx.update(|cx| cx.quit());
     })
@@ -205,6 +212,10 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
 async fn script(run: &mut Run, cx: &mut AsyncApp) {
     library(run, cx).await;
     let Some((id, folder, stem, facts)) = open_first(run, cx).await else { return };
+    let photo = run.read(cx, |a, cx| a.library.read(cx).record(&id).map(|r| r.file.path.clone())).flatten().unwrap_or_default();
+    for (name, ok, detail) in cx.background_spawn(async move { super::parity::record(&photo) }).await {
+        run.check(&name, ok, detail);
+    }
     edits(run, cx, &folder, &stem, &facts).await;
     film(run, cx).await;
     color_controls(run, cx).await;

@@ -15,6 +15,7 @@ pub mod inspector;
 pub mod motion;
 pub mod oklch;
 pub mod panel;
+pub mod parity;
 pub mod rail;
 pub mod range;
 pub mod slider;
