@@ -98,6 +98,8 @@ struct ViewRequest {
     film: Option<FilmRequest>,
     #[serde(default)]
     curve_input: bool,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, Default)]
@@ -163,7 +165,7 @@ impl ViewRequest {
         RenderRequest {
             max_w: self.max_w,
             max_h: self.max_h,
-            quality: Quality::Full,
+            quality: if self.draft { Quality::Draft } else { Quality::Full },
             apply_crop: self.apply_crop,
             overlay: self.overlay.map_or(Overlay::None, OverlayRequest::overlay),
             space: OutputSpace::Srgb,
@@ -939,7 +941,7 @@ impl Engine {
             film: v.film.as_ref(),
             light: light_of(&s, &req),
             view: stored.as_ref().and_then(|k| self.scenes.remove(k)),
-            look: self.looks.remove(key),
+            look: if v.draft { None } else { self.looks.remove(key) },
             look_key: look_key(key, &s, &req),
             native: native_frame(loaded.width, loaded.height, &s),
         };
@@ -955,11 +957,12 @@ impl Engine {
         if let (Some(k), Some(view)) = (stored, outcome.view) {
             self.scenes.insert(k, view);
         }
-        if let Some(look) = outcome.look {
+        if let Some(look) = outcome.look.filter(|_| !v.draft) {
             self.looks.insert(key.to_string(), look);
         }
         let Some(mut rendered) = outcome.rendered.filter(|_| !stop::stopped()) else { return Ok(None) };
-        if let Some(h) = spent("hdr histogram", || pipeline::hdr_histogram(&src.image, &info, &s, &req)) {
+        let histogram = if v.draft { pipeline::drag_hdr_histogram } else { pipeline::hdr_histogram };
+        if let Some(h) = spent("hdr histogram", || histogram(&src.image, &info, &s, &req)) {
             rendered.histogram = h;
         }
         if stop::stopped() {

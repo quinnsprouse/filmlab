@@ -509,10 +509,21 @@ pub const HDR_HISTOGRAM_DRAG_EDGE: usize = 192;
 /// high-bit-depth, windowed and proofed requests (their histogram stays the image's).
 pub fn hdr_histogram(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> Option<Histogram> {
     // a drag's drafts keep their own histogram: a second render per tick would slow them down
-    if !s.hdr.enabled || req.depth != OutputDepth::U8 || req.window.is_some() || req.proof.is_some() || req.quality == Quality::Draft {
+    if req.quality == Quality::Draft {
         return None;
     }
-    let k = (HDR_HISTOGRAM_EDGE as f64 / req.max_w.max(req.max_h).max(1) as f64).min(1.0);
+    hdr_histogram_at(src, info, s, req, HDR_HISTOGRAM_EDGE)
+}
+
+pub fn drag_hdr_histogram(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> Option<Histogram> {
+    hdr_histogram_at(src, info, s, req, HDR_HISTOGRAM_DRAG_EDGE)
+}
+
+fn hdr_histogram_at(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, edge: usize) -> Option<Histogram> {
+    if !s.hdr.enabled || req.depth != OutputDepth::U8 || req.window.is_some() || req.proof.is_some() {
+        return None;
+    }
+    let k = (edge as f64 / req.max_w.max(req.max_h).max(1) as f64).min(1.0);
     let size = |v: usize| ((v as f64 * k).round() as usize).max(1);
     let hreq = RenderRequest {
         max_w: size(req.max_w),

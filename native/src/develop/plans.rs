@@ -133,6 +133,7 @@ pub fn draft_plan(fit: &Plan) -> Plan {
         view[k] = json!((view[k].as_f64().unwrap_or(1.0) / 2.0).round().max(1.0) as usize);
     }
     view["stages"] = json!("draft");
+    view["draft"] = json!(true);
     Plan { view, ..fit.clone() }
 }
 

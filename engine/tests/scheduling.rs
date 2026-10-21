@@ -44,6 +44,14 @@ fn window(film: Option<Value>) -> Value {
     view
 }
 
+fn draft(mut view: Value) -> Value {
+    view["maxW"] = json!(200);
+    view["maxH"] = json!(200);
+    view["stages"] = json!("draft");
+    view["draft"] = json!(true);
+    view
+}
+
 fn exposed(settings: &Value, ev: f64) -> Value {
     let mut s = settings.clone();
     s["light"]["exposure"] = json!(ev);
@@ -109,4 +117,63 @@ fn a_render_nobody_stops_matches_a_plain_render() {
     let always: Wanted = Arc::new(|| true);
     let mut frame = engine_with(&raw, &facts).render_while("photo", &settings.to_string(), &view.to_string(), Some(always)).unwrap().expect("a wanted render finishes");
     assert!(frame.take_rgba() == plain);
+}
+
+fn settles_after_drafts(film: Option<Value>) {
+    let (raw, facts, settings) = photo();
+    let settled = exposed(&settings, 0.3);
+    let fit_view = fit("loupe", film.clone());
+    let zoom_view = window(film);
+    let settle = |engine: &mut Engine| (pixels(engine, &settled, &fit_view), pixels(engine, &settled, &zoom_view));
+
+    let mut undragged = engine_with(&raw, &facts);
+    pixels(&mut undragged, &settings, &fit_view);
+    let (expected_fit, expected_zoom) = settle(&mut undragged);
+
+    let mut dragged = engine_with(&raw, &facts);
+    pixels(&mut dragged, &settings, &fit_view);
+    for step in 0..6 {
+        let ev = 0.05 * f64::from(step);
+        assert!(!pixels(&mut dragged, &exposed(&settings, ev), &draft(fit_view.clone())).is_empty());
+    }
+    let (fit_after, zoom_after) = settle(&mut dragged);
+    assert!(fit_after == expected_fit, "the fit frame after a drag's drafts differs from one without them");
+    assert!(zoom_after == expected_zoom, "the zoomed window after a drag's drafts differs from one without them");
+}
+
+#[test]
+fn the_frame_after_a_drags_drafts_is_the_one_without_them() {
+    settles_after_drafts(None);
+    settles_after_drafts(Some(film()));
+}
+
+#[test]
+fn a_draft_is_drawn_at_draft_quality() {
+    let (raw, facts, settings) = photo();
+    let mut s = settings.clone();
+    s["light"]["shadows"] = json!(60);
+    let mut engine = Engine::new();
+    engine.load("photo", &facts, &raw, 2048).unwrap();
+    let full = json!({"maxW": 2000, "maxH": 2000, "stages": "full"});
+    let at_full = pixels(&mut engine, &s, &full);
+    let at_draft = pixels(&mut engine, &s, &json!({"maxW": 2000, "maxH": 2000, "stages": "draft", "draft": true}));
+    assert_eq!(at_full.len(), at_draft.len());
+    assert!(at_full != at_draft, "the draft rendered at full quality");
+}
+
+fn hdr_scale(histogram: &[u32]) -> &[u32] {
+    &histogram[histogram.len() - 2..]
+}
+
+#[test]
+fn a_draft_of_an_hdr_edit_keeps_the_hdr_histogram() {
+    let (raw, facts, settings) = photo();
+    let mut hdr = settings.clone();
+    hdr["hdr"]["enabled"] = json!(true);
+    let mut engine = engine_with(&raw, &facts);
+    let full = engine.render("photo", &hdr.to_string(), &fit("loupe", None).to_string()).unwrap().take_histogram();
+    let drafted = engine.render("photo", &hdr.to_string(), &draft(fit("loupe", None)).to_string()).unwrap().take_histogram();
+    let sdr = engine.render("photo", &settings.to_string(), &draft(fit("loupe", None)).to_string()).unwrap().take_histogram();
+    assert_ne!(hdr_scale(&full), hdr_scale(&sdr), "the HDR edit's histogram has no HDR scale");
+    assert_eq!(hdr_scale(&drafted), hdr_scale(&full), "the draft's histogram lost its HDR scale");
 }
