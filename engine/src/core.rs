@@ -478,6 +478,7 @@ impl Frame {
     }
 }
 
+#[derive(Clone)]
 struct Loaded {
     source: DecodedSource,
     header: SourceInfo,
@@ -544,6 +545,7 @@ impl CachedScene {
 }
 
 /// A photo decoded outside any engine, so a slow raw decode never holds an engine's lock.
+#[derive(Clone)]
 pub struct Decoded(Loaded);
 
 pub fn decode(facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<Decoded> {

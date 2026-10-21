@@ -1,10 +1,12 @@
 pub mod plans;
+mod shared;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use filmlab_engine::core::{self, Commands, Engine};
+use filmlab_engine::core::{self, Commands, Engine, Wanted};
 use gpui_kit::{AppContext, Context, Entity, Task};
 use serde_json::{Value, json};
 
@@ -12,6 +14,7 @@ use crate::camera::{Camera, Native, Region, Size, WHOLE, Zoom, camera_of, mix_lo
 use crate::film::{FilmSettings, render_film};
 use crate::library::{Library, PhotoState, ensure_luts};
 use plans::{Inputs, Layer, Level, Plan, fit_plan, plans, same_plan};
+use shared::Shared;
 
 const COALESCE: Duration = Duration::from_millis(900);
 const SAVE_DELAY: Duration = Duration::from_millis(700);
@@ -109,6 +112,30 @@ struct Animation {
     started: Instant,
 }
 
+#[derive(Clone)]
+struct Wish(Arc<AtomicBool>);
+
+impl Wish {
+    fn new() -> Wish {
+        Wish(Arc::new(AtomicBool::new(true)))
+    }
+
+    fn drop_it(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+
+    fn wanted(&self) -> Wanted {
+        let wish = self.0.clone();
+        Arc::new(move || wish.load(Ordering::Relaxed))
+    }
+}
+
+struct Running {
+    plan: Plan,
+    curve_input: bool,
+    wish: Wish,
+}
+
 pub struct Develop {
     library: Entity<Library>,
     pub photo_id: Option<String>,
@@ -133,11 +160,12 @@ pub struct Develop {
     pub native: Native,
     commands: Commands,
     path: Option<std::path::PathBuf>,
-    engine: Arc<Mutex<Engine>>,
+    engine: Shared,
+    ahead_engine: Shared,
     loading: HashSet<String>,
     ready: HashSet<String>,
     shown: HashMap<bool, Plan>,
-    in_flight: bool,
+    running: Option<Running>,
     settle: Option<Task<()>>,
     save: Option<Task<()>>,
     trim: Option<Task<()>>,
@@ -147,7 +175,7 @@ pub struct Develop {
     pub applied: Option<Applied>,
     /// Fit frames of the neighbouring photos, rendered while idle so the arrow keys show them at once.
     prerendered: HashMap<String, (Plan, Arc<DisplayFrame>)>,
-    prerendering: bool,
+    prerendering: Option<Wish>,
     idle: Option<Task<()>>,
     step: isize,
     edited: Option<Instant>,
@@ -266,11 +294,12 @@ impl Develop {
             native: (1.0, 1.0),
             commands: Commands::new(),
             path: None,
-            engine: Arc::new(Mutex::new(Engine::new())),
+            engine: Shared::default(),
+            ahead_engine: Shared::default(),
             loading: HashSet::new(),
             ready: HashSet::new(),
             shown: HashMap::new(),
-            in_flight: false,
+            running: None,
             settle: None,
             save: None,
             trim: None,
@@ -279,7 +308,7 @@ impl Develop {
             load_token: 0,
             applied: None,
             prerendered: HashMap::new(),
-            prerendering: false,
+            prerendering: None,
             idle: None,
             step: 1,
             edited: None,
@@ -362,6 +391,7 @@ impl Develop {
         self.shown.clear();
         self.applied = None;
         self.rested = false;
+        self.stop_unwanted();
         self.commands.detach();
         if let Err(e) = self.commands.open(&probed.facts.to_string(), &state.settings.to_string()) {
             self.error = Some(e);
@@ -374,18 +404,7 @@ impl Develop {
             self.ready.remove(key);
             self.loading.remove(key);
         }
-        // why: a render may hold the engine for tens of milliseconds; releasing off the main thread keeps the switch smooth
-        if !stale.is_empty() {
-            let engine = self.engine.clone();
-            cx.background_spawn(async move {
-                if let Ok(mut engine) = engine.lock() {
-                    for key in stale {
-                        engine.release(&key);
-                    }
-                }
-            })
-            .detach();
-        }
+        self.let_go(stale, cx);
         let wanted: HashSet<&str> = neighbours.iter().map(|(n, _, _)| n.as_str()).collect();
         let mut adopt = self.prerendered.remove(id);
         self.prerendered.retain(|n, _| wanted.contains(n.as_str()));
@@ -440,11 +459,7 @@ impl Develop {
                 }
                 self.pump(cx);
             }
-            Ok(()) => {
-                if let Ok(mut engine) = self.engine.lock() {
-                    engine.release(&key);
-                }
-            }
+            Ok(()) => self.let_go(vec![key], cx),
             Err(e) if wanted && current => {
                 self.status = Status::Failed;
                 self.error = Some(e);
@@ -473,7 +488,7 @@ impl Develop {
             return;
         }
         self.loading.insert(key.clone());
-        let engine = self.engine.clone();
+        let engines = self.engines_for(Level::Preview);
         cx.spawn(async move |this, cx| {
             let loaded = {
                 let key = key.clone();
@@ -482,8 +497,7 @@ impl Develop {
                         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                         core::decode(&facts, &bytes, Level::Preview.max_edge())
                     })?;
-                    engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
-                    Ok::<(), String>(())
+                    insert(&engines, &key, decoded)
                 })
                 .await
             };
@@ -499,7 +513,7 @@ impl Develop {
             return;
         }
         self.loading.insert(key.clone());
-        let engine = self.engine.clone();
+        let engines = self.engines_for(level);
         cx.spawn(async move |this, cx| {
             let loaded = {
                 let key = key.clone();
@@ -510,8 +524,7 @@ impl Develop {
                     if std::env::var_os("FILMLAB_TRACE").is_some() {
                         eprintln!("decode {key} {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
-                    engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
-                    Ok::<(), String>(())
+                    insert(&engines, &key, decoded)
                 })
                 .await
             };
@@ -552,8 +565,75 @@ impl Develop {
         }
     }
 
+    fn unwanted(&self, running: &Running) -> bool {
+        let plan = &running.plan;
+        if self.photo_id.as_deref() != Some(plan.photo_id.as_str()) {
+            return true;
+        }
+        if running.curve_input {
+            return self.dragging.is_some() || self.next_plan().is_some();
+        }
+        match plan.layer {
+            Layer::Detail => self.target_zoom() == Zoom::Fit,
+            Layer::Fit if plans::is_draft(plan) => self.dragging.is_none(),
+            Layer::Fit => self.dragging.is_some() && self.tool == Tool::Edit && plan.revision != self.planned_revision(),
+        }
+    }
+
+    fn stop_unwanted(&mut self) {
+        if let Some(running) = &self.running
+            && self.unwanted(running)
+        {
+            running.wish.drop_it();
+        }
+    }
+
+    fn stop_prerender(&mut self) {
+        if let Some(wish) = &self.prerendering {
+            wish.drop_it();
+        }
+    }
+
+    fn engines_for(&self, level: Level) -> Vec<Shared> {
+        match level {
+            Level::Preview => vec![self.engine.clone(), self.ahead_engine.clone()],
+            Level::Full => vec![self.engine.clone()],
+        }
+    }
+
+    fn tidy(&self, engines: &[Shared], chore: impl Fn(&mut Engine) + Send + Sync + 'static, cx: &mut Context<Develop>) {
+        let chore = Arc::new(chore);
+        for shared in engines {
+            let chore = chore.clone();
+            if !shared.later(move |engine| chore(engine)) {
+                let shared = shared.clone();
+                cx.background_spawn(async move {
+                    let _ = shared.with(|_| ());
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn let_go(&self, keys: Vec<String>, cx: &mut Context<Develop>) {
+        if keys.is_empty() {
+            return;
+        }
+        let engines = self.engines_for(Level::Preview);
+        self.tidy(
+            &engines,
+            move |engine| {
+                for key in &keys {
+                    engine.release(key);
+                }
+            },
+            cx,
+        );
+    }
+
     pub fn pump(&mut self, cx: &mut Context<Develop>) {
-        if self.in_flight || self.settle.is_some() {
+        self.stop_unwanted();
+        if self.running.is_some() || self.settle.is_some() {
             return;
         }
         self.drop_stale_detail();
@@ -567,20 +647,23 @@ impl Develop {
         };
         self.trim = None;
         self.idle = None;
-        self.in_flight = true;
+        self.stop_prerender();
         let started = Instant::now();
-        let rendering = self.rendering(&plan, cx);
+        let wish = Wish::new();
+        let rendering = self.rendering(&plan, &wish, cx);
+        self.running = Some(Running { plan: plan.clone(), curve_input: false, wish });
         cx.spawn(async move |this, cx| {
             let rendered = rendering.await;
             if std::env::var_os("FILMLAB_TRACE").is_some()
-                && let Ok(f) = &rendered
+                && let Ok(Some(f)) = &rendered
             {
                 eprintln!("render {:?} {}x{} {:.1} ms rev {} {:?} {}", plan.layer, f.width, f.height, started.elapsed().as_secs_f64() * 1000.0, plan.revision, plan.level, plan.view);
             }
             let _ = this.update(cx, |develop, cx| {
-                develop.in_flight = false;
+                develop.running = None;
                 match rendered {
-                    Ok(mut f) => {
+                    Ok(None) => {}
+                    Ok(Some(mut f)) => {
                         if develop.photo_id.as_deref() == Some(plan.photo_id.as_str()) {
                             let region = match (plan.layer, plan.view["window"].as_array()) {
                                 (Layer::Detail, Some(w)) => {
@@ -610,8 +693,9 @@ impl Develop {
         .detach();
     }
 
-    fn rendering(&self, plan: &Plan, cx: &mut Context<Develop>) -> Task<Result<core::Frame, String>> {
+    fn rendering(&self, plan: &Plan, wish: &Wish, cx: &mut Context<Develop>) -> Task<Result<Option<core::Frame>, String>> {
         let engine = self.engine.clone();
+        let wanted = wish.wanted();
         let key = source_key(&plan.photo_id, plan.level);
         let mut view = plan.view.clone();
         if let Some(o) = &plan.overlay {
@@ -625,10 +709,10 @@ impl Develop {
         cx.background_spawn(async move {
             // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
             // render that holds it would deadlock the pool
-            let mut engine = engine.lock().map_err(|e| e.to_string())?;
-            let engine = &mut *engine;
-            ensure_luts(engine, film.as_ref())?;
-            crate::perf::interactive(|| engine.render(&key, &settings, &view.to_string()))
+            engine.with(|engine| {
+                ensure_luts(engine, film.as_ref())?;
+                crate::perf::interactive(|| engine.render_while(&key, &settings, &view.to_string(), Some(wanted)))
+            })?
         })
     }
 
@@ -656,14 +740,20 @@ impl Develop {
 
     fn measure_curve_input(&mut self, cx: &mut Context<Develop>) -> bool {
         let Some((plan, made_from)) = self.curve_input_plan() else { return false };
-        self.in_flight = true;
-        let rendering = self.rendering(&plan, cx);
+        let wish = Wish::new();
+        let rendering = self.rendering(&plan, &wish, cx);
+        let photo_id = plan.photo_id.clone();
+        self.running = Some(Running { plan, curve_input: true, wish });
         cx.spawn(async move |this, cx| {
             let rendered = rendering.await;
             let _ = this.update(cx, |develop, cx| {
-                develop.in_flight = false;
-                let (width, height, rgba) = rendered.map_or((0, 0, Vec::new()), |mut f| (f.width, f.height, f.take_rgba()));
-                if develop.photo_id.as_deref() == Some(plan.photo_id.as_str()) {
+                develop.running = None;
+                let (width, height, rgba) = match rendered {
+                    Ok(None) => return develop.pump(cx),
+                    Ok(Some(mut f)) => (f.width, f.height, f.take_rgba()),
+                    Err(_) => (0, 0, Vec::new()),
+                };
+                if develop.photo_id.as_deref() == Some(photo_id.as_str()) {
                     develop.curve_input = Some(Arc::new(CurveInput { width, height, rgba, made_from }));
                 }
                 cx.notify();
@@ -701,7 +791,7 @@ impl Develop {
     }
 
     pub fn idle_for(&self, wait: Duration) -> bool {
-        !self.in_flight && self.last_request.elapsed() >= wait
+        self.running.is_none() && self.last_request.elapsed() >= wait
     }
 
     pub fn tick(&mut self) -> bool {
@@ -734,7 +824,7 @@ impl Develop {
             return;
         }
         self.loading.insert(key.clone());
-        let engine = self.engine.clone();
+        let engines = self.engines_for(Level::Full);
         let facts = facts.to_string();
         cx.spawn(async move |this, cx| {
             let loaded = {
@@ -745,8 +835,7 @@ impl Develop {
                         core::decode(&facts, &bytes, Level::Full.max_edge())
                     };
                     let decoded = if urgent { crate::perf::initiated(decode) } else { crate::perf::background(decode) }?;
-                    engine.lock().map_err(|e| e.to_string())?.insert(&key, decoded);
-                    Ok::<(), String>(())
+                    insert(&engines, &key, decoded)
                 })
                 .await
             };
@@ -757,15 +846,19 @@ impl Develop {
 
     // why: a zoomed window's caches (full-size stages, its film scene, the whole-frame look) are worth keeping only
     // while zoomed
-    fn forget_zoom(&mut self) {
+    fn forget_zoom(&mut self, cx: &mut Context<Develop>) {
         let Some(id) = self.photo_id.clone() else { return };
         self.detail = None;
         self.shown.remove(&true);
-        if let Ok(mut engine) = self.engine.lock() {
-            for level in [Level::Preview, Level::Full] {
-                engine.forget_view(&source_key(&id, level), "loupe-zoom");
-            }
-        }
+        self.tidy(
+            std::slice::from_ref(&self.engine),
+            move |engine| {
+                for level in [Level::Preview, Level::Full] {
+                    engine.forget_view(&source_key(&id, level), "loupe-zoom");
+                }
+            },
+            cx,
+        );
     }
 
     /// Lets go of everything the open photo holds (decodes, caches, frames), for when Develop isn't on screen.
@@ -773,11 +866,7 @@ impl Develop {
         self.flush(cx);
         self.load_token += 1;
         let keys: Vec<String> = self.ready.drain().chain(self.loading.drain()).collect();
-        if let Ok(mut engine) = self.engine.lock() {
-            for key in keys {
-                engine.release(&key);
-            }
-        }
+        self.let_go(keys, cx);
         self.commands.detach();
         self.photo_id = None;
         self.path = None;
@@ -786,8 +875,10 @@ impl Develop {
         self.curve_input = None;
         self.shown.clear();
         self.prerendered.clear();
+        self.stop_prerender();
         self.rested = false;
         self.status = Status::Idle;
+        self.stop_unwanted();
         crate::gpu::reset();
         crate::perf::give_back();
         cx.notify();
@@ -798,7 +889,7 @@ impl Develop {
     /// `quiet` at the fit view; `wake` decodes it again.
     pub fn rest(&mut self, quiet: Duration, cx: &mut Context<Develop>) {
         let Some(id) = self.photo_id.clone() else { return };
-        if self.status != Status::Ready || self.target_zoom() != Zoom::Fit || !self.loading.is_empty() || self.prerendering || !self.idle_for(quiet) {
+        if self.status != Status::Ready || self.target_zoom() != Zoom::Fit || !self.loading.is_empty() || self.prerendering.is_some() || !self.idle_for(quiet) {
             return;
         }
         self.rested = true;
@@ -806,14 +897,14 @@ impl Develop {
         if !self.ready.remove(&full) {
             return;
         }
-        let engine = self.engine.clone();
-        cx.background_spawn(async move {
-            if let Ok(mut engine) = engine.lock() {
+        self.tidy(
+            std::slice::from_ref(&self.engine),
+            move |engine| {
                 engine.release(&full);
-            }
-            crate::perf::give_back();
-        })
-        .detach();
+                crate::perf::give_back();
+            },
+            cx,
+        );
     }
 
     // why: one at a time, each on every core, so the first is ready in about the time of one cold open; side by side
@@ -833,22 +924,21 @@ impl Develop {
         }
         wanted.retain(|(key, ..)| !self.ready.contains(key) && !self.loading.contains(key));
         self.loading.extend(wanted.iter().map(|(key, ..)| key.clone()));
-        let engine = self.engine.clone();
+        let (preview, full) = (self.engines_for(Level::Preview), self.engines_for(Level::Full));
         cx.spawn(async move |this, cx| {
             for (key, facts, path, level) in wanted {
                 // why: a photo opened meanwhile takes what it no longer needs out of `loading`
                 if !this.read_with(cx, |develop, _| develop.loading.contains(&key)).unwrap_or(false) {
                     continue;
                 }
-                let (engine, inserted) = (engine.clone(), key.clone());
+                let (engines, inserted) = (if level == Level::Full { full.clone() } else { preview.clone() }, key.clone());
                 let loaded = cx
                     .background_spawn(async move {
                         let decoded = crate::perf::initiated(|| {
                             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                             core::decode(&facts, &bytes, level.max_edge())
                         })?;
-                        engine.lock().map_err(|e| e.to_string())?.insert(&inserted, decoded);
-                        Ok::<(), String>(())
+                        insert(&engines, &inserted, decoded)
                     })
                     .await;
                 if this.update(cx, |develop, cx| develop.landed(key, loaded, cx)).is_err() {
@@ -862,11 +952,12 @@ impl Develop {
     pub fn set_zoom(&mut self, zoom: Zoom, animate: bool, gesture: bool, cx: &mut Context<Develop>) {
         self.last_request = Instant::now();
         if zoom == Zoom::Fit && self.zoom != Zoom::Fit {
-            self.forget_zoom();
+            self.forget_zoom(cx);
         } else if zoom != Zoom::Fit {
             self.ensure_full(cx);
         }
         self.zoom = zoom;
+        self.stop_unwanted();
         let target = camera_of(zoom, self.native, self.viewport);
         if animate {
             self.animation = Some(Animation { from: self.camera, to: target, started: Instant::now() });
@@ -892,7 +983,7 @@ impl Develop {
     /// Shows a neighbour's frame rendered ahead, when it was made from the same settings at the same size.
     fn adopt(&mut self, plan: Plan, frame: Arc<DisplayFrame>) {
         let Some(inputs) = self.inputs() else { return };
-        let wanted = fit_plan(&inputs, self.viewport);
+        let Some(wanted) = self.runnable(&fit_plan(&inputs, self.viewport)) else { return };
         if self.target_zoom() == Zoom::Fit && plan.look == wanted.look && plan.settings == wanted.settings && plan.view == wanted.view && plan.level == wanted.level {
             self.fit = Some(frame);
             self.shown.insert(false, Plan { revision: wanted.revision, ..plan });
@@ -921,7 +1012,7 @@ impl Develop {
     // dropped) so switching shows the finished photo at once; then the open photo's full-size source is decoded so the
     // first zoom is quick, on Macs with the memory for it
     fn ahead(&mut self, cx: &mut Context<Develop>) {
-        if self.prerendering || self.in_flight || self.settle.is_some() || self.animation.is_some() || self.viewport.width < 1.0 {
+        if self.prerendering.is_some() || self.running.is_some() || self.settle.is_some() || self.animation.is_some() || self.viewport.width < 1.0 {
             return;
         }
         let Some(current) = self.photo_id.clone() else { return };
@@ -931,13 +1022,15 @@ impl Develop {
                 continue;
             }
             let Some(inputs) = self.neighbour_inputs(&id, cx) else { continue };
-            let plan = fit_plan(&inputs, self.viewport);
+            let plan = Plan { level: Level::Preview, ..fit_plan(&inputs, self.viewport) };
             let fresh = self.prerendered.get(&id).is_some_and(|(p, _)| p.look == plan.look && p.settings == plan.settings && p.view == plan.view);
-            if fresh || plan.level != Level::Preview {
+            if fresh {
                 continue;
             }
-            self.prerendering = true;
-            let engine = self.engine.clone();
+            let wish = Wish::new();
+            let wanted = wish.wanted();
+            self.prerendering = Some(wish);
+            let engine = self.ahead_engine.clone();
             let mut view = plan.view.clone();
             view["stages"] = json!(PREFETCH);
             if let Some(f) = &plan.film {
@@ -947,17 +1040,17 @@ impl Develop {
             cx.spawn(async move |this, cx| {
                 let rendered = cx
                     .background_spawn(async move {
-                        let mut engine = engine.lock().map_err(|e| e.to_string())?;
-                        let engine = &mut *engine;
-                        ensure_luts(engine, film.as_ref())?;
-                        let frame = crate::perf::initiated(|| engine.render(&key, &settings, &view.to_string()));
-                        engine.forget_view(&key, PREFETCH);
-                        frame
+                        engine.with(|engine| {
+                            ensure_luts(engine, film.as_ref())?;
+                            let frame = crate::perf::initiated(|| engine.render_while(&key, &settings, &view.to_string(), Some(wanted)));
+                            engine.forget_view(&key, PREFETCH);
+                            frame
+                        })?
                     })
                     .await;
                 let _ = this.update(cx, |develop, cx| {
-                    develop.prerendering = false;
-                    if let Ok(mut f) = rendered {
+                    develop.prerendering = None;
+                    if let Ok(Some(mut f)) = rendered {
                         let frame = Arc::new(DisplayFrame { width: f.width, height: f.height, rgba: f.take_rgba(), region: WHOLE, histogram: f.take_histogram() });
                         develop.prerendered.insert(id, (plan, frame));
                     }
@@ -1246,7 +1339,7 @@ impl Develop {
         let film = if before { None } else { render_film(self.film.as_ref()) };
         let ready = |level| self.ready.contains(&source_key(&id, level));
         let level = if ready(Level::Full) { Level::Full } else if ready(Level::Preview) { Level::Preview } else { return None };
-        Some(RenderJob { engine: self.engine.clone(), key: source_key(&id, level), full: level == Level::Full, settings, film, facts: self.facts.clone()? })
+        Some(RenderJob { engine: self.engine.engine(), key: source_key(&id, level), full: level == Level::Full, settings, film, facts: self.facts.clone()? })
     }
 
     /// The engine and key holding `id`'s decode at `max_edge` (0: full size), when it is the open photo and that
@@ -1254,7 +1347,7 @@ impl Develop {
     pub fn decode_at(&self, id: &str, max_edge: usize) -> Option<(Arc<Mutex<Engine>>, String)> {
         let level = [Level::Preview, Level::Full].into_iter().find(|l| l.max_edge() == max_edge)?;
         let key = source_key(self.photo_id.as_deref().filter(|open| *open == id)?, level);
-        self.ready.contains(&key).then(|| (self.engine.clone(), key))
+        self.ready.contains(&key).then(|| (self.engine.engine(), key))
     }
 
     /// Whether the full-resolution source is decoded, or the photo is small enough that the preview is full size.
@@ -1299,4 +1392,13 @@ pub struct Applied {
     pub before_film: Option<FilmSettings>,
     pub step: usize,
     pub photo_id: Option<String>,
+}
+
+fn insert(engines: &[Shared], key: &str, decoded: core::Decoded) -> Result<(), String> {
+    let (main, others) = engines.split_first().ok_or("no engine to decode into")?;
+    for other in others {
+        let (key, decoded) = (key.to_string(), decoded.clone());
+        other.later(move |engine| engine.insert(&key, decoded));
+    }
+    main.with(|engine| engine.insert(key, decoded))
 }

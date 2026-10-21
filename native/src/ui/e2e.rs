@@ -364,6 +364,21 @@ async fn edits(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     run.check("edit: an agent's change is marked until you take it over", marked && cleared && back, format!("marked {marked}, cleared {cleared}, marked again after undo {back}"));
     run.develop(cx, |d, cx| d.undo(cx));
     run.verify(cx, "edit: undoing the agent's change matches", false).await;
+
+    let step = run.read(cx, |a, cx| a.develop.read(cx).cursor).unwrap_or(0);
+    let mut drafted = false;
+    for i in 0..30 {
+        let v = 0.4 + f64::from(i) / 100.0;
+        run.develop(cx, move |d, cx| d.edit_controls(&[("light.exposure", v)], "Exposure", cx));
+        run.pause(cx, 16).await;
+        drafted |= run.read(cx, |a, cx| a.develop.read(cx).shown_plan(false).is_some_and(crate::develop::plans::is_draft)).unwrap_or(false);
+    }
+    run.develop(cx, |d, cx| d.release(cx));
+    run.verify(cx, "edit: a slider drag settles to a frame that matches an independent render", false).await;
+    let added = run.read(cx, |a, cx| a.develop.read(cx).cursor).unwrap_or(0).saturating_sub(step);
+    run.check("edit: a slider drag draws drafts while it moves and is one undo step", drafted && added == 1, format!("drafts shown {drafted}, {added} steps"));
+    run.develop(cx, |d, cx| d.undo(cx));
+    run.verify(cx, "edit: undoing the drag matches", false).await;
 }
 
 async fn film(run: &mut Run, cx: &mut AsyncApp) {
