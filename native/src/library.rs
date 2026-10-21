@@ -767,7 +767,7 @@ impl Library {
                     let existing = std::fs::read_to_string(&target).ok();
                     let state = serde_json::to_string(&state).map_err(|e| e.to_string())?;
                     let text = core::write_sidecar(&facts, &state, existing)?;
-                    std::fs::write(&target, text).map_err(|e| e.to_string())
+                    crate::files::write_atomic(&target, text.as_bytes()).map_err(|e| e.to_string())
                 })
                 .await
             };

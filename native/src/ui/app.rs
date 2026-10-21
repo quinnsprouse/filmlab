@@ -94,7 +94,7 @@ fn remember(folder: &std::path::Path, photo: Option<&str>) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(file, serde_json::json!({"folder": folder, "photo": photo}).to_string());
+    crate::files::write_atomic_soon(file, serde_json::json!({"folder": folder, "photo": photo}).to_string().into_bytes());
 }
 
 fn last_session() -> Option<(PathBuf, Option<String>)> {

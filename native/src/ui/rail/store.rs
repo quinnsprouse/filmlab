@@ -68,7 +68,7 @@ pub fn write(profiles: &[Profile]) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string(profiles) {
-        let _ = std::fs::write(path, text);
+        let _ = crate::files::write_atomic(&path, text.as_bytes());
     }
 }
 

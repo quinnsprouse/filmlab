@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use filmlab_engine::core::{self, Engine};
@@ -16,7 +17,7 @@ use crate::camera::Zoom;
 use crate::develop::plans::Plan;
 use crate::develop::{Compare, DisplayFrame, Tool};
 use crate::film::{FilmSettings, Gauge};
-use crate::library::ensure_luts;
+use crate::library::{Saving, ensure_luts};
 use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, StockKind};
 
@@ -226,6 +227,43 @@ async fn script(run: &mut Run, cx: &mut AsyncApp) {
     navigation(run, cx, &id).await;
     export(run, cx).await;
     leave(run, cx, &folder, &stem, &facts).await;
+    torn_writes(run, cx, &folder, &stem, &facts).await;
+}
+
+/// Reads `path` as a sidecar until `stop`: how many reads, and how many found anything but a whole sidecar.
+fn read_while(path: PathBuf, facts: String, stop: Arc<AtomicBool>) -> (usize, usize) {
+    let (mut reads, mut torn) = (0, 0);
+    while !stop.load(Ordering::Relaxed) {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        reads += 1;
+        if !text.trim_end().ends_with("<?xpacket end=\"w\"?>") || core::read_sidecar(&facts, &text).is_err() {
+            torn += 1;
+        }
+    }
+    (reads, torn)
+}
+
+async fn torn_writes(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, facts: &Value) {
+    let found = run.read(cx, |a, cx| a.library.read(cx).photos.iter().find(|r| r.file.stem == stem).and_then(|r| Some((r.file.id.clone(), r.file.sidecar.clone()?, r.state.as_ref()?.rating)))).flatten();
+    let Some((id, path, rating)) = found else { return run.check("sidecars: the edited photo has a sidecar to rewrite", false, "") };
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = std::thread::spawn({
+        let (stop, facts) = (stop.clone(), facts.to_string());
+        move || read_while(path, facts, stop)
+    });
+    for i in 0..40u8 {
+        let ids = vec![id.clone()];
+        run.act(cx, move |a, cx| a.library.update(cx, |l, cx| l.set_rating(&ids, i % 6, cx)));
+        run.pause(cx, 15).await;
+    }
+    let ids = vec![id.clone()];
+    run.act(cx, move |a, cx| a.library.update(cx, |l, cx| l.set_rating(&ids, rating, cx)));
+    let saved = run.wait(cx, 10, |a, cx| a.library.read(cx).saving != Saving::Saving).await;
+    stop.store(true, Ordering::Relaxed);
+    let (reads, torn) = reader.join().unwrap_or((0, usize::MAX));
+    run.check("sidecars: a sidecar read while it is rewritten is always whole", saved && reads > 0 && torn == 0, format!("{torn} of {reads} reads torn"));
+    let left: Vec<String> = std::fs::read_dir(folder).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| crate::files::is_temporary(n)).collect()).unwrap_or_default();
+    run.check("sidecars: rewriting leaves no temporary file behind", left.is_empty(), format!("{left:?}"));
 }
 
 fn rgba_of(image: &RenderImage) -> Option<Vec<u8>> {

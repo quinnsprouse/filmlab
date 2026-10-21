@@ -1089,7 +1089,7 @@ fn write_snapshots(all: &BTreeMap<String, Vec<Snapshot>>) -> Result<(), String> 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, serde_json::to_string(all).map_err(|e| e.to_string())?).map_err(|e| format!("unable to save snapshots: {e}"))
+    crate::files::write_atomic(&path, serde_json::to_string(all).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| format!("unable to save snapshots: {e}"))
 }
 
 #[derive(Deserialize)]
