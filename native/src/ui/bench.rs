@@ -130,6 +130,59 @@ async fn library(driver: &Driver, cx: &mut AsyncApp, launch: f64) {
     });
 }
 
+fn frame_of(a: &FilmlabApp, cx: &App, detail: bool) -> Option<usize> {
+    let d = a.develop.read(cx);
+    if detail { d.detail.as_ref() } else { d.fit.as_ref() }.map(|f| std::sync::Arc::as_ptr(f) as usize)
+}
+
+struct Moves {
+    frames: usize,
+    worst: Duration,
+    took: Duration,
+}
+
+// why: what the hand feels while it moves is how often a new frame comes back and the longest wait for one
+async fn moves(driver: &Driver, cx: &mut AsyncApp, detail: bool, count: u32, step: impl Fn(u32, &mut AsyncApp)) -> Moves {
+    let mut last = driver.read(cx, |a, cx| frame_of(a, cx, detail)).flatten();
+    let (mut frames, mut worst, started) = (0usize, Duration::ZERO, Instant::now());
+    let mut since = started;
+    for i in 0..count {
+        step(i, cx);
+        let tick = Instant::now();
+        while tick.elapsed() < Duration::from_millis(16) {
+            let now = driver.read(cx, |a, cx| frame_of(a, cx, detail)).flatten();
+            if now != last {
+                frames += 1;
+                last = now;
+                worst = worst.max(since.elapsed());
+                since = Instant::now();
+            }
+            cx.background_executor().timer(Duration::from_millis(1)).await;
+        }
+    }
+    Moves { frames, worst: worst.max(since.elapsed()), took: started.elapsed() }
+}
+
+async fn drag_exposure(driver: &Driver, cx: &mut AsyncApp, photo: &str, name: &str) {
+    cx.background_executor().timer(Duration::from_millis(400)).await;
+    let d = driver.clone();
+    let dragged = moves(driver, cx, false, 60, move |i, cx| {
+        let v = -0.5 + f64::from(i) / 60.0;
+        d.develop(cx, move |d, cx| d.edit_controls(&[("light.exposure", v)], "Exposure", cx));
+    })
+    .await;
+    driver.develop(cx, |d, cx| d.release(cx));
+    let p = photo.to_string();
+    let full = until(driver, cx, 30, move |a, cx| !a.develop.read(cx).drafting() && shows(a, cx, &p)).await;
+    eprintln!(
+        "bench {name:<28} {:>7.1} fps over {:.0} ms, worst gap {:.1} ms, full frame {:.1} ms after release",
+        dragged.frames as f64 / dragged.took.as_secs_f64(),
+        ms(dragged.took),
+        ms(dragged.worst),
+        full.map_or(f64::NAN, ms)
+    );
+}
+
 pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
     if std::env::var_os("FILMLAB_BENCH").is_none() {
         return;
@@ -245,30 +298,19 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         }
         report("edit halation (fit)", &mut film);
 
-        // why: a real slider drag sends an edit every frame; what the hand feels is how many frames come back while
-        // it moves, and how soon the full frame lands once it stops
-        cx.background_executor().timer(Duration::from_millis(400)).await;
-        let frame_of = |a: &FilmlabApp, cx: &App| a.develop.read(cx).fit.as_ref().map(|f| std::sync::Arc::as_ptr(f) as usize);
-        let mut last = driver.read(cx, frame_of).flatten();
-        let (mut frames, started) = (0usize, Instant::now());
-        for i in 0..60 {
-            let v = -0.5 + f64::from(i) / 60.0;
-            driver.develop(cx, move |d, cx| d.edit_controls(&[("light.exposure", v)], "Exposure", cx));
-            let tick = Instant::now();
-            while tick.elapsed() < Duration::from_millis(16) {
-                let now = driver.read(cx, frame_of).flatten();
-                if now != last {
-                    frames += 1;
-                    last = now;
-                }
-                cx.background_executor().timer(Duration::from_millis(1)).await;
-            }
-        }
-        let dragged = started.elapsed();
-        driver.develop(cx, |d, cx| d.release(cx));
+        drag_exposure(&driver, cx, &photo, "drag exposure (fit, film)").await;
+        let film = driver.film(cx);
+        driver.develop(cx, |d, cx| {
+            let settings = d.settings.clone()?;
+            d.restore(settings, None, "No film", "bench.film", cx).ok()
+        });
+        drag_exposure(&driver, cx, &photo, "drag exposure (fit, no film)").await;
+        driver.develop(cx, move |d, cx| {
+            let settings = d.settings.clone()?;
+            d.restore(settings, film, "Film", "bench.film", cx).ok()
+        });
         let p = photo.clone();
-        let full = until(&driver, cx, 30, move |a, cx| !a.develop.read(cx).drafting() && shows(a, cx, &p)).await;
-        eprintln!("bench {:<28} {:>7.1} fps over {:.0} ms, full frame {:.1} ms after release", "drag exposure (fit)", frames as f64 / dragged.as_secs_f64(), ms(dragged), full.map_or(f64::NAN, ms));
+        until(&driver, cx, 30, move |a, cx| shows(a, cx, &p)).await;
 
         let mut zoom = Vec::new();
         for i in 0..4 {
@@ -286,6 +328,29 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
             cx.background_executor().timer(Duration::from_millis(300)).await;
         }
         report("zoom to 1:1 / pan", &mut zoom);
+
+        let native = driver.read(cx, |a, cx| a.develop.read(cx).native).unwrap_or((1.0, 1.0));
+        let d = driver.clone();
+        let panned = moves(&driver, cx, true, 40, move |i, cx| {
+            let c = 0.4 + 6.0 * f64::from(i) / native.0;
+            d.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: 0.5 }, false, true, cx));
+        })
+        .await;
+        let settled = until(&driver, cx, 60, |a, cx| {
+            let d = a.develop.read(cx);
+            let seen = crate::develop::plans::visible_region(d.camera, d.native, d.viewport);
+            let covers = |r: &crate::camera::Region| r.u0 <= seen.u0 + 1e-6 && r.v0 <= seen.v0 + 1e-6 && r.u1 >= seen.u1 - 1e-6 && r.v1 >= seen.v1 - 1e-6;
+            d.detail.is_some() && d.idle_for(Duration::ZERO) && d.shown_plan(true).is_some_and(|p| p.revision == d.planned_revision() && covers(&p.region))
+        })
+        .await;
+        eprintln!(
+            "bench {:<28} {:>7.1} fps over {:.0} ms, worst gap {:.1} ms, settled {:.1} ms after the last move",
+            "pan 1:1 (6 px a frame)",
+            panned.frames as f64 / panned.took.as_secs_f64(),
+            ms(panned.took),
+            ms(panned.worst),
+            settled.map_or(f64::NAN, ms)
+        );
         driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
         driver.act(cx, |a, cx| a.set_mode(Mode::Browse, cx));
         cx.background_executor().timer(Duration::from_millis(300)).await;
