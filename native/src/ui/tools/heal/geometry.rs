@@ -11,6 +11,11 @@ pub struct Mapping {
     pub scale: f64,
 }
 
+/// A spot's radius in window points, for a frame of `frame` pixels drawn at `scale` pixels a point.
+pub fn radius_of(size: f64, frame: (u32, u32), scale: f64) -> f64 {
+    size * f64::from(frame.0.max(frame.1)) / scale
+}
+
 pub fn distance(a: V, b: V) -> f64 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
@@ -37,7 +42,7 @@ impl Mapping {
     }
 
     pub fn radius_of(&self, size: f64) -> f64 {
-        size * f64::from(self.frame.0.max(self.frame.1)) / self.scale
+        radius_of(size, self.frame, self.scale)
     }
 
     pub fn shapes_of(&self, spots: &[Spot]) -> Vec<SpotShape> {

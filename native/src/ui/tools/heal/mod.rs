@@ -4,9 +4,13 @@ mod overlay;
 mod panel;
 mod spots;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui_kit::*;
 
-use self::geometry::Grip;
+use self::draw::Strokes;
+use self::geometry::{Grip, SpotShape};
 use self::overlay::Gesture;
 use self::spots::{Mode, Spot, V};
 use crate::ui::app::FilmlabApp;
@@ -31,6 +35,23 @@ pub struct State {
     grips: Vec<Grip>,
     focus: Option<FocusHandle>,
     adds: u32,
+    seen: RefCell<Option<Seen>>,
+    shapes: Option<Shapes>,
+}
+
+/// The open photo's spots as of a develop revision.
+struct Seen {
+    revision: u64,
+    spots: Rc<[Spot]>,
+}
+
+/// The spots as drawn on a frame of `frame` pixels at `scale`, as of a develop revision.
+struct Shapes {
+    revision: u64,
+    frame: (u32, u32),
+    scale: f64,
+    shapes: Rc<[SpotShape]>,
+    strokes: Strokes,
 }
 
 impl Default for State {
@@ -45,6 +66,8 @@ impl Default for State {
             grips: Vec::new(),
             focus: None,
             adds: 0,
+            seen: RefCell::default(),
+            shapes: None,
         }
     }
 }
@@ -67,7 +90,12 @@ impl State {
     }
 }
 
-fn current(app: &FilmlabApp, cx: &App) -> (Option<String>, Vec<Spot>) {
+fn current(app: &FilmlabApp, cx: &App) -> (Option<String>, Rc<[Spot]>) {
     let d = app.develop.read(cx);
-    (d.photo_id.clone(), spots::spots_of(d.settings.as_ref()))
+    let mut seen = app.tools.heal.seen.borrow_mut();
+    let spots = match seen.as_ref().filter(|s| s.revision == d.revision) {
+        Some(s) => s.spots.clone(),
+        None => seen.insert(Seen { revision: d.revision, spots: spots::spots_of(d.settings.as_ref()).into() }).spots.clone(),
+    };
+    (d.photo_id.clone(), spots)
 }

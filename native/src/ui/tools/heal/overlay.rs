@@ -1,9 +1,12 @@
+use std::rc::Rc;
+
 use gpui_kit::*;
 use serde_json::json;
 
-use super::draw::Scene;
-use super::geometry::{Grip, Mapping, distance, grip_at, grips_of};
-use super::spots::{self, SIZE_MAX, SIZE_MIN, V};
+use super::draw::{Scene, Strokes};
+use super::geometry::{Grip, Mapping, SpotShape, distance, grip_at, grips_of, radius_of};
+use super::spots::{self, SIZE_MAX, SIZE_MIN, Spot, V};
+use super::{Shapes, State};
 use crate::develop::Compare;
 use crate::ui::app::FilmlabApp;
 
@@ -23,31 +26,47 @@ fn mapping(app: &FilmlabApp, cx: &App, frame: (u32, u32), scale: f64) -> Option<
     Some(Mapping { facts: d.facts.as_ref()?.to_string(), settings: d.settings.as_ref()?.to_string(), frame, scale })
 }
 
+fn shapes_of(app: &mut FilmlabApp, cx: &App, frame: (u32, u32), scale: f64, spots: &[Spot]) -> Option<(Rc<[SpotShape]>, Strokes)> {
+    let revision = app.develop.read(cx).revision;
+    if let Some(s) = app.tools.heal.shapes.as_ref().filter(|s| s.revision == revision && s.frame == frame && s.scale == scale) {
+        return Some((s.shapes.clone(), s.strokes.clone()));
+    }
+    let shapes: Rc<[SpotShape]> = mapping(app, cx, frame, scale)?.shapes_of(spots).into();
+    app.tools.heal.grips = grips_of(&shapes);
+    let strokes = Strokes::default();
+    app.tools.heal.shapes = Some(Shapes { revision, frame, scale, shapes: shapes.clone(), strokes: strokes.clone() });
+    Some((shapes, strokes))
+}
+
+/// What the pointer shows: the brush ring (where, if drawn) and whether it is over a spot's grip.
+#[derive(PartialEq)]
+struct Pointer {
+    ring: Option<V>,
+    over_grip: bool,
+    moving: bool,
+}
+
+fn pointer(h: &State, selected: Option<usize>) -> Pointer {
+    let moving = matches!(h.gesture, Some(Gesture::Move { moved: true, .. }));
+    let idle = !moving && h.paint.is_empty();
+    let over_grip = h.hover.filter(|_| idle).and_then(|at| grip_at(&h.grips, at, selected)).is_some();
+    Pointer { ring: h.hover.filter(|_| idle && !over_grip), over_grip, moving }
+}
+
 pub fn overlay(app: &mut FilmlabApp, frame: Bounds<Pixels>, window: &mut Window, cx: &mut Context<FilmlabApp>) -> Option<AnyElement> {
     let (_, size) = app.fit_frame(window, cx)?;
     if app.develop.read(cx).compare == Compare::Before {
         return None;
     }
-    let map = mapping(app, cx, size, f64::from(window.scale_factor()))?;
+    let scale = f64::from(window.scale_factor());
     let (photo, spots) = super::current(app, cx);
-    let shapes = map.shapes_of(&spots);
-    let grips = grips_of(&shapes);
+    let (shapes, strokes) = shapes_of(app, cx, size, scale, &spots)?;
     let h = &mut app.tools.heal;
     let selected = h.selected(photo.as_deref(), spots.len());
     let focus = h.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-    let moving = matches!(h.gesture, Some(Gesture::Move { moved: true, .. }));
-    let idle = !moving && h.paint.is_empty();
-    let over_grip = h.hover.filter(|_| idle).and_then(|at| grip_at(&grips, at, selected)).is_some();
-    let scene = Scene {
-        shapes,
-        selected,
-        paint: h.paint.clone(),
-        cursor: h.hover.filter(|_| idle && !over_grip),
-        radius: map.radius_of(h.brush.size),
-        feather: h.brush.feather,
-    };
-    h.grips = grips;
-    let cursor = if moving { CursorStyle::ClosedHand } else if over_grip { CursorStyle::OpenHand } else { CursorStyle::Crosshair };
+    let shown = pointer(h, selected);
+    let scene = Scene { shapes, strokes, selected, paint: h.paint.clone(), cursor: shown.ring, radius: radius_of(h.brush.size, size, scale), feather: h.brush.feather };
+    let cursor = if shown.moving { CursorStyle::ClosedHand } else if shown.over_grip { CursorStyle::OpenHand } else { CursorStyle::Crosshair };
     Some(
         div()
             .id("heal-overlay")
@@ -102,13 +121,16 @@ fn moved(app: &mut FilmlabApp, event: &MouseMoveEvent, frame: Bounds<Pixels>, si
     }
     let at = local(event.position, frame);
     let scale = f64::from(window.scale_factor());
+    let (photo, spots) = super::current(app, cx);
     let h = &mut app.tools.heal;
+    let selected = h.selected(photo.as_deref(), spots.len());
+    let shown = pointer(h, selected);
     h.hover = Some(at);
     if h.gesture.is_some() && event.pressed_button != Some(MouseButton::Left) {
         finish(app, size, scale, cx);
         return;
     }
-    match h.gesture.take() {
+    let painted = match h.gesture.take() {
         Some(Gesture::Move { grip, start, mut last, mut moved }) => {
             if moved || distance(start, at) >= DRAG_THRESHOLD {
                 let from = last;
@@ -119,17 +141,22 @@ fn moved(app: &mut FilmlabApp, event: &MouseMoveEvent, frame: Bounds<Pixels>, si
             } else {
                 app.tools.heal.gesture = Some(Gesture::Move { grip, start, last, moved });
             }
+            false
         }
         Some(Gesture::Paint) => {
             h.gesture = Some(Gesture::Paint);
             let radius = f64::from(size.0.max(size.1)) * h.brush.size / scale;
-            if h.paint.last().is_none_or(|&l| distance(l, at) >= (radius * 0.35).max(2.0)) {
+            let far = h.paint.last().is_none_or(|&l| distance(l, at) >= (radius * 0.35).max(2.0));
+            if far {
                 h.paint.push(at);
             }
+            far
         }
-        None => {}
+        None => false,
+    };
+    if painted || pointer(&app.tools.heal, selected) != shown {
+        cx.notify();
     }
-    cx.notify();
 }
 
 fn drag_grip(app: &mut FilmlabApp, cx: &mut Context<FilmlabApp>, size: (u32, u32), scale: f64, grip: Grip, from: V, to: V) {

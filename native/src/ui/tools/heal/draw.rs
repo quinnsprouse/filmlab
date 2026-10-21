@@ -1,11 +1,25 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui_kit::*;
 
 use super::geometry::{SpotShape, distance};
 use super::spots::V;
 use crate::ui::theme;
 
+/// The strokes each spot draws (its brushed path, its source's, the dashed link between them), built once for the
+/// frame's origin: building a stroke is most of what drawing a spot costs.
+pub type Strokes = Rc<RefCell<Option<(Point<Pixels>, Vec<SpotStrokes>)>>>;
+
+pub struct SpotStrokes {
+    target: Option<Path<Pixels>>,
+    source: Option<Path<Pixels>>,
+    link: Option<Path<Pixels>>,
+}
+
 pub struct Scene {
-    pub shapes: Vec<SpotShape>,
+    pub shapes: Rc<[SpotShape]>,
+    pub strokes: Strokes,
     pub selected: Option<usize>,
     pub paint: Vec<V>,
     pub cursor: Option<V>,
@@ -29,8 +43,8 @@ fn circle(window: &mut Window, origin: Point<Pixels>, c: V, r: f64, fill: Option
     window.paint_quad(quad(bounds, Corners::all(px(r)), background, Edges::all(px(width)), color, BorderStyle::Solid));
 }
 
-fn polyline(window: &mut Window, origin: Point<Pixels>, points: &[V], width: f32, color: Hsla, dash: Option<&[Pixels]>) {
-    let Some((first, rest)) = points.split_first() else { return };
+fn stroke(origin: Point<Pixels>, points: &[V], width: f32, dash: Option<&[Pixels]>) -> Option<Path<Pixels>> {
+    let (first, rest) = points.split_first()?;
     let mut builder = PathBuilder::stroke(px(width));
     if let Some(dash) = dash {
         builder = builder.dash_array(dash);
@@ -39,18 +53,37 @@ fn polyline(window: &mut Window, origin: Point<Pixels>, points: &[V], width: f32
     for p in rest {
         builder.line_to(at(origin, *p));
     }
-    if let Ok(path) = builder.build() {
+    builder.build().ok()
+}
+
+fn polyline(window: &mut Window, origin: Point<Pixels>, points: &[V], width: f32, color: Hsla) {
+    if let Some(path) = stroke(origin, points, width, None) {
         window.paint_path(path, color);
     }
 }
 
+fn brushed(origin: Point<Pixels>, points: &[V], radius: f64) -> Option<Path<Pixels>> {
+    (points.len() > 1).then(|| stroke(origin, points, (radius * 2.0) as f32, None)).flatten()
+}
+
+fn strokes_of(origin: Point<Pixels>, shape: &SpotShape) -> SpotStrokes {
+    let link = shape.points.first().zip(shape.source_points.first()).and_then(|(&target, &source)| link(origin, shape.radius, target, source));
+    SpotStrokes { target: brushed(origin, &shape.points, shape.radius), source: brushed(origin, &shape.source_points, shape.radius), link }
+}
+
 impl Scene {
     pub fn paint(&self, origin: Point<Pixels>, window: &mut Window) {
-        for shape in &self.shapes {
-            self.spot(window, origin, shape, Some(shape.index) == self.selected);
+        let mut built = self.strokes.borrow_mut();
+        if built.as_ref().is_none_or(|(o, _)| *o != origin) {
+            *built = Some((origin, self.shapes.iter().map(|s| strokes_of(origin, s)).collect()));
+        }
+        if let Some((_, strokes)) = built.as_ref() {
+            for (shape, strokes) in self.shapes.iter().zip(strokes) {
+                self.spot(window, origin, shape, strokes, Some(shape.index) == self.selected);
+            }
         }
         if !self.paint.is_empty() {
-            polyline(window, origin, &self.paint, (self.radius * 2.0) as f32, white(0.3), None);
+            polyline(window, origin, &self.paint, (self.radius * 2.0) as f32, white(0.3));
             if let [only] = self.paint[..] {
                 circle(window, origin, only, self.radius, Some(white(0.3)), None);
             }
@@ -61,25 +94,27 @@ impl Scene {
         }
     }
 
-    fn spot(&self, window: &mut Window, origin: Point<Pixels>, shape: &SpotShape, selected: bool) {
-        outline(window, origin, &shape.points, shape.radius, if selected { 1.0 } else { 0.6 });
+    fn spot(&self, window: &mut Window, origin: Point<Pixels>, shape: &SpotShape, strokes: &SpotStrokes, selected: bool) {
+        outline(window, origin, &shape.points, strokes.target.as_ref(), shape.radius, if selected { 1.0 } else { 0.6 });
         let (Some(&target), Some(&source)) = (shape.points.first(), shape.source_points.first()) else {
             if let Some(&target) = shape.points.first() {
                 pin(window, origin, target, selected);
             }
             return;
         };
-        outline(window, origin, &shape.source_points, shape.radius, if selected { 0.8 } else { 0.35 });
-        link(window, origin, shape.radius, target, source);
+        outline(window, origin, &shape.source_points, strokes.source.as_ref(), shape.radius, if selected { 0.8 } else { 0.35 });
+        if let Some(link) = &strokes.link {
+            window.paint_path(link.clone(), white(0.7));
+        }
         circle(window, origin, source, 3.0, Some(white(if selected { 1.0 } else { 0.5 })), None);
         pin(window, origin, target, selected);
     }
 }
 
-fn outline(window: &mut Window, origin: Point<Pixels>, points: &[V], radius: f64, alpha: f32) {
+fn outline(window: &mut Window, origin: Point<Pixels>, points: &[V], brushed: Option<&Path<Pixels>>, radius: f64, alpha: f32) {
     let (Some(&first), Some(&last)) = (points.first(), points.last()) else { return };
-    if points.len() > 1 {
-        polyline(window, origin, points, (radius * 2.0) as f32, white(0.15), None);
+    if let Some(path) = brushed {
+        window.paint_path(path.clone(), white(0.15));
     }
     circle(window, origin, first, radius, None, Some((1.25, white(alpha))));
     if points.len() > 1 {
@@ -94,13 +129,13 @@ fn pin(window: &mut Window, origin: Point<Pixels>, c: V, selected: bool) {
     circle(window, origin, c, 2.0, Some(white(if selected { 1.0 } else { 0.6 })), None);
 }
 
-fn link(window: &mut Window, origin: Point<Pixels>, radius: f64, target: V, source: V) {
+fn link(origin: Point<Pixels>, radius: f64, target: V, source: V) -> Option<Path<Pixels>> {
     let gap = distance(target, source);
     if gap < 1.0 || gap <= radius * 2.0 {
-        return;
+        return None;
     }
     let unit = ((target.0 - source.0) / gap, (target.1 - source.1) / gap);
     let from = (source.0 + unit.0 * radius, source.1 + unit.1 * radius);
     let to = (target.0 - unit.0 * radius, target.1 - unit.1 * radius);
-    polyline(window, origin, &[from, to], 1.0, white(0.7), Some(&[px(4.0), px(3.0)]));
+    stroke(origin, &[from, to], 1.0, Some(&[px(4.0), px(3.0)]))
 }
