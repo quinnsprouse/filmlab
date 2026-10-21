@@ -2,7 +2,8 @@
 set -eu
 
 # Times what a user waits for (launch, indexing, opening and switching photos, edits, zoom) on a copy of a photo
-# folder, with an empty cache and a fresh HOME, and prints the "bench" lines.
+# folder, with an empty cache and a fresh HOME, and prints the "bench" lines. FILMLAB_BENCH=library stops after the
+# library's first paint, indexing, scrolling and memory.
 photos=${1:?usage: native/scripts/bench.sh <photo folder> [output folder]}
 out=${2:-$(mktemp -d)}
 home="$out/home"
@@ -16,4 +17,4 @@ printf '{"folder":"%s","photo":null}' "$roll" >"$home/Library/Application Suppor
 
 cd "$(dirname "$0")/.."
 cargo build --release --quiet
-HOME="$home" FILMLAB_MCP=0 FILMLAB_BENCH=1 ./target/release/filmlab 2>&1 | tee "$out/full.log" | grep '^bench'
+HOME="$home" FILMLAB_MCP=0 FILMLAB_BENCH="${FILMLAB_BENCH:-1}" ./target/release/filmlab 2>&1 | tee "$out/full.log" | grep '^bench'
