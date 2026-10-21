@@ -14,6 +14,7 @@ use super::look::State;
 use super::{Answer, Output, args, effect, look};
 use crate::film::{Dust, FilmSettings, GAUGES, Gauge, Halation, STOCK_DUST};
 use crate::mcp::session::{Edit, Held, Hub, NO_PHOTO, control_values};
+use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
 use crate::ui::driver::Driver;
 use crate::ui::rail::store::{self, LOOK_GROUPS, PER_PHOTO_GROUPS};
@@ -258,7 +259,7 @@ fn summarize(settings: &Value, before: Option<&Value>, facts: Option<&Value>, fi
 
 /// A photo's edit, compact: non-default controls, film, crop, masks, spots (`all`: every control).
 pub fn describe(e: &Edit<'_>, all: bool) -> Value {
-    summarize(e.settings, e.before, e.facts, e.film, &e.values(), all)
+    summarize(&e.settings, e.before.as_ref(), e.facts, e.film, &e.values(), all)
 }
 
 #[derive(Deserialize)]
@@ -401,7 +402,7 @@ pub async fn set_controls(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, val
     let label = p.label.unwrap_or_else(|| controls_label(&ids));
     let key = next_key("controls");
     held.command(driver, cx, "develop.set", json!({"values": targets}), &label, &key).await?;
-    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)))).ok_or(NO_PHOTO)?;
+    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, &e.settings)))).ok_or(NO_PHOTO)?;
     let relative = |id: &String| p.values[id].as_str().is_some_and(|t| t.trim().starts_with(['+', '-']));
     let set: Map<String, Value> = ids.iter().filter(|id| relative(id)).filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
     let out = strip(json!({"photo": p.photo.is_none().then(|| held.id(driver, cx)), "set": set, "clamped": clamped}));
@@ -715,7 +716,7 @@ pub async fn change(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Va
         let next = film.as_ref().map_or_else(|| before.film.clone(), |f| Some(f.film.clone()));
         held.restore(driver, cx, settings, next, &label, &next_key("edit")).await?;
     }
-    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, e.settings)))).ok_or(NO_PHOTO)?;
+    let (values, wb) = held.read(driver, cx, |e| (e.values(), e.facts.and_then(|f| white_balance(f, &e.settings)))).ok_or(NO_PHOTO)?;
     let relative = |id: &String| p.values.as_ref().is_some_and(|v| v[id].as_str().is_some_and(|t| t.trim().starts_with(['+', '-'])));
     let mut set: Map<String, Value> = ids.iter().filter(|id| relative(id)).filter_map(|id| Some((id.clone(), spec(id).map(|s| shown(s, current(&values, wb.as_ref(), id).unwrap_or(s.default)))?))).collect();
     set.extend(tally.set);
@@ -1019,6 +1020,7 @@ pub async fn profiles(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: 
             let (settings, film) = held.read(driver, cx, |e| (e.settings.clone(), e.film.map(|f| f.normalized().to_value()))).ok_or(NO_PHOTO)?;
             let saved = driver
                 .act(cx, |a, cx| {
+                    let settings = Settings::parse(&settings)?;
                     let profile = store::build(&name, &settings, groups, film).ok_or("the edit couldn't be saved as a profile")?;
                     let list = store::shown(&mut a.rail);
                     let replaced = list.iter().position(|x| x.name.eq_ignore_ascii_case(&name)).map(|i| list.remove(i)).is_some();

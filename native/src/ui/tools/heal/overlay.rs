@@ -23,7 +23,7 @@ fn local(position: Point<Pixels>, frame: Bounds<Pixels>) -> V {
 
 fn mapping(app: &FilmlabApp, cx: &App, frame: (u32, u32), scale: f64) -> Option<Mapping> {
     let d = app.develop.read(cx);
-    Some(Mapping { facts: d.facts.as_ref()?.to_string(), settings: d.settings.as_ref()?.to_string(), frame, scale })
+    Some(Mapping { facts: d.engine_facts()?, settings: d.settings.clone()?, frame, scale })
 }
 
 fn shapes_of(app: &mut FilmlabApp, cx: &App, frame: (u32, u32), scale: f64, spots: &[Spot]) -> Option<(Rc<[SpotShape]>, Strokes)> {

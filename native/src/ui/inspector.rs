@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
-use filmlab_engine::core;
+use filmlab_engine::core::{self, Facts, WbMode, WhiteBalanceView};
+use filmlab_engine::develop::Treatment;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::app::FilmlabApp;
 use super::color_rail::ColorRail;
@@ -19,6 +20,7 @@ use super::{icon, theme};
 use crate::develop::Develop;
 use crate::film::{FilmSettings, GAUGES};
 use crate::menu::Entry;
+use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
 
 #[derive(Deserialize, Clone)]
@@ -50,12 +52,9 @@ pub(super) fn format(spec: &Spec, value: f64) -> String {
     if value > 0.0 && spec.min < 0.0 { format!("+{text}") } else { text }
 }
 
-#[derive(Deserialize)]
-struct WhiteBalance {
-    mode: String,
-    temp: f64,
-    tint: f64,
-    kelvin: bool,
+/// The id an enum setting is saved as (`asShot`, `highlightPriority`).
+fn saved_as(value: impl Serialize) -> String {
+    serde_json::to_value(value).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 const WB_MODES: [(&str, &str); 9] = [
@@ -363,12 +362,13 @@ fn dust_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Deve
     rows
 }
 
-fn white_balance_rows(facts: &Value, settings: &Value, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
-    let Some(view) = core::white_balance(&facts.to_string(), &settings.to_string()).ok().and_then(|j| serde_json::from_str::<WhiteBalance>(&j).ok()) else { return Vec::new() };
+fn white_balance_rows(facts: &Facts, settings: &Settings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
+    let view = core::white_balance_of(facts, settings);
+    let mode = saved_as(view.mode);
     let (temp, tint) = if view.kelvin { ((2000.0, 12000.0, 50.0), (-150.0, 150.0, 1.0)) } else { ((-100.0, 100.0, 1.0), (-100.0, 100.0, 1.0)) };
-    let current = WB_MODES.iter().find(|(v, _)| *v == view.mode).map(|(_, l)| *l).unwrap_or("Custom");
-    let modes: Vec<(&str, &str)> = WB_MODES.iter().copied().filter(|(v, _)| *v != "custom" || view.mode == "custom").collect();
-    let listed: Vec<(bool, String)> = modes.iter().map(|(v, l)| (*v == view.mode, l.to_string())).collect();
+    let current = WB_MODES.iter().find(|(v, _)| *v == mode).map(|(_, l)| *l).unwrap_or("Custom");
+    let modes: Vec<(&str, &str)> = WB_MODES.iter().copied().filter(|(v, _)| *v != "custom" || mode == "custom").collect();
+    let listed: Vec<(bool, String)> = modes.iter().map(|(v, l)| (*v == mode, l.to_string())).collect();
     let d = develop.clone();
     let mode_rows = Picker::new(
         "wb-mode",
@@ -400,13 +400,14 @@ fn white_balance_rows(facts: &Value, settings: &Value, marks: &HashSet<String>, 
     vec![mode_rows.into_any_element(), wb("wb.temp", "Temp", view.temp, temp, temp_rail), wb("wb.tint", "Tint", view.tint, tint, tint_rail)]
 }
 
-fn as_shot(facts: &Value, settings: &Value, view: &WhiteBalance) -> (f64, f64) {
+fn as_shot(facts: &Facts, settings: &Settings, view: &WhiteBalanceView) -> (f64, f64) {
     if !view.kelvin {
         return (0.0, 0.0);
     }
     let mut shot = settings.clone();
-    shot["wb"]["mode"] = json!("asShot");
-    core::white_balance(&facts.to_string(), &shot.to_string()).ok().and_then(|j| serde_json::from_str::<WhiteBalance>(&j).ok()).map_or((view.temp, view.tint), |v| (v.temp, v.tint))
+    shot.edit().wb.mode = WbMode::AsShot;
+    let v = core::white_balance_of(facts, &shot);
+    (v.temp, v.tint)
 }
 
 fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut Context<FilmlabApp>) {
@@ -415,7 +416,7 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
         Row::Slider(id, label) => rows.extend(control(*id, *label, ctx, develop)),
         Row::HueRange { low, high, label, hues } => rows.extend(hue_range(low, high, label, *hues, ctx, develop, &app.ui.placed)),
         Row::Toggle(section, field, label) => {
-            let on = ctx.settings[section][field].as_bool().unwrap_or(false);
+            let on = toggled(&ctx.settings, section, field);
             let d = develop.clone();
             rows.push(
                 Toggle::new(SharedString::from(format!("{section}.{field}")), *label, on, move |next, _, cx| {
@@ -425,7 +426,7 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
             );
         }
         Row::Treatment => {
-            let bw = ctx.settings["treatment"].as_str() == Some("bw");
+            let bw = ctx.settings.treatment == Treatment::Bw;
             let d = develop.clone();
             rows.push(
                 Segmented::new("treatment", vec![("Color".into(), !bw), ("B&W".into(), bw)], move |i, _, cx| {
@@ -443,7 +444,7 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
         Row::Dust if ctx.film.is_on() => rows.extend(dust_rows(&ctx.film, &ctx.marks, develop)),
         Row::Halation | Row::Grain | Row::Dust => rows.push(needs_stock()),
         Row::Mixer => {
-            let bw = ctx.settings["treatment"].as_str() == Some("bw");
+            let bw = ctx.settings.treatment == Treatment::Bw;
             if bw {
                 for band in MIXER_BANDS {
                     rows.extend(control(format!("bw.{band}"), sentence(band), ctx, develop));
@@ -478,7 +479,7 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
         }
         Row::ToneCurve => rows.extend(tone_curve(app, ctx, develop, cx)),
         Row::VignetteStyle => {
-            let style = ctx.settings["vignette"]["style"].as_str().unwrap_or("highlightPriority").to_string();
+            let style = saved_as(ctx.settings.vignette.style);
             let styles = [("highlightPriority", "Highlight"), ("colorPriority", "Color"), ("paintOverlay", "Paint")];
             let d = develop.clone();
             rows.push(
@@ -500,9 +501,18 @@ fn row(app: &FilmlabApp, r: &'static Row, ctx: &Ctx, rows: &mut Rows, cx: &mut C
     }
 }
 
+/// Whether a section's switch (`optics.lens_profile`) is on.
+fn toggled(settings: &Settings, section: &str, field: &str) -> bool {
+    match (section, field) {
+        ("optics", "remove_ca") => settings.optics.remove_ca,
+        ("optics", "lens_profile") => settings.optics.lens_profile,
+        _ => settings.to_value()[section][field].as_bool().unwrap_or(false),
+    }
+}
+
 struct Ctx {
-    facts: Value,
-    settings: Value,
+    facts: Arc<Facts>,
+    settings: Settings,
     values: HashMap<String, f64>,
     film: FilmSettings,
     /// Controls an agent set that nobody has changed since.
@@ -584,7 +594,7 @@ fn histogram(counts: &[u32]) -> impl IntoElement {
 
 pub fn inspector(app: &FilmlabApp, cx: &mut Context<FilmlabApp>) -> AnyElement {
     let d = app.develop.read(cx);
-    let (Some(facts), Some(settings)) = (d.facts.clone(), d.settings.clone()) else {
+    let (Some(facts), Some(settings)) = (d.engine_facts(), d.settings.clone()) else {
         return div().p_4().text_size(px(12.)).text_color(theme::tertiary()).child("Open a photo to develop it.").into_any_element();
     };
     let marks: HashSet<String> = d.agent_marks.keys().cloned().collect();

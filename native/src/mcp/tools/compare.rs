@@ -70,9 +70,9 @@ impl Now {
             id: e.id.to_string(),
             settings: e.settings.clone(),
             film: e.film.cloned(),
-            before: e.before.cloned(),
+            before: e.before.clone(),
             facts: e.facts.cloned(),
-            steps: e.history.iter().map(|s| (s.label.clone(), s.settings.clone(), s.film.clone())).collect(),
+            steps: e.history.iter().map(|s| (s.label.clone(), s.settings.to_value(), s.film.clone())).collect(),
             cursor: e.cursor,
         }
     }

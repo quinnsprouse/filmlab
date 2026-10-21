@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use lightcraft_engine::Session;
 use lightcraft_engine::catalog::{Catalog, ColorLabel, Flag, MediaKind, Meta, Op, Photo, PhotoId, Source};
-use lightcraft_engine::develop::{CONTROLS, DevelopSettings, EmbeddedLens, SettingsGroup, WbMode, apply_partial, controls as specs, extract_groups};
+use lightcraft_engine::develop::{CONTROLS, EmbeddedLens, SettingsGroup, apply_partial, controls as specs, extract_groups};
 use lightcraft_engine::pipeline::local::{effective_wb, normalize_wb};
 use lightcraft_engine::export::{ExportOptions, MetadataPolicy, encode_rendered, export_metadata, output_size};
 use lightcraft_engine::media::{DecodedSource, SourceLevel, source_info};
@@ -12,6 +12,7 @@ use lightcraft_engine::pipeline::{self, MaskView, OutputDepth, OutputSpace, Over
 use lightcraft_engine::sidecar::{OWNED, OWNED_IF_STATED, merge_into, parse_sidecar, sidecar_packet};
 use serde::{Deserialize, Serialize};
 
+pub use lightcraft_engine::develop::{DevelopSettings, WbMode};
 pub use lightcraft_engine::pipeline::stop::Wanted;
 use lightcraft_engine::pipeline::stop;
 
@@ -261,15 +262,20 @@ pub fn extract_profile(settings: &str, groups: &str) -> Fallible<String> {
 }
 
 pub fn apply_profile(settings: &str, partial: &str, amount: f64) -> Fallible<String> {
-    let s: DevelopSettings = parse(settings)?;
-    let p: Value = parse(partial)?;
-    to_json(&apply_partial(&s, &p, amount))
+    to_json(&apply_profile_to(&parse(settings)?, &parse(partial)?, amount))
+}
+
+pub fn apply_profile_to(settings: &DevelopSettings, partial: &Value, amount: f64) -> DevelopSettings {
+    apply_partial(settings, partial, amount)
 }
 
 pub fn control_values(settings: &str) -> Fallible<String> {
-    let s: DevelopSettings = parse(settings)?;
-    let values: HashMap<&str, f64> = CONTROLS.iter().filter_map(|c| specs::get(&s, c.id).map(|v| (c.id, v))).collect();
-    to_json(&values)
+    to_json(&values_of(&parse(settings)?))
+}
+
+/// Every control's value in `settings`, by control id.
+pub fn values_of(settings: &DevelopSettings) -> HashMap<&'static str, f64> {
+    CONTROLS.iter().filter_map(|c| specs::get(settings, c.id).map(|v| (c.id, v))).collect()
 }
 
 fn kelvin_scale(p: &Photo) -> bool {
@@ -287,36 +293,42 @@ fn rel_to_k(r: f64) -> f64 {
 /// The settings value for a Temp slider position: kelvin for raw photos, the relative -100..100 scale (converted to
 /// the kelvin LightCraft stores) for rendered ones.
 pub fn temp_setting(facts: &str, slider: f64) -> Fallible<f64> {
-    let p = photo_of(&parse(facts)?);
-    Ok(if kelvin_scale(&p) { slider } else { rel_to_k(slider) })
+    Ok(temp_setting_for(&parse(facts)?, slider))
 }
 
+pub fn temp_setting_for(facts: &Facts, slider: f64) -> f64 {
+    if kelvin_scale(&photo_of(facts)) { slider } else { rel_to_k(slider) }
+}
+
+/// The white balance the Temp and Tint sliders show: kelvin for raw photos, -100..100 for rendered ones.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WhiteBalanceView {
-    mode: WbMode,
-    temp: f64,
-    tint: f64,
-    kelvin: bool,
+pub struct WhiteBalanceView {
+    pub mode: WbMode,
+    pub temp: f64,
+    pub tint: f64,
+    pub kelvin: bool,
 }
 
 pub fn white_balance(facts: &str, settings: &str) -> Fallible<String> {
-    let p = photo_of(&parse(facts)?);
-    let d: DevelopSettings = parse(settings)?;
+    to_json(&white_balance_of(&parse(facts)?, &parse(settings)?))
+}
+
+pub fn white_balance_of(facts: &Facts, d: &DevelopSettings) -> WhiteBalanceView {
+    let p = photo_of(facts);
     let kelvin = kelvin_scale(&p);
     let (temp, tint) = if d.wb.mode == WbMode::AsShot && p.relative_wb() {
         (6500.0, 0.0)
     } else if kelvin {
-        effective_wb(&source_info(&p), &d)
+        effective_wb(&source_info(&p), d)
     } else {
         (d.wb.temp, d.wb.tint)
     };
-    let view = if kelvin {
+    if kelvin {
         WhiteBalanceView { mode: d.wb.mode, temp, tint, kelvin }
     } else {
         WhiteBalanceView { mode: d.wb.mode, temp: k_to_rel(temp), tint: tint.clamp(-100.0, 100.0), kelvin }
-    };
-    to_json(&view)
+    }
 }
 
 pub fn set_controls(facts: &str, settings: &str, values: &str) -> Fallible<String> {
@@ -399,33 +411,34 @@ pub fn export_plan(facts: &str, state: &str, options: &str) -> Fallible<String> 
     to_json(&ExportPlan { width, height, max_edge })
 }
 
+/// Points to map between a frame of `width` by `height` pixels and normalized image coordinates (`to_image`), or
+/// back.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MapRequest {
-    width: usize,
-    height: usize,
+pub struct MapRequest {
+    pub width: usize,
+    pub height: usize,
     #[serde(default = "yes")]
-    apply_crop: bool,
-    points: Vec<[f64; 2]>,
-    to_image: bool,
+    pub apply_crop: bool,
+    pub points: Vec<[f64; 2]>,
+    pub to_image: bool,
 }
 
 pub fn map_points(facts: &str, settings: &str, request: &str) -> Fallible<String> {
-    let f: Facts = parse(facts)?;
-    let d: DevelopSettings = parse(settings)?;
-    let r: MapRequest = parse(request)?;
-    let frame = Geometry::new(f.width.max(1) as usize, f.height.max(1) as usize, &d, r.apply_crop);
+    to_json(&mapped_points(&parse(facts)?, &parse(settings)?, &parse(request)?))
+}
+
+pub fn mapped_points(f: &Facts, d: &DevelopSettings, r: &MapRequest) -> Vec<[f64; 2]> {
+    let frame = Geometry::new(f.width.max(1) as usize, f.height.max(1) as usize, d, r.apply_crop);
     let (w, h) = (r.width.max(1), r.height.max(1));
     let affine = if r.to_image { frame.out_to_norm(w, h) } else { frame.norm_to_out(w, h) };
-    let mapped: Vec<[f64; 2]> = r
-        .points
+    r.points
         .iter()
         .map(|&[x, y]| {
             let p = affine.apply(lightcraft_geom::Point::new(x, y));
             [p.x, p.y]
         })
-        .collect();
-    to_json(&mapped)
+        .collect()
 }
 
 fn native_frame(width: u32, height: u32, s: &DevelopSettings) -> Size {
@@ -442,10 +455,12 @@ pub fn native_size(facts: &str, settings: &str) -> Fallible<String> {
 
 // why: in crop mode the loupe shows the uncropped frame, so its layout needs that frame's size
 pub fn frame_size(facts: &str, settings: &str, apply_crop: bool) -> Fallible<String> {
-    let f: Facts = parse(facts)?;
-    let d: DevelopSettings = parse(settings)?;
-    let (w, h) = Geometry::new(f.width.max(1) as usize, f.height.max(1) as usize, &d, apply_crop).native_size();
-    to_json(&[w.round().max(1.0) as usize, h.round().max(1.0) as usize])
+    to_json(&frame_size_of(&parse(facts)?, &parse(settings)?, apply_crop))
+}
+
+pub fn frame_size_of(f: &Facts, d: &DevelopSettings, apply_crop: bool) -> [usize; 2] {
+    let (w, h) = Geometry::new(f.width.max(1) as usize, f.height.max(1) as usize, d, apply_crop).native_size();
+    [w.round().max(1.0) as usize, h.round().max(1.0) as usize]
 }
 
 pub fn normalize_settings(settings: &str) -> Fallible<String> {
@@ -921,16 +936,23 @@ impl Engine {
     }
 
     pub fn render(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Frame> {
-        self.render_while(key, settings, view, None)?.ok_or_else(|| fail("a render nobody stopped came back stopped"))
+        self.render_develop(key, &parse(settings)?, view)
     }
 
     pub fn render_while(&mut self, key: &str, settings: &str, view: &str, wanted: Option<Wanted>) -> Fallible<Option<Frame>> {
+        self.render_develop_while(key, &parse(settings)?, view, wanted)
+    }
+
+    pub fn render_develop(&mut self, key: &str, settings: &DevelopSettings, view: &str) -> Fallible<Frame> {
+        self.render_develop_while(key, settings, view, None)?.ok_or_else(|| fail("a render nobody stopped came back stopped"))
+    }
+
+    pub fn render_develop_while(&mut self, key: &str, settings: &DevelopSettings, view: &str, wanted: Option<Wanted>) -> Fallible<Option<Frame>> {
         pipeline::film_hook::without_tone_hook(|| stop::while_wanted(wanted, || self.render_frame(key, settings, view)))
     }
 
-    fn render_frame(&mut self, key: &str, settings: &str, view: &str) -> Fallible<Option<Frame>> {
+    fn render_frame(&mut self, key: &str, s: &DevelopSettings, view: &str) -> Fallible<Option<Frame>> {
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
-        let s: DevelopSettings = parse(settings)?;
         let v: ViewRequest = parse(view)?;
         let req = v.request();
         let src = &loaded.source;
@@ -941,17 +963,17 @@ impl Engine {
         let job = FilmJob {
             luts: &self.luts,
             film: v.film.as_ref(),
-            light: light_of(&s, &req),
+            light: light_of(s, &req),
             view: stored.as_ref().and_then(|k| self.scenes.remove(k)),
             look: if v.draft { None } else { self.looks.remove(key) },
-            look_key: look_key(key, &s, &req),
-            native: native_frame(loaded.width, loaded.height, &s),
+            look_key: look_key(key, s, &req),
+            native: native_frame(loaded.width, loaded.height, s),
         };
-        let size_of = |r: &RenderRequest| pipeline::output_size(src.image.width, src.image.height, &s, r);
+        let size_of = |r: &RenderRequest| pipeline::output_size(src.image.width, src.image.height, s, r);
         let rendered = || {
             film_render(job, &req, size_of, |r, lane| match (lane, &cache, &look_cache) {
-                (Lane::View, Some(cache), _) | (Lane::Look, _, Some(cache)) => pipeline::render_cached(&src.image, &info, &s, r, cache),
-                _ => pipeline::render(&src.image, &info, &s, r),
+                (Lane::View, Some(cache), _) | (Lane::Look, _, Some(cache)) => pipeline::render_cached(&src.image, &info, s, r, cache),
+                _ => pipeline::render(&src.image, &info, s, r),
             })
         };
         let outcome = if v.curve_input { pipeline::film_hook::with_curve_input(rendered) } else { rendered() }?;
@@ -964,7 +986,7 @@ impl Engine {
         }
         let Some(mut rendered) = outcome.rendered.filter(|_| !stop::stopped()) else { return Ok(None) };
         let histogram = if v.draft { pipeline::drag_hdr_histogram } else { pipeline::hdr_histogram };
-        if let Some(h) = spent("hdr histogram", || histogram(&src.image, &info, &s, &req)) {
+        if let Some(h) = spent("hdr histogram", || histogram(&src.image, &info, s, &req)) {
             rendered.histogram = h;
         }
         if stop::stopped() {
@@ -1106,13 +1128,15 @@ impl Commands {
     }
 
     pub fn open(&mut self, facts: &str, settings: &str) -> Fallible<()> {
-        let f: Facts = parse(facts)?;
-        let d: DevelopSettings = parse(settings)?;
+        self.open_settings(&parse(facts)?, parse(settings)?)
+    }
+
+    pub fn open_settings(&mut self, f: &Facts, d: DevelopSettings) -> Fallible<()> {
         if let Some(previous) = self.photo.take() {
             self.session.catalog.apply(Op::RemovePhoto { id: previous }).map_err(fail)?;
         }
         let id = self.session.catalog.alloc_photo_id();
-        let mut p = photo_of(&f);
+        let mut p = photo_of(f);
         p.id = id;
         p.develop = Arc::new(d);
         self.session.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).map_err(fail)?;
@@ -1140,11 +1164,16 @@ impl Commands {
     }
 
     pub fn run(&mut self, command: &str, params: &str) -> Fallible<String> {
-        let id = self.photo.ok_or("no photo is open")?;
-        let params: Value = parse(params)?;
-        let result = self.session.execute(command, &params).map_err(fail)?;
-        let settings = self.session.develop_of(id).ok_or("the photo left the session")?;
+        let (result, settings) = self.run_settings(command, &parse(params)?)?;
         to_json(&serde_json::json!({"result": result, "settings": &*settings}))
+    }
+
+    /// Runs a command on the open photo: its result, and the photo's settings after it.
+    pub fn run_settings(&mut self, command: &str, params: &Value) -> Fallible<(Value, Arc<DevelopSettings>)> {
+        let id = self.photo.ok_or("no photo is open")?;
+        let result = self.session.execute(command, params).map_err(fail)?;
+        let settings = self.session.develop_of(id).ok_or("the photo left the session")?;
+        Ok((result, settings))
     }
 }
 

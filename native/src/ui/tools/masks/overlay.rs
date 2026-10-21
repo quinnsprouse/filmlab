@@ -12,10 +12,10 @@ pub fn overlay(app: &mut FilmlabApp, frame: Bounds<Pixels>, window: &mut Window,
     let (_, pixels) = app.fit_frame(window, cx)?;
     let (facts, settings, photo) = {
         let d = app.develop.read(cx);
-        (d.facts.clone()?, d.settings.clone()?, d.photo_id.clone())
+        (d.engine_facts()?, d.settings.clone()?, d.photo_id.clone())
     };
     let scale = f64::from(pixels.0) / f64::from(f32::from(frame.size.width)).max(1.0);
-    let space = ViewSpace::new(&facts, &settings, pixels, scale);
+    let space = ViewSpace::new(facts, settings.clone(), pixels, scale);
     let masks = read_masks(Some(&settings));
     let active = app.tools.masks.active_for(photo.as_ref()).filter(|id| masks.iter().any(|m| m.id == *id));
     let scene = build_scene(&masks, active, &space);

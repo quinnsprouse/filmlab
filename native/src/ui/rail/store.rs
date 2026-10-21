@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::film::FilmSettings;
+use crate::settings::Settings;
 
 pub const LOOK_GROUPS: [&str; 10] = ["film", "profile", "treatment", "toneCurve", "color", "colorMixer", "colorGrading", "effects", "vignette", "calibration"];
 pub const PER_PHOTO_GROUPS: [&str; 8] = ["whiteBalance", "light", "detail", "optics", "geometry", "crop", "masks", "spots"];
@@ -91,9 +92,9 @@ impl Profile {
 }
 
 // why: a profile stores every engine group; film's settings travel separately as `film`
-pub fn build(name: &str, settings: &Value, groups: Vec<String>, film: Option<Value>) -> Option<Profile> {
+pub fn build(name: &str, settings: &Settings, groups: Vec<String>, film: Option<Value>) -> Option<Profile> {
     let engine_groups: Vec<&String> = groups.iter().filter(|g| *g != "film").collect();
-    let partial = core::extract_profile(&settings.to_string(), &serde_json::to_string(&engine_groups).ok()?).ok()?;
+    let partial = core::extract_profile(&settings.json(), &serde_json::to_string(&engine_groups).ok()?).ok()?;
     let film = film.filter(|_| groups.iter().any(|g| g == "film"));
     Some(Profile { id: new_id(), name: name.trim().to_string(), groups, partial: serde_json::from_str(&partial).ok()?, film, created_at: iso_now() })
 }

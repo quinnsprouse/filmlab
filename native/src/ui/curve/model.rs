@@ -1,9 +1,9 @@
 use filmlab_engine::tone_curve::{Curve, Curves};
 use gpui_kit::*;
-use serde_json::Value;
 
 use super::Tab;
-use crate::develop::{CurveInput, POINT_CURVES};
+use crate::develop::CurveInput;
+use crate::settings::Settings;
 use crate::ui::color_rail;
 
 pub const INSET: f32 = 10.0;
@@ -49,8 +49,9 @@ pub fn level(value: f64) -> i64 {
     (value * 255.0).round() as i64
 }
 
-pub fn points(settings: &Value, channel: usize) -> Vec<[f64; 2]> {
-    let stored: Vec<[f64; 2]> = settings["curve"][POINT_CURVES[channel]].as_array().map(|a| a.iter().filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?])).collect()).unwrap_or_default();
+pub fn points(settings: &Settings, channel: usize) -> Vec<[f64; 2]> {
+    let curve = &settings.curve;
+    let stored: Vec<[f64; 2]> = [&curve.master, &curve.red, &curve.green, &curve.blue].get(channel).map(|c| c.iter().map(|p| [p.x, p.y]).collect()).unwrap_or_default();
     if stored.len() < 2 { vec![[0.0, 0.0], [1.0, 1.0]] } else { stored }
 }
 

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use filmlab_engine::core::{self, Commands, Engine};
+use filmlab_engine::core::{self, Commands, Engine, Facts};
 use gpui_kit::{AppContext, AsyncApp};
 use serde_json::Value;
 use tokio::sync::{Mutex as Queue, OwnedMutexGuard, Semaphore, SemaphorePermit};
@@ -16,6 +16,7 @@ use crate::film::{FilmSettings, render_film};
 use crate::library::{PhotoRecord, PhotoState};
 use crate::mcp::tools::Output;
 use crate::mcp::tools::look::Shot;
+use crate::settings::Settings;
 use crate::ui::driver::Driver;
 
 /// How many photos agents may hold open off screen at once, how many of those keep their decodes, and how long an
@@ -49,8 +50,9 @@ pub struct Session {
     folder: PathBuf,
     path: PathBuf,
     pub facts: Value,
-    pub before: Value,
-    pub settings: Value,
+    parsed_facts: Facts,
+    pub before: Settings,
+    pub settings: Settings,
     pub film: Option<FilmSettings>,
     pub history: Vec<Step>,
     pub cursor: usize,
@@ -68,8 +70,9 @@ impl Session {
         let (Some(probed), Some(state)) = (&record.probed, &record.state) else {
             return Err(format!("{} is still being indexed; try again in a moment", record.file.id));
         };
+        let parsed_facts: Facts = serde_json::from_str(&probed.facts.to_string()).map_err(|e| e.to_string())?;
         let mut commands = Commands::new();
-        commands.open(&probed.facts.to_string(), &state.settings.to_string())?;
+        commands.open_settings(&parsed_facts, (*state.settings).clone())?;
         let film = state.film();
         let now = Instant::now();
         Ok(Session {
@@ -77,6 +80,7 @@ impl Session {
             folder,
             path: record.file.path.clone(),
             facts: probed.facts.clone(),
+            parsed_facts,
             before: probed.defaults.clone(),
             settings: state.settings.clone(),
             film: film.clone(),
@@ -93,14 +97,19 @@ impl Session {
     }
 
     fn reopen(&mut self) -> Result<(), String> {
-        self.commands.open(&self.facts.to_string(), &self.settings.to_string())
+        let settings = self.settings.clone();
+        self.open_commands(&settings)
+    }
+
+    fn open_commands(&mut self, settings: &Settings) -> Result<(), String> {
+        self.commands.open_settings(&self.parsed_facts, (**settings).clone())
     }
 
     // why: the same history rules as Develop's commit; agent keys are unique, so only a profile re-applied within
     // the coalescing window replaces its own step
-    fn commit(&mut self, settings: Value, label: &str, key: &str, film: Option<FilmSettings>) {
+    fn commit(&mut self, settings: Settings, label: &str, key: &str, film: Option<FilmSettings>) {
         if key.starts_with("profile") {
-            let _ = self.commands.open(&self.facts.to_string(), &settings.to_string());
+            let _ = self.open_commands(&settings);
         }
         self.history.truncate(self.cursor + 1);
         let now = Instant::now();
@@ -114,14 +123,14 @@ impl Session {
     }
 
     fn try_command(&mut self, command: &str, params: &Value, label: &str, key: &str) -> Result<(Value, bool), String> {
-        let out = self.commands.run(command, &params.to_string())?;
-        let mut parsed: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-        let changed = parsed["settings"] != self.settings;
+        let (result, settings) = self.commands.run_settings(command, params)?;
+        let settings = Settings::from(settings);
+        let changed = settings != self.settings;
         if changed {
             let film = self.film.clone();
-            self.commit(parsed["settings"].take(), label, key, film);
+            self.commit(settings, label, key, film);
         }
-        Ok((parsed["result"].take(), changed))
+        Ok((result, changed))
     }
 
     fn go_to(&mut self, index: usize) -> Result<(), String> {
@@ -139,7 +148,7 @@ impl Session {
             Some(a) if a.profile_id == profile_id && a.step == self.cursor => (a.before.clone(), a.before_film.clone()),
             _ => (self.settings.clone(), self.film.clone()),
         };
-        let next: Value = serde_json::from_str(&core::apply_profile(&before.to_string(), &partial.to_string(), amount)?).map_err(|e| e.to_string())?;
+        let next = Settings::from(core::apply_profile_to(&before, partial, amount));
         let applied = film.map_or_else(|| before_film.clone(), |film| crate::film::blend(before_film.as_ref(), film.as_ref(), amount));
         self.commit(next, label, &format!("profile:{profile_id}"), applied);
         self.applied = Some(Applied { profile_id: profile_id.to_string(), before, before_film, step: self.cursor, photo_id: Some(self.id.clone()) });
@@ -170,8 +179,8 @@ impl Session {
 /// A read-only view of one photo's edit, from Develop, an agent session or the library record.
 pub struct Edit<'a> {
     pub id: &'a str,
-    pub settings: &'a Value,
-    pub before: Option<&'a Value>,
+    pub settings: Value,
+    pub before: Option<Value>,
     pub facts: Option<&'a Value>,
     pub film: Option<&'a FilmSettings>,
     pub history: &'a [Step],
@@ -180,7 +189,7 @@ pub struct Edit<'a> {
 
 impl Edit<'_> {
     pub fn values(&self) -> HashMap<String, f64> {
-        control_values(self.settings)
+        control_values(&self.settings)
     }
 }
 
@@ -233,13 +242,13 @@ fn develop_edit<R>(driver: &Driver, cx: &mut AsyncApp, f: impl FnOnce(Edit<'_>) 
     driver
         .read(cx, |a, cx| {
             let d = a.develop.read(cx);
-            Some(f(Edit { id: d.photo_id.as_deref()?, settings: d.settings.as_ref()?, before: d.before.as_ref(), facts: d.facts.as_ref(), film: d.film.as_ref(), history: &d.history, cursor: d.cursor }))
+            Some(f(Edit { id: d.photo_id.as_deref()?, settings: d.settings.as_ref()?.to_value(), before: d.before.as_ref().map(Settings::to_value), facts: d.facts.as_ref(), film: d.film.as_ref(), history: &d.history, cursor: d.cursor }))
         })
         .flatten()
 }
 
 fn session_edit<R>(s: &Session, f: impl FnOnce(Edit<'_>) -> R) -> R {
-    f(Edit { id: &s.id, settings: &s.settings, before: Some(&s.before), facts: Some(&s.facts), film: s.film.as_ref(), history: &s.history, cursor: s.cursor })
+    f(Edit { id: &s.id, settings: s.settings.to_value(), before: Some(s.before.to_value()), facts: Some(&s.facts), film: s.film.as_ref(), history: &s.history, cursor: s.cursor })
 }
 
 /// Saves a session's edit to the photo's record and sidecar (which also redraws its thumbnail), keeping the flags,
@@ -292,7 +301,7 @@ impl Held {
     }
 
     fn digest_now(&self, driver: &Driver, cx: &mut AsyncApp) -> Option<String> {
-        self.read(driver, cx, |e| digest(e.id, e.settings, e.film))
+        self.read(driver, cx, |e| digest(e.id, &e.settings, e.film))
     }
 
     // why: checked in the same main-thread turn as the change it guards, so nothing lands between the two
@@ -400,6 +409,7 @@ impl Held {
 
     pub async fn restore(&self, driver: &Driver, cx: &mut AsyncApp, settings: Value, film: Option<FilmSettings>, label: &str, key: &str) -> Result<(), String> {
         self.ready(driver, cx)?;
+        let settings = Settings::parse(&settings)?;
         match &self.on {
             On::Ui(_) => {
                 let (label, key) = (label.to_string(), key.to_string());
@@ -409,8 +419,7 @@ impl Held {
             On::Agent(s) => {
                 {
                     let mut session = s.borrow_mut();
-                    let facts = session.facts.to_string();
-                    session.commands.open(&facts, &settings.to_string())?;
+                    session.open_commands(&settings)?;
                     session.commit(settings, label, key, film);
                 }
                 self.committed(driver, cx);
@@ -819,7 +828,7 @@ impl Hub {
                 let record = a.library.read(cx).record(id).ok_or_else(|| format!("no photo {id} in the open folder; photos list gives the ids"))?;
                 let (Some(probed), Some(state)) = (&record.probed, &record.state) else { return Err(format!("{id} is still being indexed; try again in a moment")) };
                 let film = state.film();
-                Ok(f(Edit { id, settings: &state.settings, before: Some(&probed.defaults), facts: Some(&probed.facts), film: film.as_ref(), history: &[], cursor: 0 }))
+                Ok(f(Edit { id, settings: state.settings.to_value(), before: Some(probed.defaults.to_value()), facts: Some(&probed.facts), film: film.as_ref(), history: &[], cursor: 0 }))
             })
             .ok_or(GONE)?
     }

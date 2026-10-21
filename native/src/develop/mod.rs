@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use filmlab_engine::core::{self, Commands, Engine, Wanted};
+use filmlab_engine::core::{self, Commands, Engine, Facts, Wanted};
 use gpui_kit::{AppContext, Context, Entity, Task};
 use serde_json::{Value, json};
 
 use crate::camera::{Camera, Native, Region, Size, WHOLE, Zoom, camera_of, mix_log_scale};
 use crate::film::{FilmSettings, render_film};
 use crate::library::{Library, PhotoState, ensure_luts};
+use crate::settings::Settings;
 use marks::{Flat, Marks, Replay};
 use plans::{Inputs, Layer, Level, Plan, fit_plan, plans, same_plan};
 use shared::Shared;
@@ -37,7 +38,7 @@ const DRAG_GAP: Duration = Duration::from_millis(150);
 pub struct Step {
     pub label: String,
     pub key: String,
-    pub settings: Value,
+    pub settings: Settings,
     pub film: Option<FilmSettings>,
     pub at: Instant,
 }
@@ -68,7 +69,7 @@ pub struct RenderJob {
     pub engine: Arc<Mutex<Engine>>,
     pub key: String,
     pub full: bool,
-    pub settings: Value,
+    pub settings: Settings,
     pub film: Option<FilmSettings>,
     pub facts: Value,
 }
@@ -85,7 +86,17 @@ pub struct CurveInput {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    made_from: Value,
+    made_from: MadeFrom,
+}
+
+/// What a curve input frame shows: the photo's fit view as drawn without its tone curve.
+#[derive(PartialEq)]
+struct MadeFrom {
+    photo_id: String,
+    level: Level,
+    uncurved: Settings,
+    film: Option<FilmSettings>,
+    view: Value,
 }
 
 impl CurveInput {
@@ -143,9 +154,10 @@ pub struct Develop {
     library: Entity<Library>,
     pub photo_id: Option<String>,
     pub facts: Option<Value>,
+    parsed_facts: Option<Arc<Facts>>,
     pub base: Option<PhotoState>,
-    pub before: Option<Value>,
-    pub settings: Option<Value>,
+    pub before: Option<Settings>,
+    pub settings: Option<Settings>,
     pub film: Option<FilmSettings>,
     pub revision: u64,
     pub history: Vec<Step>,
@@ -245,6 +257,7 @@ impl Develop {
             library,
             photo_id: None,
             facts: None,
+            parsed_facts: None,
             base: None,
             before: None,
             settings: None,
@@ -302,7 +315,7 @@ impl Develop {
         self.revision + u64::from(self.compare == Compare::Before) * (1 << 40)
     }
 
-    fn shown_settings(&self) -> Option<&Value> {
+    fn shown_settings(&self) -> Option<&Settings> {
         if self.compare == Compare::Before { self.before.as_ref() } else { self.settings.as_ref() }
     }
 
@@ -312,15 +325,19 @@ impl Develop {
         self.inputs_of(settings, film, self.overlay.clone())
     }
 
-    fn inputs_of(&self, settings: Value, film: Option<FilmSettings>, overlay: Option<Value>) -> Option<Inputs> {
+    fn inputs_of(&self, settings: Settings, film: Option<FilmSettings>, overlay: Option<Value>) -> Option<Inputs> {
         if self.status != Status::Ready {
             return None;
         }
         let photo_id = self.photo_id.clone()?;
-        let facts = self.facts.as_ref()?;
         let apply_crop = self.tool != Tool::Crop;
-        let native: [f64; 2] = serde_json::from_str(&core::frame_size(&facts.to_string(), &settings.to_string(), apply_crop).ok()?).ok()?;
-        Some(Inputs { photo_id, revision: self.planned_revision(), settings, film, overlay, apply_crop, native: (native[0], native[1]) })
+        let [w, h] = core::frame_size_of(self.parsed_facts.as_ref()?, &settings, apply_crop);
+        Some(Inputs { photo_id, revision: self.planned_revision(), settings, film, overlay, apply_crop, native: (w as f64, h as f64) })
+    }
+
+    /// The open photo's facts as the engine reads them.
+    pub fn engine_facts(&self) -> Option<Arc<Facts>> {
+        self.parsed_facts.clone()
     }
 
     fn target_zoom(&self) -> Zoom {
@@ -344,6 +361,7 @@ impl Develop {
         self.photo_id = Some(id.to_string());
         self.path = Some(path.clone());
         self.facts = Some(probed.facts.clone());
+        self.parsed_facts = serde_json::from_value(probed.facts.clone()).ok().map(Arc::new);
         self.before = Some(probed.defaults.clone());
         self.settings = Some(state.settings.clone());
         self.film = film.clone();
@@ -365,7 +383,7 @@ impl Develop {
         self.rested = false;
         self.stop_unwanted();
         self.commands.detach();
-        if let Err(e) = self.commands.open(&probed.facts.to_string(), &state.settings.to_string()) {
+        if let Err(e) = self.open_commands(&state.settings) {
             self.error = Some(e);
         }
         let neighbours = self.neighbours(id, cx);
@@ -679,14 +697,14 @@ impl Develop {
         if let Some(f) = &plan.film {
             view["film"] = f.to_value();
         }
-        let settings = plan.settings.to_string();
+        let settings = plan.settings.clone();
         let film = plan.film.clone();
         cx.background_spawn(async move {
             // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
             // render that holds it would deadlock the pool
             engine.with(|engine| {
                 ensure_luts(engine, film.as_ref())?;
-                crate::perf::interactive(|| engine.render_while(&key, &settings, &view.to_string(), Some(wanted)))
+                crate::perf::interactive(|| engine.render_develop_while(&key, &settings, &view.to_string(), Some(wanted)))
             })?
         })
     }
@@ -697,15 +715,15 @@ impl Develop {
         }
     }
 
-    fn curve_input_plan(&self) -> Option<(Plan, Value)> {
+    fn curve_input_plan(&self) -> Option<(Plan, MadeFrom)> {
         if !self.curve_input_wanted || self.dragging.is_some() || self.compare != Compare::After {
             return None;
         }
         let inputs = self.inputs_of(self.settings.clone()?, render_film(self.film.as_ref()), None)?;
         let mut plan = self.runnable(&fit_plan(&inputs, self.viewport))?;
         let mut uncurved = plan.settings.clone();
-        uncurved.as_object_mut()?.remove("curve");
-        let made_from = json!([plan.photo_id, plan.level.tag(), uncurved, plan.film.as_ref().map(FilmSettings::to_value), plan.view]);
+        uncurved.edit().curve = Default::default();
+        let made_from = MadeFrom { photo_id: plan.photo_id.clone(), level: plan.level, uncurved, film: plan.film.clone(), view: plan.view.clone() };
         if self.curve_input.as_ref().is_some_and(|c| c.made_from == made_from) {
             return None;
         }
@@ -978,8 +996,9 @@ impl Develop {
         let library = self.library.read(cx);
         let record = library.record(id)?;
         let (probed, state) = (record.probed.as_ref()?, record.state.as_ref()?);
-        let native: [f64; 2] = serde_json::from_str(&core::frame_size(&probed.facts.to_string(), &state.settings.to_string(), true).ok()?).ok()?;
-        Some(Inputs { photo_id: id.to_string(), revision: 0, settings: state.settings.clone(), film: render_film(state.film().as_ref()), overlay: None, apply_crop: true, native: (native[0], native[1]) })
+        let facts: Facts = serde_json::from_value(probed.facts.clone()).ok()?;
+        let [w, h] = core::frame_size_of(&facts, &state.settings, true);
+        Some(Inputs { photo_id: id.to_string(), revision: 0, settings: state.settings.clone(), film: render_film(state.film().as_ref()), overlay: None, apply_crop: true, native: (w as f64, h as f64) })
     }
 
     // why: while the user looks at a photo, the neighbours' fit frames are rendered one at a time (and their stage caches
@@ -1010,13 +1029,13 @@ impl Develop {
             if let Some(f) = &plan.film {
                 view["film"] = f.to_value();
             }
-            let (settings, film) = (plan.settings.to_string(), plan.film.clone());
+            let (settings, film) = (plan.settings.clone(), plan.film.clone());
             cx.spawn(async move |this, cx| {
                 let rendered = cx
                     .background_spawn(async move {
                         engine.with(|engine| {
                             ensure_luts(engine, film.as_ref())?;
-                            let frame = crate::perf::initiated(|| engine.render_while(&key, &settings, &view.to_string(), Some(wanted)));
+                            let frame = crate::perf::initiated(|| engine.render_develop_while(&key, &settings, &view.to_string(), Some(wanted)));
                             engine.forget_view(&key, PREFETCH);
                             frame
                         })?
@@ -1091,11 +1110,14 @@ impl Develop {
         }
     }
 
-    fn commit(&mut self, settings: Value, label: &str, key: &str, film: Option<FilmSettings>, cx: &mut Context<Develop>) {
-        if key.starts_with("profile")
-            && let Some(facts) = &self.facts
-        {
-            let _ = self.commands.open(&facts.to_string(), &settings.to_string());
+    fn open_commands(&mut self, settings: &Settings) -> Result<(), String> {
+        let facts = self.parsed_facts.as_ref().ok_or("the photo's facts couldn't be read")?;
+        self.commands.open_settings(facts, (**settings).clone())
+    }
+
+    fn commit(&mut self, settings: Settings, label: &str, key: &str, film: Option<FilmSettings>, cx: &mut Context<Develop>) {
+        if key.starts_with("profile") && self.parsed_facts.is_some() {
+            let _ = self.open_commands(&settings);
         }
         let appending = self.cursor + 1 == self.history.len();
         self.history.truncate(self.cursor + 1);
@@ -1152,7 +1174,7 @@ impl Develop {
 
     pub fn command(&mut self, command: &str, params: Value, label: &str, key: &str, cx: &mut Context<Develop>) -> Option<Value> {
         self.settings.as_ref()?;
-        let out = match self.commands.run(command, &params.to_string()) {
+        let (result, settings) = match self.commands.run_settings(command, &params) {
             Ok(out) => out,
             Err(e) => {
                 self.error = Some(e);
@@ -1160,24 +1182,23 @@ impl Develop {
                 return None;
             }
         };
-        let parsed: Value = serde_json::from_str(&out).ok()?;
         let film = self.film.clone();
-        self.commit(parsed["settings"].clone(), label, key, film, cx);
-        Some(parsed["result"].clone())
+        self.commit(settings.into(), label, key, film, cx);
+        Some(result)
     }
 
     /// Runs a LightCraft command for an agent: the engine's own error on failure, and a history step only when
     /// the photo's settings changed. Returns the command's result and whether the photo changed.
     pub fn try_command(&mut self, command: &str, params: Value, label: &str, key: &str, cx: &mut Context<Develop>) -> Result<(Value, bool), String> {
         let current = self.settings.clone().ok_or("no photo is open; open_photo first")?;
-        let out = self.commands.run(command, &params.to_string())?;
-        let mut parsed: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-        let changed = parsed["settings"] != current;
+        let (result, settings) = self.commands.run_settings(command, &params)?;
+        let settings = Settings::from(settings);
+        let changed = settings != current;
         if changed {
             let film = self.film.clone();
-            self.commit(parsed["settings"].take(), label, key, film, cx);
+            self.commit(settings, label, key, film, cx);
         }
-        Ok((parsed["result"].take(), changed))
+        Ok((result, changed))
     }
 
     /// Every LightCraft command as (id, params doc).
@@ -1190,9 +1211,9 @@ impl Develop {
     }
 
     /// Puts back a saved state of the open photo (settings and film) as one new history step.
-    pub fn restore(&mut self, settings: Value, film: Option<FilmSettings>, label: &str, key: &str, cx: &mut Context<Develop>) -> Result<(), String> {
-        let facts = self.facts.as_ref().ok_or("no photo is open; open_photo first")?;
-        self.commands.open(&facts.to_string(), &settings.to_string())?;
+    pub fn restore(&mut self, settings: Settings, film: Option<FilmSettings>, label: &str, key: &str, cx: &mut Context<Develop>) -> Result<(), String> {
+        self.facts.as_ref().ok_or("no photo is open; open_photo first")?;
+        self.open_commands(&settings)?;
         self.commit(settings, label, key, film, cx);
         Ok(())
     }
@@ -1208,8 +1229,8 @@ impl Develop {
         let mut keys: Vec<&str> = values.iter().map(|(k, _)| *k).collect();
         keys.sort_unstable();
         // why: the Temp slider is in kelvin for raw photos and -100..100 for rendered ones, while develop.set stores kelvin
-        let facts = self.facts.as_ref().map(Value::to_string).unwrap_or_default();
-        let setting = |k: &str, v: f64| if k == "wb.temp" { core::temp_setting(&facts, v).unwrap_or(v) } else { v };
+        let facts = self.parsed_facts.clone();
+        let setting = |k: &str, v: f64| if k == "wb.temp" { facts.as_ref().map_or(v, |f| core::temp_setting_for(f, v)) } else { v };
         let map: serde_json::Map<String, Value> = values.iter().map(|(k, v)| ((*k).to_string(), json!(setting(k, *v)))).collect();
         self.command("develop.set", json!({"values": map}), label, &keys.join(","), cx);
     }
@@ -1230,10 +1251,8 @@ impl Develop {
         self.cursor = index;
         self.revision += 1;
         self.compare = Compare::After;
-        if let Some(facts) = &self.facts
-            && let Some(settings) = &self.settings
-        {
-            let _ = self.commands.open(&facts.to_string(), &settings.to_string());
+        if let Some(settings) = self.settings.clone() {
+            let _ = self.open_commands(&settings);
         }
         self.remark();
         self.request_render(cx);
@@ -1316,7 +1335,7 @@ impl Develop {
     }
 
     pub fn control_values(&self) -> HashMap<String, f64> {
-        self.settings.as_ref().and_then(|s| core::control_values(&s.to_string()).ok()).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+        self.settings.as_ref().map(|s| core::values_of(s).into_iter().map(|(k, v)| (k.to_string(), v)).collect()).unwrap_or_default()
     }
 
     // why: re-applying the same profile at the same step starts again from
@@ -1329,8 +1348,7 @@ impl Develop {
             Some(a) if a.profile_id == profile_id && a.step == self.cursor && a.photo_id == self.photo_id => (a.before.clone(), a.before_film.clone()),
             _ => (settings, self.film.clone()),
         };
-        let Ok(out) = core::apply_profile(&before.to_string(), &partial.to_string(), amount) else { return };
-        let Ok(next) = serde_json::from_str::<Value>(&out) else { return };
+        let next = Settings::from(core::apply_profile_to(&before, partial, amount));
         let applied = film.map_or_else(|| before_film.clone(), |film| crate::film::blend(before_film.as_ref(), film.as_ref(), amount));
         self.commit(next, label, &format!("profile:{profile_id}"), applied, cx);
         self.applied = Some(Applied { profile_id: profile_id.to_string(), before, before_film, step: self.cursor, photo_id: self.photo_id.clone() });
@@ -1341,7 +1359,7 @@ impl Develop {
 /// amount starts from them rather than stacking.
 pub struct Applied {
     pub profile_id: String,
-    pub before: Value,
+    pub before: Settings,
     pub before_film: Option<FilmSettings>,
     pub step: usize,
     pub photo_id: Option<String>,

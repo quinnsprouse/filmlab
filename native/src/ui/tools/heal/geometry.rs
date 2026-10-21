@@ -1,12 +1,14 @@
-use filmlab_engine::core;
-use serde_json::{Value, json};
+use std::sync::Arc;
+
+use filmlab_engine::core::{self, Facts, MapRequest};
 
 use super::spots::{Spot, V};
+use crate::settings::Settings;
 
 /// Maps between the overlay box (window points) and normalized image coordinates.
 pub struct Mapping {
-    pub facts: String,
-    pub settings: String,
+    pub facts: Arc<Facts>,
+    pub settings: Settings,
     pub frame: (u32, u32),
     pub scale: f64,
 }
@@ -25,11 +27,8 @@ impl Mapping {
         if points.is_empty() {
             return Vec::new();
         }
-        let pairs: Vec<[f64; 2]> = points.iter().map(|&(x, y)| [x, y]).collect();
-        let request = json!({"width": self.frame.0, "height": self.frame.1, "applyCrop": true, "points": pairs, "toImage": to_image});
-        let mapped = core::map_points(&self.facts, &self.settings, &request.to_string()).ok();
-        let parsed: Vec<[f64; 2]> = mapped.and_then(|j| serde_json::from_str::<Value>(&j).ok()).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-        parsed.into_iter().map(|[x, y]| (x, y)).collect()
+        let request = MapRequest { width: self.frame.0 as usize, height: self.frame.1 as usize, apply_crop: true, points: points.iter().map(|&(x, y)| [x, y]).collect(), to_image };
+        core::mapped_points(&self.facts, &self.settings, &request).into_iter().map(|[x, y]| (x, y)).collect()
     }
 
     pub fn css_to_image(&self, points: &[V]) -> Vec<V> {

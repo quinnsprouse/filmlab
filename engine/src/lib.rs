@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod core;
+pub use lightcraft_engine::develop;
 pub mod dust;
 mod dust_tables;
 pub mod film;

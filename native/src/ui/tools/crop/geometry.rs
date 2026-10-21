@@ -1,5 +1,6 @@
-use filmlab_engine::core;
-use serde_json::{Value, json};
+use filmlab_engine::core::{self, Facts, MapRequest};
+
+use crate::settings::Settings;
 
 pub type Vec2 = [f64; 2];
 
@@ -30,24 +31,17 @@ pub struct Crop {
     pub aspect: Option<Vec2>,
 }
 
-fn num(value: &Value, fallback: f64) -> f64 {
-    value.as_f64().filter(|v| v.is_finite()).unwrap_or(fallback)
+fn finite(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
 }
 
-fn pair(value: &Value) -> Option<Vec2> {
-    let list = value.as_array().filter(|l| l.len() == 2)?;
-    let (w, h) = (list[0].as_f64()?, list[1].as_f64()?);
-    (w > 0.0 && h > 0.0).then_some([w, h])
-}
-
-pub fn read_crop(settings: &Value) -> Crop {
-    let crop = &settings["crop"];
-    let geometry = &crop["geometry"];
-    let rect = &geometry["rect"];
+pub fn read_crop(settings: &Settings) -> Crop {
+    let crop = &settings.crop;
+    let (geometry, rect) = (&crop.geometry, &crop.geometry.rect);
     Crop {
-        rect: Rect { x0: num(&rect["x0"], FULL.x0), y0: num(&rect["y0"], FULL.y0), x1: num(&rect["x1"], FULL.x1), y1: num(&rect["y1"], FULL.y1) },
-        angle: num(&geometry["angle"], 0.0),
-        aspect: pair(&crop["aspect"]),
+        rect: Rect { x0: finite(rect.x0, FULL.x0), y0: finite(rect.y0, FULL.y0), x1: finite(rect.x1, FULL.x1), y1: finite(rect.y1, FULL.y1) },
+        angle: finite(geometry.angle, 0.0),
+        aspect: crop.aspect.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| [f64::from(w), f64::from(h)]),
     }
 }
 
@@ -68,10 +62,9 @@ pub struct FrameMap {
 }
 
 impl FrameMap {
-    pub fn new(facts: &Value, settings: &Value, size: (u32, u32)) -> Option<FrameMap> {
-        let request = json!({"width": size.0, "height": size.1, "applyCrop": false, "points": [[0, 0], [1, 0], [0, 1]], "toImage": false});
-        let out = core::map_points(&facts.to_string(), &settings.to_string(), &request.to_string()).ok()?;
-        let points: Vec<Vec2> = serde_json::from_str(&out).ok()?;
+    pub fn new(facts: &Facts, settings: &Settings, size: (u32, u32)) -> Option<FrameMap> {
+        let request = MapRequest { width: size.0 as usize, height: size.1 as usize, apply_crop: false, points: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], to_image: false };
+        let points = core::mapped_points(facts, settings, &request);
         let [origin, x, y] = [*points.first()?, *points.get(1)?, *points.get(2)?];
         Some(FrameMap { width: f64::from(size.0), height: f64::from(size.1), origin, unit_x: [x[0] - origin[0], x[1] - origin[1]], unit_y: [y[0] - origin[0], y[1] - origin[1]] })
     }

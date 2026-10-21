@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::cache;
 use crate::film::{FilmSettings, render_film};
 use crate::pictures::{Picture, Pictures, Source, image_of};
+use crate::settings::Settings;
 use crate::stocks;
 
 const RAW: [&str; 15] = ["dng", "cr3", "cr2", "arw", "nef", "nrw", "raf", "rw2", "rwl", "orf", "pef", "srw", "erf", "3fr", "iiq"];
@@ -37,13 +38,13 @@ pub struct PhotoFile {
 #[serde(rename_all = "camelCase")]
 pub struct Probed {
     pub facts: Value,
-    pub defaults: Value,
+    pub defaults: Settings,
     pub embedded_xmp: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PhotoState {
-    pub settings: Value,
+    pub settings: Settings,
     pub rating: u8,
     pub flag: String,
     pub label: Option<String>,
@@ -208,7 +209,7 @@ fn state_of(probed: &Probed, sidecar: Option<&str>) -> Result<PhotoState, String
 /// Hash of everything in `state` that changes its thumbnail's pixels.
 fn look_of(state: &PhotoState) -> u64 {
     let film = render_film(state.film().as_ref()).map(|f| f.to_value().to_string()).unwrap_or_default();
-    cache::look(&state.settings.to_string(), &film, THUMBNAIL_EDGE, THUMBNAIL_SOURCE)
+    cache::look(&state.settings.json(), &film, THUMBNAIL_EDGE, THUMBNAIL_SOURCE)
 }
 
 fn view_of(film: Option<&FilmSettings>) -> String {
@@ -248,7 +249,7 @@ fn index_render(slot: usize, file: &PhotoFile, probed: &Probed, state: &PhotoSta
     let view = view_of(film.as_ref());
     let frame = crate::perf::initiated(|| {
         engine.load("scratch", &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
-        engine.render("scratch", &state.settings.to_string(), &view)
+        engine.render_develop("scratch", &state.settings, &view)
     });
     engine.release("scratch");
     finish(frame?, state, cache::key(&file.path).as_ref())
@@ -269,7 +270,7 @@ fn refresh_render(path: &Path, probed: &Probed, state: &PhotoState) -> Result<Re
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
             engine.load(REFRESHED, &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
         }
-        engine.render(REFRESHED, &state.settings.to_string(), &view)
+        engine.render_develop(REFRESHED, &state.settings, &view)
     });
     *decoded = if frame.is_ok() { key.clone() } else { None };
     finish(frame?, state, key.as_ref())
@@ -282,7 +283,7 @@ pub fn fresh_thumbnail(path: &Path, probed: &Probed, state: &PhotoState) -> Resu
     let mut engine = Engine::new();
     ensure_luts(&mut engine, film.as_ref())?;
     engine.load("fresh", &probed.facts.to_string(), &bytes, THUMBNAIL_SOURCE)?;
-    Ok(engine.render("fresh", &state.settings.to_string(), &view_of(film.as_ref()))?.take_rgba())
+    Ok(engine.render_develop("fresh", &state.settings, &view_of(film.as_ref()))?.take_rgba())
 }
 
 /// What the disk cache already knows about a photo: its probe, and whether its film thumbnail matches its look.

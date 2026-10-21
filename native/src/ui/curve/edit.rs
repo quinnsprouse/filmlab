@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use super::model::{self, Plot};
 use super::{Ease, Focused, GRAPH, Gesture, PointDrag, REGIONS, SPLITS, Tab, Target, point_text, region_text};
 use crate::develop::{Compare, POINT_CURVES};
+use crate::settings::Settings;
 use crate::ui::app::FilmlabApp;
 use crate::ui::{inspector, motion, slider};
 
@@ -66,7 +67,7 @@ fn interior(points: &[[f64; 2]], index: usize) -> bool {
     index > 0 && index + 1 < points.len()
 }
 
-fn settings(app: &FilmlabApp, cx: &App) -> Option<Value> {
+fn settings(app: &FilmlabApp, cx: &App) -> Option<Settings> {
     app.develop.read(cx).settings.clone()
 }
 
@@ -357,7 +358,7 @@ pub fn pick_tab(app: &mut FilmlabApp, tab: Tab, reset: bool, cx: &mut Context<Fi
 
 fn reset_tab(app: &mut FilmlabApp, tab: Tab, cx: &mut Context<FilmlabApp>) {
     let Some(settings) = settings(app, cx) else { return };
-    let from = model::samples(model::line(&app.ui.curve.curves(&settings["curve"]), tab));
+    let from = model::samples(model::line(&app.ui.curve.curves(&settings.curve), tab));
     let (label, key) = (format!("{} curve reset", tab.label()), format!("curve.reset.{}", tab.reset()));
     let changed = app.develop.update(cx, |d, cx| d.try_command("curve.reset", json!({"channel": tab.reset()}), &label, &key, cx)).is_ok_and(|(_, changed)| changed);
     if changed && !motion::reduced() {

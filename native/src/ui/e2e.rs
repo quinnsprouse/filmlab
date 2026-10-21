@@ -17,6 +17,7 @@ use crate::develop::plans::Plan;
 use crate::develop::{Compare, DisplayFrame, Tool};
 use crate::film::{FilmSettings, Gauge};
 use crate::library::ensure_luts;
+use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, StockKind};
 
 // why: a scripted session (FILMLAB_E2E=1) that drives the real window through its key bindings, injected mouse
@@ -74,7 +75,7 @@ fn reference(path: &Path, facts: &Value, plan: &Plan) -> Result<Vec<u8>, String>
     if let Some(f) = &plan.film {
         view["film"] = f.to_value();
     }
-    let mut frame = engine.render("reference", &plan.settings.to_string(), &view.to_string())?;
+    let mut frame = engine.render("reference", &plan.settings.json(), &view.to_string())?;
     Ok(frame.take_rgba())
 }
 
@@ -565,7 +566,7 @@ async fn defringe_range(run: &mut Run, cx: &mut AsyncApp) {
 }
 
 fn master_points(a: &FilmlabApp, cx: &App) -> Vec<[f64; 2]> {
-    let settings = a.develop.read(cx).settings.clone().unwrap_or_default();
+    let settings = a.develop.read(cx).settings.as_ref().map(Settings::to_value).unwrap_or_default();
     settings["curve"]["master"].as_array().map(|ps| ps.iter().filter_map(|p| Some([p["x"].as_f64()?, p["y"].as_f64()?])).collect()).unwrap_or_default()
 }
 
@@ -737,7 +738,7 @@ async fn tone_curve(run: &mut Run, cx: &mut AsyncApp) {
     run.verify(cx, "tone curve: a saved curve renders and matches", false).await;
     let master = run.read(cx, master_points).unwrap_or_default();
     let label = run.read(cx, step_label).unwrap_or_default();
-    let named = run.read(cx, |a, cx| a.develop.read(cx).settings.clone().is_some_and(|s| a.rail.curves().any(|p| p.name == "medium print" && p.partial["curve"] == s["curve"]))).unwrap_or(false);
+    let named = run.read(cx, |a, cx| a.develop.read(cx).settings.clone().is_some_and(|s| a.rail.curves().any(|p| p.name == "medium print" && p.partial["curve"] == s.to_value()["curve"]))).unwrap_or(false);
     run.check(
         "tone curve: the curve menu applies a saved curve as one step and names it",
         master == [[0.0, 0.0], [0.25, 0.2], [0.5, 0.5], [0.75, 0.8], [1.0, 1.0]] && label == "Tone curve medium print" && named,
@@ -971,7 +972,7 @@ async fn tools(run: &mut Run, cx: &mut AsyncApp) {
     run.check("masks: M opens the masks tool", masks, "");
     let added = run.develop(cx, |d, cx| d.command("mask.add", json!({"kind": "radial"}), "Add radial gradient", "mask.add", cx)).flatten();
     let id = added.as_ref().and_then(|r| r["activeMask"].as_u64());
-    let count = run.read(cx, |a, cx| a.develop.read(cx).settings.as_ref().and_then(|s| s["masks"].as_array().map(Vec::len)).unwrap_or(0)).unwrap_or(0);
+    let count = run.read(cx, |a, cx| a.develop.read(cx).settings.as_ref().and_then(|s| s.to_value()["masks"].as_array().map(Vec::len)).unwrap_or(0)).unwrap_or(0);
     run.check("masks: adding a radial mask succeeds", added.is_some() && count == 1, format!("{count} masks, result {}", added.as_ref().map_or(String::new(), Value::to_string)));
     if let Some(id) = id {
         run.develop(cx, |d, cx| d.command("mask.adjust", json!({"id": id, "values": {"exposure": 1.5}}), "Mask exposure", "mask.adjust.e2e", cx));
@@ -995,10 +996,10 @@ async fn compare_and_profiles(run: &mut Run, cx: &mut AsyncApp) {
     run.wait(cx, 5, |a, cx| a.develop.read(cx).compare == Compare::After).await;
     run.verify(cx, "compare: the after view matches", false).await;
 
-    let settings = run.read(cx, |a, cx| a.develop.read(cx).settings.clone()).flatten().unwrap_or(Value::Null);
-    let saved = exposure_of(&settings);
+    let settings = run.read(cx, |a, cx| a.develop.read(cx).settings.clone()).flatten();
+    let saved = settings.as_ref().map_or(f64::NAN, |s| exposure_of(&s.to_value()));
     let film = run.film(cx).map(|f| f.to_value());
-    let profile = super::rail::store::build("E2E look", &settings, vec!["light".into(), "film".into()], film);
+    let profile = settings.as_ref().and_then(|s| super::rail::store::build("E2E look", s, vec!["light".into(), "film".into()], film));
     run.check("profiles: a profile builds from the current settings", profile.is_some(), "");
     let Some(profile) = profile else { return };
     let mut all = super::rail::store::load();
@@ -1079,7 +1080,7 @@ async fn leave(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     run.act(cx, |a, cx| a.library.update(cx, |l, cx| l.open(folder, cx)));
     let reread = run.wait(cx, 60, {
         let stem = stem.to_string();
-        move |a, cx| a.library.read(cx).photos.iter().find(|r| r.file.stem == stem).and_then(|r| r.state.as_ref()).is_some_and(|s| (exposure_of(&s.settings) - 0.7).abs() < 1e-6)
+        move |a, cx| a.library.read(cx).photos.iter().find(|r| r.file.stem == stem).and_then(|r| r.state.as_ref()).is_some_and(|s| (exposure_of(&s.settings.to_value()) - 0.7).abs() < 1e-6)
     })
     .await;
     run.check("persistence: reopening the folder reads the edit back", reread, "");

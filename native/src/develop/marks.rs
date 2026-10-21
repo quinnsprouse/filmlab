@@ -5,8 +5,9 @@ use std::time::Instant;
 use filmlab_engine::core;
 use serde_json::{Value, json};
 
-use super::{POINT_CURVES, Step};
+use super::Step;
 use crate::film::FilmSettings;
+use crate::settings::Settings;
 
 /// A photo's edit as flat ids and values: every control (`light.exposure`) and the film look (`film.grain.size`).
 pub type Flat = HashMap<String, Value>;
@@ -26,7 +27,7 @@ pub fn changed(before: &Flat, after: &Flat, by_agent: bool) -> Vec<String> {
         .collect()
 }
 
-pub fn flatten(settings: &Value, film: Option<&FilmSettings>) -> Flat {
+pub fn flatten(settings: &Settings, film: Option<&FilmSettings>) -> Flat {
     fn walk(prefix: &str, v: &Value, out: &mut Flat) {
         match v {
             Value::Object(map) => map.iter().for_each(|(k, v)| walk(&format!("{prefix}.{k}"), v, out)),
@@ -35,10 +36,10 @@ pub fn flatten(settings: &Value, film: Option<&FilmSettings>) -> Flat {
             }
         }
     }
-    let values: HashMap<String, f64> = core::control_values(&settings.to_string()).ok().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
-    let mut out: Flat = values.into_iter().map(|(k, v)| (k, json!(v))).collect();
-    for channel in POINT_CURVES {
-        out.insert(format!("curve.{channel}"), settings["curve"][channel].clone());
+    let mut out: Flat = core::values_of(settings).into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
+    let curve = &settings.curve;
+    for (channel, points) in [("master", &curve.master), ("red", &curve.red), ("green", &curve.green), ("blue", &curve.blue)] {
+        out.insert(format!("curve.{channel}"), serde_json::to_value(points).unwrap_or_default());
     }
     if let Some(film) = film {
         walk("film", &film.normalized().to_value(), &mut out);

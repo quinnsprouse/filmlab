@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::settings::Settings;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pt {
     pub x: f64,
@@ -340,6 +342,7 @@ fn parse_mask(value: &Value) -> Option<Mask> {
     })
 }
 
-pub fn read_masks(settings: Option<&Value>) -> Vec<Mask> {
-    settings.and_then(|s| s.get("masks")).and_then(Value::as_array).map(|list| list.iter().filter_map(parse_mask).collect()).unwrap_or_default()
+pub fn read_masks(settings: Option<&Settings>) -> Vec<Mask> {
+    let masks = settings.and_then(|s| serde_json::to_value(&s.masks).ok());
+    masks.as_ref().and_then(Value::as_array).map(|list| list.iter().filter_map(parse_mask).collect()).unwrap_or_default()
 }

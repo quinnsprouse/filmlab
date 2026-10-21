@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use filmlab_engine::develop::ToneCurve;
 use filmlab_engine::tone_curve::Curves;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,6 +18,7 @@ use super::controls::Picker;
 use super::theme;
 use crate::develop::POINT_CURVES;
 use crate::menu::Entry;
+use crate::settings::Settings;
 use model::{Intake, level};
 
 pub use edit::{Preset, choose, pick_preset, preset_names};
@@ -133,7 +135,7 @@ type HistogramKey = (usize, u64);
 
 #[derive(Default)]
 struct Cache {
-    curves: Option<(String, Rc<Curves>)>,
+    curves: Option<(ToneCurve, Rc<Curves>)>,
     histogram: Option<(HistogramKey, Rc<Vec<f32>>)>,
     presets: Option<(u64, Value)>,
 }
@@ -171,16 +173,16 @@ impl State {
         self.focus.get().is_some_and(|f| f.is_focused(window))
     }
 
-    fn curves(&self, curve: &Value) -> Rc<Curves> {
-        let key = curve.to_string();
+    fn curves(&self, curve: &ToneCurve) -> Rc<Curves> {
         let mut cache = self.cache.borrow_mut();
         if let Some((k, c)) = &cache.curves
-            && *k == key
+            && k == curve
         {
             return c.clone();
         }
-        let curves = Rc::new(Curves::of(&key).unwrap_or_else(|_| Curves::of("null").expect("an empty tone curve")));
-        cache.curves = Some((key, curves.clone()));
+        let json = serde_json::to_string(curve).unwrap_or_default();
+        let curves = Rc::new(Curves::of(&json).unwrap_or_else(|_| Curves::of("null").expect("an empty tone curve")));
+        cache.curves = Some((curve.clone(), curves.clone()));
         curves
     }
 
@@ -220,10 +222,12 @@ struct Saved {
 }
 
 impl Shown {
-    pub fn of(app: &FilmlabApp, settings: &Value, values: &HashMap<String, f64>, marks: &HashSet<String>, cx: &mut Context<FilmlabApp>) -> Shown {
+    pub fn of(app: &FilmlabApp, settings: &Settings, values: &HashMap<String, f64>, marks: &HashSet<String>, cx: &mut Context<FilmlabApp>) -> Shown {
         let state = &app.ui.curve;
         let tab = state.tab;
-        let curves = state.curves(&settings["curve"]);
+        let curves = state.curves(&settings.curve);
+        let saved_curve = OnceCell::new();
+        let curve_value = || saved_curve.get_or_init(|| serde_json::to_value(&settings.curve).unwrap_or_default());
         let value = |id: &str| values.get(id).copied().or_else(|| super::inspector::spec(id).map(|s| s.default)).unwrap_or(0.0);
         let splits = SPLITS.map(|(id, _)| value(id));
         let regions = REGIONS.map(|(id, _)| value(id));
@@ -259,13 +263,13 @@ impl Shown {
         let band = band.filter(|_| tab == Tab::Regions);
         let envelope = band.map(|b| {
             let reach = |amount: f64| {
-                let mut curve = settings["curve"].clone();
+                let mut curve = curve_value().clone();
                 curve[REGIONS[b].0.trim_start_matches("curve.")] = json!(amount);
                 Curves::of(&curve.to_string()).map(|c| model::samples(&c.regions)).unwrap_or_default()
             };
             (reach(-100.0), reach(100.0))
         });
-        let saved = app.rail.curves().map(|p| Saved { id: p.id.clone(), name: p.name.clone(), on: p.partial["curve"] == settings["curve"] }).collect();
+        let saved = app.rail.curves().map(|p| Saved { id: p.id.clone(), name: p.name.clone(), on: p.partial["curve"] == *curve_value() }).collect();
         *state.snapshot.borrow_mut() = Snapshot { tab, points: points.clone(), splits };
         Shown { tab, curves, points, splits, regions, in_use, straight, agent, band, envelope, histogram, pointer, presets, saved }
     }

@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 use crate::camera::{Camera, Native, Region, Size, WHOLE, Zoom, camera_of, fit_scale};
 use crate::film::FilmSettings;
+use crate::settings::Settings;
 
 const DETAIL_MARGIN: f64 = 64.0;
 pub const PREVIEW_EDGE: f64 = 2560.0;
@@ -38,7 +39,7 @@ pub enum Layer {
 pub struct Inputs {
     pub photo_id: String,
     pub revision: u64,
-    pub settings: Value,
+    pub settings: Settings,
     pub film: Option<FilmSettings>,
     pub overlay: Option<Value>,
     pub apply_crop: bool,
@@ -52,7 +53,7 @@ pub struct Plan {
     pub revision: u64,
     pub look: String,
     pub level: Level,
-    pub settings: Value,
+    pub settings: Settings,
     pub film: Option<FilmSettings>,
     pub overlay: Option<Value>,
     pub view: Value,

@@ -103,7 +103,7 @@ fn base_of(held: &Held, driver: &Driver, cx: &mut AsyncApp, transfer: &str) -> O
     held.read(driver, cx, |e| {
         let step = e.history.get(e.cursor)?;
         let prior = e.history.get(e.cursor.checked_sub(1)?)?;
-        step.key.starts_with(transfer).then(|| (e.cursor - 1, State { settings: prior.settings.clone(), film: prior.film.clone() }))
+        step.key.starts_with(transfer).then(|| (e.cursor - 1, State { settings: prior.settings.to_value(), film: prior.film.clone() }))
     })
     .flatten()
 }

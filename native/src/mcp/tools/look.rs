@@ -4,7 +4,7 @@ use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use filmlab_engine::core;
+use filmlab_engine::core::{self, Facts};
 use gpui_kit::{AppContext, AsyncApp, Task};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -16,6 +16,7 @@ use crate::develop::plans::PREVIEW_EDGE;
 use crate::film::{FilmSettings, render_film};
 use crate::library::ensure_luts;
 use crate::mcp::session::{Held, Hub, NO_PHOTO};
+use crate::settings::Settings;
 use crate::ui::driver::Driver;
 
 pub struct Shot {
@@ -44,7 +45,7 @@ impl State {
 
     /// The held photo as opened, without film.
     pub fn opened(held: &Held, driver: &Driver, cx: &mut AsyncApp) -> Result<State, String> {
-        held.read(driver, cx, |e| e.before.map(|b| State { settings: b.clone(), film: None }))
+        held.read(driver, cx, |e| e.before.map(|settings| State { settings, film: None }))
             .flatten()
             .ok_or_else(|| "the photo's state before editing isn't known".into())
     }
@@ -71,12 +72,12 @@ impl Pick<'_> {
         if before { Pick::Before } else { Pick::Current }
     }
 
-    pub fn onto(&self, mut job: RenderJob) -> RenderJob {
+    pub fn onto(&self, mut job: RenderJob) -> Result<RenderJob, String> {
         if let Pick::Edit(settings, film) = self {
-            job.settings = (*settings).clone();
+            job.settings = Settings::parse(settings)?;
             job.film = render_film(*film);
         }
-        job
+        Ok(job)
     }
 }
 
@@ -97,6 +98,13 @@ pub fn frame_size(facts: &Value, settings: &Value, crop: bool) -> Result<[f64; 2
     serde_json::from_str(&core::frame_size(&facts.to_string(), &settings.to_string(), crop)?).map_err(|e| e.to_string())
 }
 
+/// The size of the frame `job` draws, cropped or not.
+fn job_frame(job: &RenderJob, crop: bool) -> Result<[f64; 2], String> {
+    let facts: Facts = serde_json::from_str(&job.facts.to_string()).map_err(|e| e.to_string())?;
+    let [w, h] = core::frame_size_of(&facts, &job.settings, crop);
+    Ok([w as f64, h as f64])
+}
+
 /// Renders the held photo off screen: the whole frame within `max_edge`, or `region` (0-1 of the frame) at up to full
 /// resolution. The frame is cropped unless `crop` is false.
 pub async fn render(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: u32, region: Option<[f64; 4]>, pick: &Pick<'_>, crop: bool) -> Result<Shot, String> {
@@ -107,8 +115,8 @@ pub async fn render(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: u
 pub async fn framing(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: u32, region: Option<[f64; 4]>, pick: &Pick<'_>, crop: bool) -> Result<(RenderJob, Value), String> {
     let region = region.map(ordered).transpose()?;
     let before = matches!(pick, Pick::Before);
-    let probe = pick.onto(held.render_job(driver, cx, before, false).await?);
-    let [w, h] = frame_size(&probe.facts, &probe.settings, crop)?;
+    let probe = pick.onto(held.render_job(driver, cx, before, false).await?)?;
+    let [w, h] = job_frame(&probe, crop)?;
     let edge = f64::from(max_edge);
     let (view, full) = match region {
         None => (json!({"maxW": max_edge, "maxH": max_edge, "stages": STAGES, "applyCrop": crop}), false),
@@ -121,7 +129,7 @@ pub async fn framing(held: &Held, driver: &Driver, cx: &mut AsyncApp, max_edge: 
             (json!({"maxW": fw as usize, "maxH": fh as usize, "stages": STAGES, "applyCrop": crop, "window": window.map(|v| v as usize)}), fw.max(fh) > PREVIEW_EDGE)
         }
     };
-    let job = if full && !probe.full { pick.onto(held.render_job(driver, cx, before, true).await?) } else { probe };
+    let job = if full && !probe.full { pick.onto(held.render_job(driver, cx, before, true).await?)? } else { probe };
     Ok((job, view))
 }
 
@@ -147,7 +155,7 @@ pub async fn draw(job: RenderJob, view: Value, cx: &mut AsyncApp) -> Result<Shot
         if let Some(f) = &job.film {
             view["film"] = f.to_value();
         }
-        let frame = crate::perf::interactive(|| engine.render(&job.key, &job.settings.to_string(), &view.to_string()));
+        let frame = crate::perf::interactive(|| engine.render_develop(&job.key, &job.settings, &view.to_string()));
         engine.forget_view(&job.key, STAGES);
         let mut frame = frame?;
         let shot = Shot { width: frame.width(), height: frame.height(), rgba: frame.take_rgba() };
@@ -165,13 +173,13 @@ fn look_of(job: &RenderJob, edge: u32, input: bool) -> u64 {
     job.key.hash(&mut hasher);
     match input {
         true => {
-            let mut uncurved = job.settings.clone();
+            let mut uncurved = job.settings.to_value();
             if let Some(o) = uncurved.as_object_mut() {
                 o.remove("curve");
             }
             uncurved.to_string().hash(&mut hasher);
         }
-        false => job.settings.to_string().hash(&mut hasher),
+        false => job.settings.json().hash(&mut hasher),
     }
     job.film.as_ref().map(|f| f.to_value().to_string()).hash(&mut hasher);
     edge.hash(&mut hasher);
@@ -191,7 +199,7 @@ pub async fn input_frame(hub: &Hub, held: &Held, driver: &Driver, cx: &mut Async
 
 async fn kept(hub: &Hub, held: &Held, driver: &Driver, cx: &mut AsyncApp, state: &State, edge: u32, input: bool) -> Result<Arc<Shot>, String> {
     let id = held.id(driver, cx).ok_or(NO_PHOTO)?;
-    let job = Pick::Edit(&state.settings, state.film.as_ref()).onto(held.render_job(driver, cx, false, false).await?);
+    let job = Pick::Edit(&state.settings, state.film.as_ref()).onto(held.render_job(driver, cx, false, false).await?)?;
     let look = look_of(&job, edge, input);
     if let Some(shot) = hub.kept(&id, look) {
         return Ok(shot);
@@ -538,7 +546,7 @@ pub async fn preview(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: V
     let held = hub.hold(driver, cx, p.photo.as_deref()).await?;
     let shot = render(&held, driver, cx, p.max_edge.unwrap_or(768).clamp(64, 2048), p.region, &Pick::of(p.before.unwrap_or(false)), true).await?;
     let before = p.before.unwrap_or(false);
-    let frame = held.read(driver, cx, |e| e.facts.map(|f| frame_size(f, if before { e.before.unwrap_or(e.settings) } else { e.settings }, true))).flatten().transpose()?;
+    let frame = held.read(driver, cx, |e| e.facts.map(|f| frame_size(f, if before { e.before.as_ref().unwrap_or(&e.settings) } else { &e.settings }, true))).flatten().transpose()?;
     drop(held);
     let quality = p.quality.unwrap_or(80).clamp(30, 95);
     let region = p.region.map(ordered).transpose()?;

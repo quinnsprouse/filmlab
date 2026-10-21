@@ -1,5 +1,7 @@
+use filmlab_engine::develop::SpotMode;
 use serde_json::{Value, json};
 
+use crate::settings::Settings;
 use crate::ui::app::FilmlabApp;
 use gpui_kit::Context;
 
@@ -37,8 +39,13 @@ impl Mode {
         }
     }
 
-    fn parse(id: Option<&str>) -> Mode {
-        Mode::ALL.into_iter().find(|m| Some(m.id()) == id).unwrap_or(Mode::Remove)
+    fn of(mode: SpotMode) -> Mode {
+        match mode {
+            SpotMode::Remove => Mode::Remove,
+            SpotMode::Heal => Mode::Heal,
+            SpotMode::Clone => Mode::Clone,
+            SpotMode::Fill => Mode::Fill,
+        }
     }
 }
 
@@ -52,24 +59,19 @@ pub struct Spot {
     pub source: Option<V>,
 }
 
-fn vec_of(value: &Value) -> Option<V> {
-    Some((value.get("x")?.as_f64()?, value.get("y")?.as_f64()?))
-}
-
-fn spot_of(raw: &Value) -> Spot {
-    let num = |key: &str, fallback: f64| raw.get(key).and_then(Value::as_f64).unwrap_or(fallback);
+fn spot_of(raw: &filmlab_engine::develop::Spot) -> Spot {
     Spot {
-        mode: Mode::parse(raw.get("mode").and_then(Value::as_str)),
-        points: raw.get("points").and_then(Value::as_array).map(|a| a.iter().filter_map(vec_of).collect()).unwrap_or_default(),
-        size: num("size", 0.02),
-        feather: num("feather", 50.0),
-        opacity: num("opacity", 100.0),
-        source: raw.get("source_offset").and_then(vec_of),
+        mode: Mode::of(raw.mode),
+        points: raw.points.iter().map(|p| (p.x, p.y)).collect(),
+        size: raw.size,
+        feather: raw.feather,
+        opacity: raw.opacity,
+        source: raw.source_offset.map(|p| (p.x, p.y)),
     }
 }
 
-pub fn spots_of(settings: Option<&Value>) -> Vec<Spot> {
-    settings.and_then(|s| s.get("spots")).and_then(Value::as_array).map(|a| a.iter().map(spot_of).collect()).unwrap_or_default()
+pub fn spots_of(settings: Option<&Settings>) -> Vec<Spot> {
+    settings.map(|s| s.spots.iter().map(spot_of).collect()).unwrap_or_default()
 }
 
 /// Runs a LightCraft command and keeps the failure text for the panel.

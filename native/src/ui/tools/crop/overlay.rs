@@ -31,8 +31,8 @@ struct View {
 fn view(app: &FilmlabApp, cx: &App) -> Option<View> {
     let (bounds, frame) = app.tools.crop.frame?;
     let d = app.develop.read(cx);
-    let (facts, settings) = (d.facts.as_ref()?, d.settings.as_ref()?);
-    let map = FrameMap::new(facts, settings, frame)?;
+    let (facts, settings) = (d.engine_facts()?, d.settings.as_ref()?);
+    let map = FrameMap::new(&facts, settings, frame)?;
     let crop = read_crop(settings);
     let scale = f64::from(f32::from(bounds.size.width)) / f64::from(frame.0.max(1));
     let corners = map.corners(&crop).map(|c| [c[0] * scale, c[1] * scale]);

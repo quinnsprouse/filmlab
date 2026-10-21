@@ -61,7 +61,7 @@ pub async fn status(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, value: Va
         "app" => operate(hub, driver, cx, "status", json!({})).await,
         "state" => {
             let out = operate(hub, driver, cx, "get_edit", json!({"photo": photo})).await?;
-            let state = hub.peek(driver, cx, photo.as_deref(), |e| digest(e.id, e.settings, e.film))?;
+            let state = hub.peek(driver, cx, photo.as_deref(), |e| digest(e.id, &e.settings, e.film))?;
             let mut edit: Value = serde_json::from_str(&out.text).map_err(|e| e.to_string())?;
             edit["state"] = json!(state);
             Ok(Output::json(edit))
