@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 
 use super::app::{FilmlabApp, Mode};
+use crate::develop::Tool;
 use super::driver::Driver;
 use crate::camera::Zoom;
 use crate::library::PhotoRecord;
@@ -182,6 +183,122 @@ async fn drag_exposure(driver: &Driver, cx: &mut AsyncApp, photo: &str, name: &s
     );
 }
 
+/// UI-thread time for one event: `step`, then drawing the window when it asked to be drawn again.
+fn drawn(driver: &Driver, cx: &mut AsyncApp, step: impl FnOnce(&Entity<FilmlabApp>, &mut Window, &mut App)) -> Option<f64> {
+    let app = driver.app.upgrade()?;
+    let notified = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = notified.clone();
+    let watch = cx.update(|cx| cx.observe(&app, move |_, _| seen.set(true)));
+    let t = Instant::now();
+    driver.on_window(cx, move |window, cx| step(&app, window, cx))?;
+    driver.on_window(cx, |window, cx| {
+        if notified.get() {
+            window.draw(cx).clear(cx);
+        }
+    })?;
+    drop(watch);
+    Some(ms(t.elapsed()))
+}
+
+async fn slider_steps(driver: &Driver, cx: &mut AsyncApp, name: &str) {
+    let mut steps = Vec::new();
+    for i in 0..40 {
+        let v = -0.4 + f64::from(i) / 50.0;
+        steps.extend(drawn(driver, cx, move |app, _, cx| app.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.edit_controls(&[("light.exposure", v)], "Exposure", cx)))));
+        cx.background_executor().timer(Duration::from_millis(16)).await;
+    }
+    driver.develop(cx, |d, cx| d.release(cx));
+    report(name, &mut steps);
+    driver.settled(cx, false).await;
+}
+
+fn mouse_move(window: &mut Window, cx: &mut App, at: Point<Pixels>) {
+    window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() }), cx);
+}
+
+/// Moves the pointer over the fit frame along `path` (frame fractions, from 0 to 1 over the moves).
+async fn pointer_moves(driver: &Driver, cx: &mut AsyncApp, name: &str, path: impl Fn(f32) -> (f32, f32)) {
+    let Some(frame) = driver.on_window(cx, |window, cx| driver.app.upgrade().and_then(|a| a.read(cx).fit_frame(window, cx))).flatten() else {
+        return eprintln!("bench {name:<28} no frame");
+    };
+    let (origin, size) = (frame.0.origin, frame.0.size);
+    driver.on_window(cx, |window, cx| window.draw(cx).clear(cx));
+    let mut moves = Vec::new();
+    for i in 0..80 {
+        let (u, v) = path(i as f32 / 80.0);
+        let at = point(origin.x + size.width * u, origin.y + size.height * v);
+        moves.extend(drawn(driver, cx, move |_, window, cx| mouse_move(window, cx, at)));
+        cx.background_executor().timer(Duration::from_millis(8)).await;
+    }
+    report(name, &mut moves);
+}
+
+fn across(t: f32) -> (f32, f32) {
+    (0.2 + 0.6 * t, 0.3 + 0.4 * t)
+}
+
+async fn heal(driver: &Driver, cx: &mut AsyncApp) {
+    driver.act(cx, |a, cx| a.set_tool(Tool::Heal, cx));
+    driver.settled(cx, false).await;
+    pointer_moves(driver, cx, "UI per heal move, no spots", across).await;
+    for i in 0..24 {
+        let (x, y) = (0.1 + 0.035 * f64::from(i), 0.2 + 0.025 * f64::from(i % 8));
+        driver.develop(cx, move |d, cx| d.command("spot.add", serde_json::json!({"mode": "heal", "points": [[x, y], [x + 0.01, y + 0.01]], "size": 0.01, "feather": 50.0, "opacity": 100.0}), "Heal spot", &format!("bench.spot.{i}"), cx));
+    }
+    driver.settled(cx, false).await;
+    pointer_moves(driver, cx, "UI per heal move, 24 spots", across).await;
+    let grip = driver.read(cx, |a, cx| a.develop.read(cx).fit.as_ref().map(|f| (f.width as f32, f.height as f32))).flatten().unwrap_or((1.0, 1.0));
+    let wobble = 1.5 / grip.0.max(grip.1);
+    pointer_moves(driver, cx, "UI per heal move, on a spot", move |t| (0.1 + wobble * (t * 40.0).sin(), 0.2 + wobble * (t * 40.0).cos())).await;
+    driver.act(cx, |a, cx| a.set_tool(Tool::Edit, cx));
+    driver.settled(cx, false).await;
+}
+
+async fn long_history(driver: &Driver, cx: &mut AsyncApp) {
+    for i in 0..200 {
+        let v = f64::from(i % 20) / 100.0;
+        let edit: (&str, f64, &str) = if i % 2 == 0 { ("light.exposure", v, "Exposure") } else { ("color.vibrance", v * 100.0, "Vibrance") };
+        driver.develop(cx, move |d, cx| d.edit_controls(&[(edit.0, edit.1)], edit.2, cx));
+    }
+    let steps = driver.read(cx, |a, cx| a.develop.read(cx).history.len()).unwrap_or(0);
+    driver.settled(cx, false).await;
+    let mut undo = Vec::new();
+    let mut redo = Vec::new();
+    for _ in 0..20 {
+        undo.extend(drawn(driver, cx, |app, _, cx| app.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.undo(cx)))));
+        cx.background_executor().timer(Duration::from_millis(30)).await;
+    }
+    for _ in 0..20 {
+        redo.extend(drawn(driver, cx, |app, _, cx| app.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.redo(cx)))));
+        cx.background_executor().timer(Duration::from_millis(30)).await;
+    }
+    report(&format!("UI per undo, {steps} steps"), &mut undo);
+    report(&format!("UI per redo, {steps} steps"), &mut redo);
+    driver.settled(cx, false).await;
+}
+
+/// Brushes a long stroke into a mask, so the edit carries what a retouched photo does.
+async fn brush(driver: &Driver, cx: &mut AsyncApp) {
+    let points: Vec<[f64; 2]> = (0..600).map(|i| f64::from(i) / 600.0).map(|t| [0.1 + 0.8 * t, 0.5 + 0.3 * (t * 25.0).sin()]).collect();
+    let params = serde_json::json!({"points": points, "size": 0.02, "feather": 50.0, "flow": 100.0, "erase": false, "autoMask": false, "connect": false});
+    driver.develop(cx, move |d, cx| d.command("mask.brushStroke", params, "Brush stroke", "bench.brush", cx));
+    let size = driver.read(cx, |a, cx| a.develop.read(cx).settings.as_ref().map(|s| serde_json::to_string(s).map_or(0, |j| j.len()))).flatten().unwrap_or(0);
+    eprintln!("bench {:<28} {:>7.1} KB", "settings with a brushed mask", size as f64 / 1024.0);
+    driver.settled(cx, false).await;
+}
+
+async fn ui_thread(driver: &Driver, cx: &mut AsyncApp) {
+    slider_steps(driver, cx, "UI per slider step").await;
+    heal(driver, cx).await;
+    long_history(driver, cx).await;
+    brush(driver, cx).await;
+    slider_steps(driver, cx, "UI per slider step, brushed").await;
+    driver.act(cx, |a, cx| a.set_tool(Tool::Masks, cx));
+    driver.settled(cx, false).await;
+    pointer_moves(driver, cx, "UI per masks move, brushed", across).await;
+    driver.act(cx, |a, cx| a.set_tool(Tool::Edit, cx));
+}
+
 pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
     if std::env::var_os("FILMLAB_BENCH").is_none() {
         return;
@@ -194,7 +311,10 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         }
         let launch = STARTED.get().map_or(0.0, |t| ms(t.elapsed()));
         eprintln!("bench {:<28} {launch:>7.1} ms", "launch to first task");
-        library(&driver, cx, launch).await;
+        let only_ui = std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "ui");
+        if !only_ui {
+            library(&driver, cx, launch).await;
+        }
         if std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "library") {
             cx.update(|cx| cx.quit());
             return;
@@ -225,6 +345,14 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         });
         cx.background_executor().timer(Duration::from_millis(2500)).await;
         let Some(first) = ids.first().cloned() else { return };
+        if only_ui {
+            let id = first.clone();
+            driver.act(cx, move |a, cx| a.open_photo(&id, cx));
+            driver.settled(cx, false).await;
+            ui_thread(&driver, cx).await;
+            cx.update(|cx| cx.quit());
+            return;
+        }
 
         let mut open = Vec::new();
         for id in ids.iter().step_by(3).take(3) {
@@ -367,6 +495,8 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         }
         report("leave 1:1 mid-render (UI)", &mut leave);
         driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
+        driver.settled(cx, false).await;
+        ui_thread(&driver, cx).await;
         driver.act(cx, |a, cx| a.set_mode(Mode::Browse, cx));
         cx.background_executor().timer(Duration::from_millis(300)).await;
         cx.update(|cx| cx.quit());
