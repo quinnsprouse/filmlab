@@ -7,10 +7,22 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
 // why: the system allocator keeps freed multi-megabyte blocks (every film frame's buffers) cached for good, so the
-// app's footprint only ever grew; mimalloc returns them to the system. Its pages carry VM tag 100, which `footprint`
-// and Instruments label "IOAccelerator": that category is mostly the heap, not GPU memory
+// app's footprint only ever grew; mimalloc returns them to the system
 #[global_allocator]
 static ALLOCATOR: MiMalloc = MiMalloc;
+
+// why: mimalloc tags its pages 100 by default, the tag `footprint`, vmmap and Instruments name "IOAccelerator", so the
+// heap read as GPU memory; tag 240 (VM_MEMORY_APPLICATION_SPECIFIC_1) shows it as the app's own. A page keeps the tag
+// it was mapped with, and Rust's runtime allocates before main, so the tag is set by an initializer that runs first
+const HEAP_TAG: std::ffi::c_long = 240;
+
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static TAG_HEAP: extern "C" fn() = tag_heap;
+
+extern "C" fn tag_heap() {
+    unsafe { libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_os_tag, HEAP_TAG) };
+}
 
 fn main() {
     filmlab::ui::bench::mark_launch();
