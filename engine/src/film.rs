@@ -45,6 +45,7 @@ impl CubeLut {
         if size < 2 || data.len() != size * size * size {
             return Err(format!("expected {} entries for size {size}, found {}", size * size * size, data.len()));
         }
+        data.shrink_to_fit();
         Ok(CubeLut { id: next_id(), size, min, max, unit: min == [0.0; 3] && max == [1.0; 3], data })
     }
 
