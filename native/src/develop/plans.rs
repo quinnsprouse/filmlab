@@ -138,8 +138,27 @@ pub fn draft_plan(fit: &Plan) -> Plan {
     Plan { view, ..fit.clone() }
 }
 
+/// The zoomed window drawn while a slider moves: the same part of the photo at half the size, a quarter of the
+/// pixels, with its own stage cache so the full-size one is still warm when the slider stops.
+pub fn draft_detail_plan(detail: &Plan) -> Plan {
+    let half = |v: &Value| (v.as_f64().unwrap_or(1.0) / 2.0).round().max(1.0);
+    let mut view = detail.view.clone();
+    let (full_w, full_h) = (half(&view["maxW"]), half(&view["maxH"]));
+    let window: Vec<f64> = view["window"].as_array().map(|w| w.iter().map(half).collect()).unwrap_or_default();
+    let [x, y, w, h] = window[..] else { return draft_plan(detail) };
+    let (w, h) = (w.min(full_w), h.min(full_h));
+    let (x, y) = (x.min(full_w - w), y.min(full_h - h));
+    view["maxW"] = json!(full_w as usize);
+    view["maxH"] = json!(full_h as usize);
+    view["window"] = json!([x as usize, y as usize, w as usize, h as usize]);
+    view["stages"] = json!("draft-zoom");
+    view["draft"] = json!(true);
+    let region = Region { u0: x / full_w, v0: y / full_h, u1: (x + w) / full_w, v1: (y + h) / full_h };
+    Plan { view, region, ..detail.clone() }
+}
+
 pub fn is_draft(plan: &Plan) -> bool {
-    plan.view["stages"] == "draft"
+    plan.view["draft"] == true
 }
 
 pub fn same_look(a: &Plan, b: &Plan) -> bool {

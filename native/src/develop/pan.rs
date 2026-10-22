@@ -174,6 +174,7 @@ impl Develop {
                     view["window"] = json!([to.x, to.y, to.w, to.h]);
                     view["pieced"] = json!(true);
                     develop.detail = Some(Arc::new(made));
+                    develop.dropped_detail = false;
                     develop.shown.insert(true, Plan { view, region: to.region(full), ..base });
                     cx.notify();
                 }

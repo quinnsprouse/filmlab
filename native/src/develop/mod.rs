@@ -182,6 +182,8 @@ pub struct Develop {
     ready: HashSet<String>,
     shown: HashMap<bool, Plan>,
     running: Option<Running>,
+    /// The last zoomed window rendered was dropped for a newer edit, so the next one is let finish.
+    dropped_detail: bool,
     settle: Option<Task<()>>,
     save: Option<Task<()>>,
     trim: Option<Task<()>>,
@@ -285,6 +287,7 @@ impl Develop {
             ready: HashSet::new(),
             shown: HashMap::new(),
             running: None,
+            dropped_detail: false,
             settle: None,
             save: None,
             trim: None,
@@ -518,8 +521,15 @@ impl Develop {
     fn next_plan(&self) -> Option<Plan> {
         let inputs = self.inputs()?;
         let drafting = self.dragging.is_some() && self.tool == Tool::Edit;
+        let covered = self.target_zoom() != Zoom::Fit && self.detail.is_some();
         for wanted in plans(&inputs, self.target_zoom(), self.viewport, self.shown.get(&true)) {
-            let wanted = if drafting && wanted.layer == Layer::Fit { plans::draft_plan(&wanted) } else { wanted };
+            // why: zoomed, the window on screen hides the fit frame; a drag's drafts go to the window alone
+            let wanted = match wanted.layer {
+                Layer::Fit if drafting && covered => continue,
+                Layer::Fit if drafting => plans::draft_plan(&wanted),
+                Layer::Detail if drafting => plans::draft_detail_plan(&wanted),
+                _ => wanted,
+            };
             if same_plan(self.shown.get(&is_detail(wanted.layer)), &wanted) {
                 continue;
             }
@@ -548,18 +558,27 @@ impl Develop {
         if running.curve_input {
             return self.dragging.is_some() || self.next_plan().is_some();
         }
+        let superseded = plan.revision != self.planned_revision();
+        let zoomed = self.target_zoom() != Zoom::Fit;
         match plan.layer {
-            Layer::Detail => self.target_zoom() == Zoom::Fit,
+            Layer::Detail if !zoomed => true,
+            Layer::Detail if plans::is_draft(plan) => self.dragging.is_none(),
+            Layer::Detail => superseded && !self.dropped_detail,
             Layer::Fit if plans::is_draft(plan) => self.dragging.is_none(),
-            Layer::Fit => self.dragging.is_some() && self.tool == Tool::Edit && plan.revision != self.planned_revision(),
+            Layer::Fit => superseded && (zoomed || (self.dragging.is_some() && self.tool == Tool::Edit)),
         }
     }
 
+    // why: an edit makes the zoomed window being rendered for the one before it worth nothing, so it is dropped for
+    // the new one; but never twice running, so edits that come faster than the window renders still show
     fn stop_unwanted(&mut self) {
         if let Some(running) = &self.running
             && self.unwanted(running)
         {
             running.wish.drop_it();
+            if running.plan.layer == Layer::Detail && !running.curve_input {
+                self.dropped_detail = !plans::is_draft(&running.plan) && running.plan.revision != self.planned_revision();
+            }
         }
     }
 
@@ -664,7 +683,10 @@ impl Develop {
                             let frame = Arc::new(DisplayFrame { width: f.width, height: f.height, rgba: f.take_rgba(), region, histogram: f.take_histogram() });
                             match plan.layer {
                                 Layer::Fit => develop.fit = Some(frame),
-                                Layer::Detail => develop.detail = Some(frame),
+                                Layer::Detail => {
+                                    develop.detail = Some(frame);
+                                    develop.dropped_detail = false;
+                                }
                             }
                             develop.shown.insert(is_detail(plan.layer), plan);
                         }
@@ -1159,9 +1181,9 @@ impl Develop {
         }
     }
 
-    /// The fit frame on screen is a draft drawn mid-drag; the full frame follows.
+    /// A frame on screen is a draft drawn mid-drag; the full frame follows.
     pub fn drafting(&self) -> bool {
-        self.dragging.is_some() || self.shown.get(&false).is_some_and(plans::is_draft)
+        self.dragging.is_some() || self.shown.values().any(plans::is_draft)
     }
 
     pub fn command(&mut self, command: &str, params: Value, label: &str, key: &str, cx: &mut Context<Develop>) -> Option<Value> {
