@@ -707,11 +707,14 @@ fn finish_rendered(
     }
     let image = finish::finish(prep, s, frame, info, req.space, req.display.as_ref(), req.proof);
     lap("finish", t);
-    let cut = |i: &Rgba8| match plan.keep {
+    // (Filmlab: a pass that made only a film hook's part of the frame made no more than is kept)
+    let partial = film_hook::current().is_some_and(|f| f.precomputed() && f.part().is_some());
+    let keep = plan.keep.filter(|_| !partial);
+    let cut = |i: &Rgba8| match keep {
         Some(k) => i.crop(k.x, k.y, k.w, k.h),
         None => i.clone(),
     };
-    let histogram = match plan.keep {
+    let histogram = match keep {
         Some(_) => Histogram::of_srgb8(&cut(&image)),
         None => Histogram::of_srgb8(&image),
     };
@@ -720,7 +723,7 @@ fn finish_rendered(
     let mask = overlay_alpha(req.overlay, plan, prep);
     let masks = overlay_alphas_all(req.overlay, plan, prep);
     visualize::apply(&mut image, req.overlay, plan, mask.as_ref(), masks.as_deref());
-    let mut image = if plan.keep.is_some() { cut(&image) } else { image };
+    let mut image = if keep.is_some() { cut(&image) } else { image };
     if req.overlay == Overlay::HdrRange && edit.hdr.enabled {
         // the HDR rendition of the same request says how far above SDR white each pixel goes
         let hreq = RenderRequest { depth: OutputDepth::F32Hdr, overlay: Overlay::None, proof: None, ..*req };

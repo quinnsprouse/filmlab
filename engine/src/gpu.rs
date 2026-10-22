@@ -855,7 +855,7 @@ pub fn finish(dev: &Developer, textured: &Textured, scan: &Scan) -> Option<Toned
     }
     let r = textured.region;
     let mut rgb = vec![[0.0f32; 3]; r.w * r.h];
-    finish_into(dev, textured, scan, &mut rgb).then_some(Toned { region: r, rgb, masks: None, band: false })
+    finish_into(dev, textured, scan, &mut rgb).then_some(Toned { region: r, rgb, masks: None, part: false })
 }
 
 /// [`finish`] read back straight into `out` (the region's pixels, row by row).

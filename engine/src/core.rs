@@ -780,7 +780,7 @@ fn film_export(
         tex = next.as_ref().map(|s| spent("band textured", || dev.band(s, band(y + EXPORT_BAND))));
         scene = next;
         if bands {
-            let toned = Arc::new(Toned { region: out, rgb: own, masks: whole.masks.clone(), band: true });
+            let toned = Arc::new(Toned { region: out, rgb: own, masks: whole.masks.clone(), part: true });
             let rendered = spent("band final", || pipeline::film_hook::with_tone_hook(toned, || render(req)));
             if (rendered.image.width, rendered.image.height) != (fw, out.h) {
                 return Err("an export band's final pass made the wrong rows".into());
@@ -793,7 +793,7 @@ fn film_export(
         let histogram = lightcraft_raster::Histogram::of_srgb8(&image);
         return Ok(pipeline::Rendered { image, histogram, deep: None });
     }
-    let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb, masks: whole.masks.clone(), band: false });
+    let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb, masks: whole.masks.clone(), part: false });
     Ok(spent("export final", || pipeline::film_hook::with_tone_hook(toned, || render(req))))
 }
 
@@ -824,9 +824,11 @@ fn film_render(
     let key = view_key(job.look_key, req);
     let margin = dev.texture.map_or(0, |p| texture::margin(frame, &p));
     let region = if window.is_some() { out.grown(margin, frame) } else { out };
-    // why: the final pass renders the captured (grown) window too, so LightCraft's stage cache hits;
-    // the margin is cut off afterwards
+    // why: the final pass renders the captured (grown) window too, so LightCraft's stage cache hits, but makes
+    // only the window's own pixels, as each depends on nothing around it; an overlay is drawn from the whole pass
+    // (spots find their edges there), which is cut down afterwards
     let capture = RenderRequest { window: window.map(|_| PixelWindow { x: region.x, y: region.y, w: region.w, h: region.h }), ..*req };
+    let finished_alone = window.is_some() && req.overlay == Overlay::None;
     let stopped = |view: Option<CachedScene>, look: Option<CachedScene>| FilmOutcome { rendered: None, keep: None, view, look };
     let mut view = match job.view.filter(|c| c.key == key) {
         Some(c) => c,
@@ -875,13 +877,13 @@ fn film_render(
                     dev.finish(&cpu, &scan).ok_or("the film stage failed on the CPU")?
                 }
             };
-            let t = Arc::new(Toned { masks: view.scene.masks.clone(), ..t });
+            let t = Arc::new(Toned { masks: view.scene.masks.clone(), part: finished_alone, ..t });
             view.toned = Some((toned_key, t.clone()));
             t
         }
     };
     let rendered = spent("final", || pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View)));
-    let keep = window.map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
+    let keep = window.filter(|_| !finished_alone).map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
     Ok(FilmOutcome { rendered: Some(rendered), keep, view: Some(view), look: Some(look) })
 }
 

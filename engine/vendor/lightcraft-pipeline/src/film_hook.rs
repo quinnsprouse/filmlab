@@ -50,9 +50,10 @@ pub trait ToneHook: Send + Sync {
         None
     }
 
-    /// The output rows a precomputed hook holds, when only some: the pass makes just those (its image is that many
-    /// rows high, every pixel as the whole pass makes it), e.g. one band of an export at a time.
-    fn rows(&self) -> Option<std::ops::Range<usize>> {
+    /// The part of the output frame a precomputed hook holds, when only part (`[x, y, w, h]` in the frame's pixels):
+    /// the pass makes just those pixels (its image is that part, every pixel as the whole pass makes it), e.g. one
+    /// band of an export at a time, or a zoomed window without the margin its film was made with.
+    fn part(&self) -> Option<[usize; 4]> {
         None
     }
 

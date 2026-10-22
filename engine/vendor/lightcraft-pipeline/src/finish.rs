@@ -322,7 +322,8 @@ pub(crate) fn finish(
             [x[0], x[1], x[2], 255]
         }
     });
-    Rgba8 { width: w, height: data.len().checked_div(w).unwrap_or(h), data }
+    let (columns, rows) = made(&fp);
+    Rgba8 { width: columns.len(), height: rows.len(), data }
 }
 
 /// [`finish`] into 16-bit display-encoded or 32-bit float linear samples (output primaries).
@@ -361,11 +362,21 @@ pub(crate) fn finish_deep(
             DeepSamples::U16(v.into_flattened())
         }
     };
-    let height = match &samples {
-        DeepSamples::F32(v) => v.len(),
-        DeepSamples::U16(v) => v.len(),
+    let (columns, rows) = made(&fp);
+    DeepImage { width: columns.len(), height: rows.len(), space, samples }
+}
+
+/// Filmlab: the columns and rows of the render `fp` describes that its pass makes: all of them, or those of a
+/// precomputed film hook's part of the frame ([`crate::film_hook::ToneHook::part`]).
+pub(crate) fn made(fp: &FinishParams) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let film = crate::film_hook::current().filter(|f| f.precomputed());
+    let Some([x, y, w, h]) = film.and_then(|f| f.part()) else { return (0..fp.w, 0..fp.h) };
+    let [vx, vy, ..] = fp.view.map(|v| v as usize);
+    let span = |start: usize, len: usize, origin: usize, most: usize| {
+        let from = start.saturating_sub(origin).min(most);
+        from..(start + len).saturating_sub(origin).clamp(from, most)
     };
-    DeepImage { width: w, height: height.checked_div(w * 3).unwrap_or(h), space, samples }
+    (span(x, w, vx, fp.w), span(y, h, vy, fp.h))
 }
 
 /// The per-pixel stage: every output pixel's colour in the output primaries, encoded with the sRGB
@@ -704,10 +715,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         film.capture((0..w * h).into_par_iter().with_min_len(1024).map(at).collect(), w, [vx, vy], [vw, vh]);
         return Vec::new();
     }
-    // (Filmlab: only the rows a precomputed hook holds, when it holds some: `ToneHook::rows`)
-    let rows = film.as_ref().filter(|_| precomputed).and_then(|f| f.rows()).map_or(0..h, |r| r.start.min(h)..r.end.min(h));
-    let mut out = vec![T::default(); w * rows.len()];
-    for_rows(&mut out, w, |y, row| {
+    // (Filmlab: only the part of the frame a precomputed hook holds, when it holds part: `ToneHook::part`)
+    let (columns, rows) = made(fp);
+    let x0 = columns.start;
+    let mut out = vec![T::default(); columns.len() * rows.len()];
+    for_rows(&mut out, columns.len().max(1), |y, row| {
         let y = rows.start + y;
         // the work up to the tone map, with each pixel's local values (what the masks add up to there)
         let mut ds: Vec<[f32; 3]> = Vec::with_capacity(row.len());
@@ -715,12 +727,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         if p.masks.is_empty() {
             match &film {
                 // why: Filmlab: a precomputed film hook hands over the row at once rather than a call per pixel
-                Some(film) if precomputed => film.tone_row(crate::film_hook::Pixel { index: y * w, x: vx, y: vy + y as f32, frame: [vw, vh] }, row.len(), &mut ds),
-                _ => ds.extend((0..row.len()).map(|x| toned(x, y, &none))),
+                Some(film) if precomputed => film.tone_row(crate::film_hook::Pixel { index: y * w + x0, x: vx + x0 as f32, y: vy + y as f32, frame: [vw, vh] }, row.len(), &mut ds),
+                _ => ds.extend(columns.clone().map(|x| toned(x, y, &none))),
             }
         } else {
             locals.reserve(row.len());
-            for x in 0..row.len() {
+            for x in columns.clone() {
                 let (l, tint_col) = mask_sums(y * w + x);
                 let [.., l_sat, l_hue, _, _, _, _] = l;
                 ds.push(toned(x, y, &l));
@@ -762,7 +774,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             }
             return;
         }
-        for (x, (px, d)) in row.iter_mut().zip(ds).enumerate() {
+        for (x, (px, d)) in columns.clone().zip(row.iter_mut().zip(ds)) {
             *px = output(x, y, d);
         }
     });

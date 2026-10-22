@@ -692,7 +692,7 @@ impl Developer {
             return crate::gpu::finish(self, textured, scan);
         }
         let rgb = textured.rgb.par_iter().map(|c| self.toned(*c, scan)).collect();
-        Some(Toned { region: textured.region, rgb, masks: None, band: false })
+        Some(Toned { region: textured.region, rgb, masks: None, part: false })
     }
 
     /// [`Developer::finish`] into `out`, the region's pixels row by row (an export band's rows of the frame).
@@ -717,8 +717,9 @@ pub struct Toned {
     pub(crate) rgb: Vec<[f32; 3]>,
     /// The masks the scene's capture evaluated, handed to the final pass ([`ToneHook::masks`]).
     pub(crate) masks: Option<Arc<Vec<Evaluated>>>,
-    /// The region is a band of the frame's rows, and the final pass makes only those ([`ToneHook::rows`]).
-    pub(crate) band: bool,
+    /// The final pass makes only the region ([`ToneHook::part`]): an export band, or a zoomed window without the
+    /// margin its film was made with.
+    pub(crate) part: bool,
 }
 
 impl ToneHook for Toned {
@@ -737,8 +738,9 @@ impl ToneHook for Toned {
         self.masks.clone()
     }
 
-    fn rows(&self) -> Option<std::ops::Range<usize>> {
-        self.band.then(|| self.region.y..self.region.y + self.region.h)
+    fn part(&self) -> Option<[usize; 4]> {
+        let r = self.region;
+        self.part.then_some([r.x, r.y, r.w, r.h])
     }
 
     // why: `tone` along a row: pixels left of the region repeat its first, those past it its last, the rest are the
