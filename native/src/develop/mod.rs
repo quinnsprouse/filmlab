@@ -355,6 +355,7 @@ impl Develop {
         let (Some(probed), Some(state)) = (record.probed.clone(), record.state.clone()) else { return };
         let path = record.file.path.clone();
         self.flush(cx);
+        let left = self.photo_id.clone().filter(|p| p != id);
         self.load_token += 1;
         let token = self.load_token;
         let film = state.film();
@@ -395,6 +396,9 @@ impl Develop {
             self.loading.remove(key);
         }
         self.let_go(stale, cx);
+        if let Some(left) = left {
+            self.forget_views(&left, cx);
+        }
         let wanted: HashSet<&str> = neighbours.iter().map(|(n, _, _)| n.as_str()).collect();
         let mut adopt = self.prerendered.remove(id);
         self.prerendered.retain(|n, _| wanted.contains(n.as_str()));
@@ -603,6 +607,13 @@ impl Develop {
                 .detach();
             }
         }
+    }
+
+    // why: a photo left for another keeps its preview decode while it's a neighbour, so coming back shows it at once,
+    // but not its stage caches and film scenes (on the GPU as well), which only make its own edits quick
+    fn forget_views(&self, id: &str, cx: &mut Context<Develop>) {
+        let key = source_key(id, Level::Preview);
+        self.tidy(std::slice::from_ref(&self.engine), move |engine| engine.forget_views(&key), cx);
     }
 
     fn let_go(&self, keys: Vec<String>, cx: &mut Context<Develop>) {

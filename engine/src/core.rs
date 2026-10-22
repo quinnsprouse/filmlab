@@ -940,6 +940,14 @@ impl Engine {
         format!("sources [{}] stages [{}] scenes [{}]", sources.join(", "), stages.join(", "), scenes.join(", "))
     }
 
+    /// Drops every view's caches of a source (stage caches, film scenes, the whole-frame look) and keeps the source.
+    pub fn forget_views(&mut self, key: &str) {
+        let views = format!("{key}:");
+        self.stages.retain(|view, _| !view.starts_with(&views));
+        self.scenes.retain(|view, _| !view.starts_with(&views));
+        self.looks.remove(key);
+    }
+
     pub fn release(&mut self, key: &str) {
         self.sources.remove(key);
         self.originals.remove(key);
