@@ -90,6 +90,44 @@ fn kept(kind: &str) -> Option<usize> {
     }
 }
 
+// why: one film program runs at a time, from upload through readback; a thumbnail's, a neighbour's or an export
+// band's program waits while one someone is looking at waits, rather than racing it for the store
+#[derive(Default)]
+struct Turns {
+    state: Mutex<Waiting>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    busy: bool,
+    urgent: usize,
+}
+
+struct Turn<'a>(&'a Turns);
+
+impl Turns {
+    fn take(&self, urgent: bool) -> Option<Turn<'_>> {
+        let mut state = self.state.lock().ok()?;
+        state.urgent += usize::from(urgent);
+        while state.busy || (!urgent && state.urgent > 0) {
+            state = self.changed.wait(state).ok()?;
+        }
+        state.urgent -= usize::from(urgent);
+        state.busy = true;
+        Some(Turn(self))
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.busy = false;
+        }
+        self.0.changed.notify_all();
+    }
+}
+
 pub struct Gpu {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -99,6 +137,7 @@ pub struct Gpu {
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
     dummies: Vec<(u32, wgpu::Buffer)>,
     store: Mutex<Store>,
+    turns: Turns,
     mappable: bool,
     stalled: AtomicBool,
 }
@@ -163,7 +202,7 @@ impl Gpu {
             .map(|&b| (b, device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })))
             .collect();
         let mappable = features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-        Some(Arc::new(Gpu { instance, adapter, device, queue, layout, pipelines, dummies, store: Mutex::default(), mappable, stalled: AtomicBool::new(false) }))
+        Some(Arc::new(Gpu { instance, adapter, device, queue, layout, pipelines, dummies, store: Mutex::default(), turns: Turns::default(), mappable, stalled: AtomicBool::new(false) }))
     }
 
     // why: on unified memory a buffer the CPU writes (an uploaded scene or LUT) is mapped and written where the shader
@@ -315,6 +354,7 @@ impl Gpu {
     }
 
     fn execute_inner(&self, mut program: Program) -> Option<()> {
+        let _turn = self.turns.take(crate::perf::urgent())?;
         let mut store = self.store.lock().ok()?;
         let store = &mut *store;
         if program.keep.iter().any(|k| k.need && store.buffers.get(k.buffer).and_then(|b| b.holds.as_deref()) != Some(k.id.as_str())) {

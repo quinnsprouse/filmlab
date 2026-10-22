@@ -50,6 +50,13 @@ pub fn interactive<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     INTERACTIVE.get_or_init(|| pool("render", all_cores(), qos_class_t::QOS_CLASS_USER_INTERACTIVE)).install(work)
 }
 
+/// The calling thread runs work someone waits on to see: the loupe's renders (`interactive`) or the UI.
+pub fn urgent() -> bool {
+    let mut class = qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let read = unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &raw mut class, std::ptr::null_mut()) } == 0;
+    read && matches!(class, qos_class_t::QOS_CLASS_USER_INTERACTIVE)
+}
+
 pub fn initiated<R: Send>(work: impl FnOnce() -> R + Send) -> R {
     let _job = Job::start();
     INITIATED.get_or_init(|| pool("export", all_cores(), qos_class_t::QOS_CLASS_USER_INITIATED)).install(work)
