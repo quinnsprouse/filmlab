@@ -33,7 +33,6 @@ const KEPT: usize = 24;
 const AT_ONCE: usize = LIVE;
 const GONE: &str = "Filmlab's window is gone";
 pub const NO_PHOTO: &str = "no photo is open; photos open first, or pass photo";
-const NO_PIXELS: &str = "pixels aren't available";
 
 fn source_key(id: &str, level: Level) -> String {
     format!("{id}#{}", level.tag())
@@ -73,6 +72,7 @@ impl Session {
         let parsed_facts: Facts = serde_json::from_str(&probed.facts.to_string()).map_err(|e| e.to_string())?;
         let mut commands = Commands::new();
         commands.open_settings(&parsed_facts, (*state.settings).clone())?;
+        commands.attach(record.file.path.clone());
         let film = state.film();
         let now = Instant::now();
         Ok(Session {
@@ -349,23 +349,7 @@ impl Held {
             }
             On::Agent(s) => s.clone(),
         };
-        let first = s.borrow_mut().try_command(command, &params, label, key);
-        // why: the session reads the raw file only for the commands that need its pixels (auto tone, subject masks),
-        // and lets go of it after
-        let out = match first {
-            Err(e) if e.contains(NO_PIXELS) => {
-                let path = s.borrow().path.clone();
-                let bytes = cx.background_spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()) }).await?;
-                self.ready(driver, cx)?;
-                let mut session = s.borrow_mut();
-                session.reopen()?;
-                session.commands.attach(bytes);
-                let out = session.try_command(command, &params, label, key);
-                session.commands.detach();
-                out
-            }
-            other => other,
-        }?;
+        let out = s.borrow_mut().try_command(command, &params, label, key)?;
         if out.1 {
             self.committed(driver, cx);
             self.changed(driver, cx).await?;

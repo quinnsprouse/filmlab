@@ -17,7 +17,6 @@ fn read(path: &Path) -> Vec<u8> {
 }
 
 struct Photo {
-    raw: Vec<u8>,
     facts: Value,
     xmp: String,
 }
@@ -26,7 +25,7 @@ fn photo() -> Photo {
     let raw = read(&fixture(".cache/ricoh-gr3.dng"));
     let probed: Value = serde_json::from_str(&probe("R0000001.DNG", &raw).unwrap()).unwrap();
     let xmp = String::from_utf8(read(&fixture("ricoh-gr3.xmp"))).unwrap();
-    Photo { raw, facts: probed["facts"].clone(), xmp }
+    Photo { facts: probed["facts"].clone(), xmp }
 }
 
 /// The state as the app keeps it (typed) and as it kept it before (JSON) give the same text, the same sidecar
@@ -92,8 +91,8 @@ fn command_settings_match_their_json() {
     let facts_typed = serde_json::from_str(&facts).unwrap();
     typed.open_settings(&facts_typed, serde_json::from_value(opened["settings"].clone()).unwrap()).unwrap();
     text.open(&facts, &opened["settings"].to_string()).unwrap();
-    typed.attach(photo.raw.clone());
-    text.attach(photo.raw.clone());
+    typed.attach(fixture(".cache/ricoh-gr3.dng"));
+    text.attach(fixture(".cache/ricoh-gr3.dng"));
     let film = FilmSettings { negative: Some(DEFAULT_NEGATIVE.into()), ..FilmSettings::default() };
     let mut last = None;
     for (command, params) in edits() {

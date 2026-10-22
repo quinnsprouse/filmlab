@@ -1129,20 +1129,21 @@ fn with_original(mut out: lightcraft_meta::Metadata, original: &lightcraft_meta:
 pub struct Commands {
     session: Session,
     photo: Option<PhotoId>,
-    pixels: Arc<std::sync::Mutex<Option<Arc<Vec<u8>>>>>,
+    file: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Default for Commands {
     fn default() -> Self {
-        let pixels: Arc<std::sync::Mutex<Option<Arc<Vec<u8>>>>> = Arc::default();
+        let file: Arc<std::sync::Mutex<Option<std::path::PathBuf>>> = Arc::default();
         let mut session = Session::new();
-        let source = pixels.clone();
+        let source = file.clone();
         session.media.file_loader = Some(Arc::new(move |_path: &str, max_edge: usize| {
-            let bytes = source.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let bytes = bytes.ok_or("the photo's pixels aren't available yet; try again in a moment")?;
-            lightcraft_engine::files::load_bytes(&bytes, max_edge)
+            let path = source.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let path = path.ok_or("the photo's pixels aren't available yet; try again in a moment")?;
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            lightcraft_engine::files::load_vec(bytes, max_edge)
         }));
-        Commands { session, photo: None, pixels }
+        Commands { session, photo: None, file }
     }
 }
 
@@ -1170,11 +1171,12 @@ impl Commands {
     }
 
     pub fn detach(&mut self) {
-        *self.pixels.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.file.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    pub fn attach(&mut self, bytes: Vec<u8>) {
-        *self.pixels.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(bytes));
+    /// The photo's file, read only when a command needs its pixels.
+    pub fn attach(&mut self, path: std::path::PathBuf) {
+        *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
     }
 
     /// Every command the session knows, as (id, params doc).

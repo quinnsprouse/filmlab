@@ -395,7 +395,7 @@ impl Develop {
         self.applied = None;
         self.rested = false;
         self.stop_unwanted();
-        self.commands.detach();
+        self.commands.attach(path.clone());
         if let Err(e) = self.open_commands(&state.settings) {
             self.error = Some(e);
         }
@@ -425,25 +425,30 @@ impl Develop {
             self.pump(cx);
         }
         let facts = probed.facts.to_string();
+        let preview = source_key(id, Level::Preview);
+        let decoding = self.ready.contains(&preview) || self.loading.contains(&preview);
         let id = id.to_string();
         cx.spawn(async move |this, cx| {
-            let bytes = cx.background_spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()) }).await;
+            let bytes = match decoding {
+                true => None,
+                false => Some(cx.background_spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()) }).await),
+            };
             let _ = this.update(cx, |develop, cx| {
                 if develop.load_token != token {
                     return;
                 }
                 match bytes {
-                    Ok(bytes) => {
-                        let bytes = Arc::new(bytes);
-                        develop.commands.attach((*bytes).clone());
-                        develop.load_source(&id, Level::Preview, facts, bytes, cx);
+                    Some(Err(e)) => {
+                        develop.status = Status::Failed;
+                        develop.error = Some(e);
+                    }
+                    read => {
+                        if let Some(Ok(bytes)) = read {
+                            develop.load_source(&id, Level::Preview, facts, Arc::new(bytes), cx);
+                        }
                         for (other, facts, path) in neighbours {
                             develop.preload(&other, facts, path, cx);
                         }
-                    }
-                    Err(e) => {
-                        develop.status = Status::Failed;
-                        develop.error = Some(e);
                     }
                 }
                 cx.notify();
