@@ -70,6 +70,11 @@ static ACTIVITY: Mutex<Activity> = Mutex::new(Activity { running: 0, ended: None
 static CHANGED: Condvar = Condvar::new();
 static SETTLER: OnceLock<()> = OnceLock::new();
 
+/// No pool has had work for `quiet`, or the work since it last had any has been settled.
+pub fn quiet_for(quiet: Duration) -> bool {
+    ACTIVITY.lock().is_ok_and(|a| a.running == 0 && a.ended.is_none_or(|t| t.elapsed() >= quiet))
+}
+
 /// One piece of work in a pool, from the start of `interactive`, `initiated` or `background` to its end.
 struct Job;
 

@@ -9,10 +9,18 @@ use crate::camera::Zoom;
 // why: a scripted session (FILMLAB_SOAK=1) that walks Browse, Develop edits, zoom, an export and every photo of the
 // folder twice over, so memory can be measured from outside without anyone driving the window; FILMLAB_SOAK_PHOTO picks
 // the photo it edits, zooms and exports
-pub(crate) fn footprint() -> u64 {
+fn usage() -> Option<libc::rusage_info_v4> {
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, (&raw mut info).cast()) } == 0;
-    if ok { info.ri_phys_footprint } else { 0 }
+    ok.then_some(info)
+}
+
+pub(crate) fn footprint() -> u64 {
+    usage().map_or(0, |u| u.ri_phys_footprint)
+}
+
+fn peak() -> u64 {
+    usage().map_or(0, |u| u.ri_lifetime_max_phys_footprint)
 }
 
 fn mb(bytes: f64) -> f64 {
@@ -42,11 +50,22 @@ fn settled(a: &FilmlabApp, cx: &App) -> bool {
     d.fit.is_some() && d.idle_for(Duration::from_millis(400))
 }
 
-/// Waits for the open photo to settle, then for its work ahead (the neighbours, the full-size decode) and the quiet
-/// after it that hands scratch memory back.
+/// Waits for the open photo to settle, then for its work ahead (the neighbours, the full-size decode, thumbnails) to end
+/// and the quiet after it that hands scratch memory back.
 async fn idle(cx: &mut AsyncApp, app: &WeakEntity<FilmlabApp>) {
     wait_until(cx, app, settled).await;
-    cx.background_executor().timer(Duration::from_secs(8)).await;
+    quiet(cx).await;
+}
+
+async fn quiet(cx: &mut AsyncApp) {
+    cx.background_executor().timer(Duration::from_secs(2)).await;
+    for _ in 0..600 {
+        if crate::perf::quiet_for(Duration::from_secs(3)) {
+            break;
+        }
+        cx.background_executor().timer(Duration::from_millis(100)).await;
+    }
+    cx.background_executor().timer(Duration::from_secs(1)).await;
 }
 
 async fn open(cx: &mut AsyncApp, app: &WeakEntity<FilmlabApp>, id: &str) {
@@ -83,7 +102,7 @@ pub fn start(app: &Entity<FilmlabApp>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let started = Instant::now();
         wait_until(cx, &weak, |a, cx| a.library.read(cx).photos.iter().all(crate::library::PhotoRecord::indexed)).await;
-        cx.background_executor().timer(Duration::from_secs(8)).await;
+        quiet(cx).await;
         log(cx, "browse, thumbnails ready", started).await;
         let ids: Vec<String> = weak.read_with(cx, |a, cx| a.library.read(cx).photos.iter().map(|r| r.file.id.clone()).collect()).unwrap_or_default();
         let Some(first) = std::env::var("FILMLAB_SOAK_PHOTO").ok().filter(|p| ids.contains(p)).or_else(|| ids.first().cloned()) else { return };
@@ -98,14 +117,14 @@ pub fn start(app: &Entity<FilmlabApp>, cx: &mut App) {
         log(cx, "after 30 exposure edits", started).await;
         let _ = weak.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: 0.5, cy: 0.5 }, false, false, cx)));
         wait_until(cx, &weak, |a, cx| settled(a, cx) && a.develop.read(cx).detail.is_some()).await;
-        cx.background_executor().timer(Duration::from_secs(8)).await;
+        quiet(cx).await;
         log(cx, "zoomed to 1:1", started).await;
         for i in 0..10 {
             let c = 0.3 + 0.04 * f64::from(i);
             let _ = weak.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: c }, false, false, cx)));
             wait_until(cx, &weak, settled).await;
         }
-        cx.background_executor().timer(Duration::from_secs(8)).await;
+        quiet(cx).await;
         log(cx, "after 10 pans", started).await;
         let _ = weak.update(cx, |a, cx| a.develop.update(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx)));
         idle(cx, &weak).await;
@@ -130,10 +149,12 @@ pub fn start(app: &Entity<FilmlabApp>, cx: &mut App) {
             eprintln!("soak growth from pass 1 to pass 2: {:+.1} MB", two - one);
         }
         let _ = weak.update(cx, |a, cx| a.set_mode(Mode::Browse, cx));
-        cx.background_executor().timer(Duration::from_secs(3)).await;
-        log(cx, "back in browse, idle 3 s", started).await;
-        cx.background_executor().timer(Duration::from_secs(10)).await;
-        log(cx, "idle 13 s (Develop unloaded)", started).await;
+        quiet(cx).await;
+        log(cx, "back in browse", started).await;
+        cx.background_executor().timer(Duration::from_secs(6)).await;
+        quiet(cx).await;
+        log(cx, "Develop unloaded", started).await;
+        eprintln!("soak peak footprint {:.1} MB", mb(peak() as f64));
         if std::env::var_os("FILMLAB_SOAK_STATS").is_some() {
             unsafe { libmimalloc_sys::mi_stats_print(std::ptr::null_mut()) };
         }
