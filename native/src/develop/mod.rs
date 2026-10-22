@@ -604,10 +604,13 @@ impl Develop {
         let engines = self.engines_for(Level::Preview);
         self.tidy(
             &engines,
+            // why: a release runs once the engine's lock is free, often after the pools went quiet and handed memory
+            // back, and nothing else would hand back the decodes it frees
             move |engine| {
                 for key in &keys {
                     engine.release(key);
                 }
+                crate::perf::give_back();
             },
             cx,
         );
