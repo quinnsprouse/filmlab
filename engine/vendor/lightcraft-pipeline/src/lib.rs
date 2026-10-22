@@ -262,6 +262,11 @@ impl Default for StageCache {
 }
 
 impl StageCache {
+    /// A cache that holds the last `capacity` output sizes.
+    pub fn with_capacity(capacity: usize) -> StageCache {
+        StageCache { capacity: capacity.max(1), ..StageCache::default() }
+    }
+
     /// Drop everything (e.g. when memory is needed).
     pub fn clear(&self) {
         self.lock().clear();

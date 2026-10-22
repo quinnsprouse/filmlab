@@ -978,7 +978,10 @@ impl Engine {
         let req = v.request();
         let src = &loaded.source;
         let info = src.info_or(loaded.header.clone());
-        let cache = v.stages.as_ref().map(|name| self.stages.entry(format!("{key}:{name}")).or_default().clone());
+        // why: a pan's strips and the window it settles on are each a new window, so a zoomed view's stage cache keeps
+        // one; a second (160 MB at 1:1 on a 24 MP photo) was never asked for again
+        let fresh = || Arc::new(if req.window.is_some() { StageCache::with_capacity(1) } else { StageCache::default() });
+        let cache = v.stages.as_ref().map(|name| self.stages.entry(format!("{key}:{name}")).or_insert_with(fresh).clone());
         let look_cache = (v.film.is_some() && req.window.is_some()).then(|| self.stages.entry(format!("{key}:look")).or_default().clone());
         let stored = v.stages.as_ref().map(|name| format!("{key}:{name}"));
         let job = FilmJob {
