@@ -716,12 +716,16 @@ impl FilmlabApp {
 
     fn painter(&self, window: &Window, cx: &App) -> impl IntoElement {
         let scene = self.push_frames(window, cx);
+        let shot = super::bench::shot_of(self.develop.read(cx));
         let viewer = self.viewer.clone();
         canvas(
             |_, _, _| {},
             move |_, _, _, _| {
-                if let (Some(scene), Some(viewer)) = (scene, viewer.borrow_mut().as_mut()) {
-                    viewer.draw(scene);
+                if let (Some(scene), Some(viewer)) = (scene, viewer.borrow_mut().as_mut())
+                    && viewer.draw(scene)
+                    && let Some(shot) = shot
+                {
+                    super::bench::presented(shot);
                 }
             },
         )

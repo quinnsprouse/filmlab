@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use gpui_kit::*;
 
 use super::app::{FilmlabApp, Mode};
-use crate::develop::Tool;
+use crate::develop::{Develop, Tool};
 use super::driver::Driver;
-use crate::camera::Zoom;
+use crate::camera::{Camera, Zoom};
 use crate::library::PhotoRecord;
 
 // why: FILMLAB_BENCH=1 times what a user waits for (window, library, opening and switching photos, edits, zoom) on
@@ -14,6 +14,248 @@ static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 pub fn mark_launch() {
     let _ = STARTED.set(Instant::now());
+}
+
+/// A frame the viewer presented: when, through which camera, and what it showed.
+#[derive(Clone, Copy, Debug)]
+pub struct Shot {
+    pub at: Instant,
+    pub camera: Camera,
+    /// The fit frame's revision, and whether it was a drag's draft.
+    pub fit: Option<(u64, bool)>,
+    /// The zoomed frame's revision, and whether it was a drag's draft.
+    pub detail: Option<(u64, bool)>,
+    /// The zoomed frame covers everything the camera shows, so no part of the view is the blurred fit frame.
+    pub sharp: bool,
+}
+
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHOTS: std::sync::Mutex<Vec<Shot>> = std::sync::Mutex::new(Vec::new());
+
+/// What the viewer is about to show of `d`, while a bench records presented frames.
+pub fn shot_of(d: &Develop) -> Option<Shot> {
+    if !RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let seen = crate::develop::plans::visible_region(d.camera, d.native, d.viewport);
+    let sharp = d.detail.as_ref().is_some_and(|f| {
+        let r = f.region;
+        r.u0 <= seen.u0 + 1e-6 && r.v0 <= seen.v0 + 1e-6 && r.u1 >= seen.u1 - 1e-6 && r.v1 >= seen.v1 - 1e-6
+    });
+    let shown = |detail: bool| d.shown_plan(detail).map(|p| (p.revision, crate::develop::plans::is_draft(p)));
+    let fit = shown(false).filter(|_| d.fit.is_some());
+    let detail = shown(true).filter(|_| d.detail.is_some());
+    Some(Shot { at: Instant::now(), camera: d.camera, fit, detail, sharp })
+}
+
+/// Logs a frame the viewer presented.
+pub fn presented(mut shot: Shot) {
+    shot.at = Instant::now();
+    if let Ok(mut shots) = SHOTS.lock() {
+        shots.push(shot);
+    }
+}
+
+fn record() {
+    if let Ok(mut shots) = SHOTS.lock() {
+        shots.clear();
+    }
+    RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn recorded() -> Vec<Shot> {
+    RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    SHOTS.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()
+}
+
+/// Time from `at` to the first frame presented after it that `shows`.
+fn wait_for(shots: &[Shot], at: Instant, shows: impl Fn(&Shot) -> bool) -> Option<f64> {
+    shots.iter().find(|s| s.at >= at && shows(s)).map(|s| ms(s.at - at))
+}
+
+fn gaps(shots: &[Shot], from: Instant, to: Instant) -> (usize, f64) {
+    let times: Vec<Instant> = std::iter::once(from).chain(shots.iter().map(|s| s.at).filter(|t| *t >= from && *t <= to)).chain(std::iter::once(to)).collect();
+    let worst = times.windows(2).map(|w| ms(w[1] - w[0])).fold(0.0, f64::max);
+    (times.len() - 2, worst)
+}
+
+fn summary(samples: &mut [f64]) -> String {
+    if samples.is_empty() {
+        return "no samples".into();
+    }
+    samples.sort_by(f64::total_cmp);
+    let p = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
+    format!("p50 {:.1} p90 {:.1} max {:.1} ms", p(0.5), p(0.9), p(1.0))
+}
+
+fn layer(s: &Shot, detail: bool) -> Option<(u64, bool)> {
+    if detail { s.detail } else { s.fit }
+}
+
+// why: macOS stops drawing a window that something else covers, and a frame never drawn can't be timed
+fn to_front(driver: &Driver, cx: &mut AsyncApp) {
+    driver.on_window(cx, |window, cx| {
+        cx.activate(true);
+        window.activate_window();
+    });
+}
+
+/// Edits sent `gap` apart, `count` of them, and when each was sent with the revision it made.
+async fn send_edits(driver: &Driver, cx: &mut AsyncApp, count: u32, gap: Duration, edit: impl Fn(u32, &mut Develop, &mut Context<Develop>)) -> Vec<(Instant, u64)> {
+    let mut sent = Vec::new();
+    for i in 0..count {
+        let at = Instant::now();
+        let edit = &edit;
+        if let Some(revision) = driver.develop(cx, move |d, cx| {
+            edit(i, d, cx);
+            d.planned_revision()
+        }) {
+            sent.push((at, revision));
+        }
+        cx.background_executor().timer(gap.saturating_sub(at.elapsed())).await;
+    }
+    sent
+}
+
+/// Edit to present for edits on `detail` (the zoomed frame) or the fit frame: per edit, how long until a frame that
+/// shows it (or a later edit) was presented, drafts included, and how long after the last edit the finished frame was.
+async fn edit_latency(driver: &Driver, cx: &mut AsyncApp, name: &str, detail: bool, count: u32, gap: Duration) {
+    to_front(driver, cx);
+    cx.background_executor().timer(Duration::from_millis(400)).await;
+    record();
+    let started = Instant::now();
+    let sent = send_edits(driver, cx, count, gap, |i, d, cx| {
+        let v = -0.5 + f64::from(i) / f64::from(count);
+        d.edit_controls(&[("light.exposure", v)], "Exposure", cx);
+    })
+    .await;
+    let ended = Instant::now();
+    let last_sent = sent.last().map_or(ended, |s| s.0);
+    driver.develop(cx, |d, cx| d.release(cx));
+    until(driver, cx, 30, move |a, cx| {
+        let d = a.develop.read(cx);
+        !d.drafting() && d.idle_for(Duration::ZERO) && d.shown_plan(detail).is_some_and(|p| p.revision == d.planned_revision())
+    })
+    .await;
+    cx.background_executor().timer(Duration::from_millis(50)).await;
+    let shots = recorded();
+    let mut seen: Vec<f64> = sent.iter().filter_map(|&(at, rev)| wait_for(&shots, at, |s| layer(s, detail).is_some_and(|(r, _)| r >= rev))).collect();
+    let last = sent.last().map_or(0, |s| s.1);
+    let full = wait_for(&shots, last_sent, |s| layer(s, detail).is_some_and(|(r, draft)| r >= last && !draft));
+    let updates = {
+        let mut revs: Vec<u64> = shots.iter().filter(|s| s.at <= ended).filter_map(|s| layer(s, detail).map(|l| l.0)).filter(|r| *r >= sent.first().map_or(0, |s| s.1)).collect();
+        revs.dedup();
+        revs.len()
+    };
+    let missed = sent.len() - seen.len();
+    eprintln!(
+        "bench {name:<28} edit to present {}, {:.1} updates/s, finished {:.1} ms after the last edit{}",
+        summary(&mut seen),
+        updates as f64 / (ended - started).as_secs_f64(),
+        full.unwrap_or(f64::NAN),
+        if missed > 0 { format!(", {missed} never shown in {} frames presented", shots.len()) } else { String::new() }
+    );
+}
+
+/// A pan at 1:1 by `step` pixels every frame: frames presented, input to present (a frame through the camera of
+/// that move or a later one), and input to sharp (such a frame with no part of the view drawn from the fit frame).
+async fn pan(driver: &Driver, cx: &mut AsyncApp, name: &str, count: u32, step: f64) {
+    let native = driver.read(cx, |a, cx| a.develop.read(cx).native).unwrap_or((1.0, 1.0));
+    let start = 0.3;
+    driver.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: start, cy: 0.5 }, false, false, cx));
+    driver.settled(cx, true).await;
+    to_front(driver, cx);
+    cx.background_executor().timer(Duration::from_millis(100)).await;
+    record();
+    let started = Instant::now();
+    let mut moves: Vec<(Instant, Camera)> = Vec::new();
+    for i in 0..count {
+        let at = Instant::now();
+        let c = start + step * f64::from(i + 1) / native.0;
+        if let Some(camera) = driver.develop(cx, move |d, cx| {
+            d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: 0.5 }, false, true, cx);
+            d.camera
+        }) {
+            moves.push((at, camera));
+        }
+        cx.background_executor().timer(Duration::from_millis(16).saturating_sub(at.elapsed())).await;
+    }
+    let ended = Instant::now();
+    let settled = until(driver, cx, 60, |a, cx| {
+        let d = a.develop.read(cx);
+        let seen = crate::develop::plans::visible_region(d.camera, d.native, d.viewport);
+        let covers = |r: &crate::camera::Region| r.u0 <= seen.u0 + 1e-6 && r.v0 <= seen.v0 + 1e-6 && r.u1 >= seen.u1 - 1e-6 && r.v1 >= seen.v1 - 1e-6;
+        d.detail.is_some() && d.idle_for(Duration::ZERO) && d.shown_plan(true).is_some_and(|p| p.revision == d.planned_revision() && covers(&p.region) && !crate::develop::pan::pieced(p))
+    })
+    .await;
+    cx.background_executor().timer(Duration::from_millis(50)).await;
+    let shots = recorded();
+    let move_of = |s: &Shot| moves.iter().position(|(_, c)| *c == s.camera);
+    let mut present = Vec::new();
+    let mut sharp = Vec::new();
+    for (i, (at, _)) in moves.iter().enumerate() {
+        present.extend(wait_for(&shots, *at, |s| move_of(s).is_some_and(|k| k >= i)));
+        sharp.extend(wait_for(&shots, *at, |s| s.sharp && move_of(s).is_some_and(|k| k >= i)));
+    }
+    let (frames, worst) = gaps(&shots, started, ended);
+    let during: Vec<&Shot> = shots.iter().filter(|s| s.at >= started && s.at <= ended).collect();
+    let blurred = during.iter().filter(|s| !s.sharp).count();
+    eprintln!(
+        "bench {name:<28} {:.1} fps presented, worst gap {worst:.1} ms, {blurred} of {frames} frames partly blurred, settled {:.1} ms after the last move",
+        frames as f64 / (ended - started).as_secs_f64(),
+        settled.map_or(f64::NAN, ms)
+    );
+    eprintln!("bench {:<28} input to present {}", "", summary(&mut present));
+    eprintln!("bench {:<28} input to sharp {}", "", summary(&mut sharp));
+}
+
+/// Zooming to 1:1 at a few places: time to the first presented frame sharp everywhere at the current edit.
+async fn zoom_in(driver: &Driver, cx: &mut AsyncApp) {
+    let mut zoom = Vec::new();
+    for i in 0..4 {
+        let c = 0.3 + 0.12 * f64::from(i);
+        to_front(driver, cx);
+        record();
+        let t = Instant::now();
+        let Some(revision) = driver.develop(cx, move |d, cx| {
+            d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: c }, false, false, cx);
+            d.planned_revision()
+        }) else {
+            continue;
+        };
+        until(driver, cx, 60, |a, cx| {
+            let d = a.develop.read(cx);
+            d.detail.is_some() && d.shown_plan(true).is_some_and(|p| p.revision == d.planned_revision()) && d.idle_for(Duration::ZERO)
+        })
+        .await;
+        cx.background_executor().timer(Duration::from_millis(50)).await;
+        zoom.extend(wait_for(&recorded(), t, |s| s.sharp && s.detail.is_some_and(|(r, _)| r >= revision)));
+        cx.background_executor().timer(Duration::from_millis(250)).await;
+    }
+    report("zoom to 1:1 (presented)", &mut zoom);
+}
+
+/// Exports the other photos again and again, as a batch export would, until `stop` is set.
+fn export_loop(driver: &Driver, cx: &mut AsyncApp, others: Vec<String>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Task<usize>> {
+    let choices = super::export::run::Choices::default();
+    let jobs = driver.read(cx, move |a, cx| super::export::run::jobs_for(a.library.read(cx), a.develop.read(cx), &others, &choices))?;
+    let folder = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("bench-exports"));
+    Some(cx.background_spawn(async move {
+        let mut engine = filmlab_engine::core::Engine::new();
+        let mut done = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            for (_, job) in &jobs {
+                let Ok(job) = job else { continue };
+                if crate::perf::initiated(|| super::export::run::export_one(&mut engine, job, &choices, folder.as_deref(), None)).is_ok() {
+                    done += 1;
+                }
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+        done
+    }))
 }
 
 fn ms(d: Duration) -> f64 {
@@ -312,7 +554,14 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         let launch = STARTED.get().map_or(0.0, |t| ms(t.elapsed()));
         eprintln!("bench {:<28} {launch:>7.1} ms", "launch to first task");
         let only_ui = std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "ui");
-        if !only_ui {
+        let develop_only = std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "develop");
+        if develop_only {
+            until(&driver, cx, 3600, |a, cx| {
+                let l = a.library.read(cx);
+                !l.photos.is_empty() && l.photos.iter().all(PhotoRecord::indexed)
+            })
+            .await;
+        } else if !only_ui {
             library(&driver, cx, launch).await;
         }
         if std::env::var("FILMLAB_BENCH").is_ok_and(|v| v == "library") {
@@ -373,19 +622,26 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         until(&driver, cx, 60, move |a, cx| shows(a, cx, &first_shown)).await;
         cx.background_executor().timer(Duration::from_millis(800)).await;
         let mut switch = Vec::new();
+        let mut switch_shown = Vec::new();
         for i in 0..8 {
             let key = if i < 4 { "right" } else { "left" };
             let before = driver.read(cx, current).flatten();
+            to_front(&driver, cx);
+            record();
             let t = Instant::now();
             driver.key(cx, key);
             let changed = until(&driver, cx, 5, move |a, cx| current(a, cx) != before).await;
+            let revision = driver.read(cx, |a, cx| a.develop.read(cx).planned_revision()).unwrap_or(0);
             let Some(now) = driver.read(cx, current).flatten() else { break };
             if changed.is_some() && until(&driver, cx, 60, move |a, cx| shows(a, cx, &now)).await.is_some() {
                 switch.push(ms(t.elapsed()));
             }
-            cx.background_executor().timer(Duration::from_millis(350)).await;
+            cx.background_executor().timer(Duration::from_millis(50)).await;
+            switch_shown.extend(wait_for(&recorded(), t, |s| s.fit.is_some_and(|(r, _)| r >= revision)));
+            cx.background_executor().timer(Duration::from_millis(300)).await;
         }
         report("switch photo (arrow, warm)", &mut switch);
+        report("switch photo (presented)", &mut switch_shown);
 
         let Some(photo) = driver.read(cx, current).flatten() else { return };
         let mut edits = Vec::new();
@@ -430,6 +686,7 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         report("edit halation (fit)", &mut film);
 
         drag_exposure(&driver, cx, &photo, "drag exposure (fit, film)").await;
+        edit_latency(&driver, cx, "drag exposure (fit, shown)", false, 60, Duration::from_millis(16)).await;
         let film = driver.film(cx);
         driver.develop(cx, |d, cx| {
             let settings = d.settings.clone()?;
@@ -443,45 +700,26 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         let p = photo.clone();
         until(&driver, cx, 30, move |a, cx| shows(a, cx, &p)).await;
 
-        let mut zoom = Vec::new();
-        for i in 0..4 {
-            let c = 0.3 + 0.12 * f64::from(i);
-            let t = Instant::now();
-            driver.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: c }, false, false, cx));
-            let detail = until(&driver, cx, 60, |a, cx| {
-                let d = a.develop.read(cx);
-                d.detail.is_some() && d.shown_plan(true).is_some_and(|p| p.revision == d.planned_revision()) && d.idle_for(Duration::from_millis(0))
-            })
-            .await;
-            if detail.is_some() {
-                zoom.push(ms(t.elapsed()));
-            }
-            cx.background_executor().timer(Duration::from_millis(300)).await;
-        }
-        report("zoom to 1:1 / pan", &mut zoom);
+        zoom_in(&driver, cx).await;
+        pan(&driver, cx, "pan 1:1 (6 px a frame)", 90, 6.0).await;
+        pan(&driver, cx, "pan 1:1 (24 px a frame)", 45, 24.0).await;
+        pan(&driver, cx, "pan 1:1 (60 px a frame)", 30, 60.0).await;
+        edit_latency(&driver, cx, "edit exposure (1:1)", true, 12, Duration::from_millis(250)).await;
+        edit_latency(&driver, cx, "drag exposure (1:1)", true, 60, Duration::from_millis(16)).await;
 
-        let native = driver.read(cx, |a, cx| a.develop.read(cx).native).unwrap_or((1.0, 1.0));
-        let d = driver.clone();
-        let panned = moves(&driver, cx, true, 40, move |i, cx| {
-            let c = 0.4 + 6.0 * f64::from(i) / native.0;
-            d.develop(cx, move |d, cx| d.set_zoom(Zoom::At { scale: 1.0, cx: c, cy: 0.5 }, false, true, cx));
-        })
-        .await;
-        let settled = until(&driver, cx, 60, |a, cx| {
-            let d = a.develop.read(cx);
-            let seen = crate::develop::plans::visible_region(d.camera, d.native, d.viewport);
-            let covers = |r: &crate::camera::Region| r.u0 <= seen.u0 + 1e-6 && r.v0 <= seen.v0 + 1e-6 && r.u1 >= seen.u1 - 1e-6 && r.v1 >= seen.v1 - 1e-6;
-            d.detail.is_some() && d.idle_for(Duration::ZERO) && d.shown_plan(true).is_some_and(|p| p.revision == d.planned_revision() && covers(&p.region))
-        })
-        .await;
-        eprintln!(
-            "bench {:<28} {:>7.1} fps over {:.0} ms, worst gap {:.1} ms, settled {:.1} ms after the last move",
-            "pan 1:1 (6 px a frame)",
-            panned.frames as f64 / panned.took.as_secs_f64(),
-            ms(panned.took),
-            ms(panned.worst),
-            settled.map_or(f64::NAN, ms)
-        );
+        let others: Vec<String> = ids.iter().filter(|id| **id != photo).take(2).cloned().collect();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exporting = export_loop(&driver, cx, others, stop.clone());
+        cx.background_executor().timer(Duration::from_millis(500)).await;
+        edit_latency(&driver, cx, "edit at 1:1 while exporting", true, 12, Duration::from_millis(250)).await;
+        pan(&driver, cx, "pan 1:1 while exporting", 45, 12.0).await;
+        driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
+        driver.settled(cx, false).await;
+        edit_latency(&driver, cx, "edit at fit while exporting", false, 12, Duration::from_millis(250)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(exporting) = exporting {
+            eprintln!("bench {:<28} {:>7} photos exported meanwhile", "exports", exporting.await);
+        }
 
         let mut leave = Vec::new();
         for i in 0..4 {
@@ -496,7 +734,9 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         report("leave 1:1 mid-render (UI)", &mut leave);
         driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
         driver.settled(cx, false).await;
-        ui_thread(&driver, cx).await;
+        if !develop_only {
+            ui_thread(&driver, cx).await;
+        }
         driver.act(cx, |a, cx| a.set_mode(Mode::Browse, cx));
         cx.background_executor().timer(Duration::from_millis(300)).await;
         cx.update(|cx| cx.quit());

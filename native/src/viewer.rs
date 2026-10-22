@@ -199,14 +199,15 @@ impl Viewer {
         self.parked = false;
     }
 
-    pub fn draw(&mut self, scene: Scene) {
+    /// Draws `scene` and presents it, unless it is on screen already; true when a frame was presented.
+    pub fn draw(&mut self, scene: Scene) -> bool {
         if self.parked || (!self.dirty && self.drawn == Some(scene)) {
-            return;
+            return false;
         }
         if self.target.is_none() {
             self.target = Target::new(&self.screen, &self.view);
         }
-        let Some(target) = self.target.as_mut() else { return };
+        let Some(target) = self.target.as_mut() else { return false };
         if let Some(window) = self.view.window() {
             target.layer.setContentsScale(window.backingScaleFactor());
         }
@@ -219,9 +220,9 @@ impl Viewer {
             wgpu::CurrentSurfaceTexture::Outdated => {
                 target.configured = None;
                 self.dirty = true;
-                return;
+                return false;
             }
-            _ => return,
+            _ => return false,
         };
         let target = output.texture.create_view(&Default::default());
         let mut encoder = self.screen.device.create_command_encoder(&Default::default());
@@ -253,6 +254,7 @@ impl Viewer {
         let _ = self.screen.device.poll(wgpu::PollType::Poll);
         self.drawn = Some(scene);
         self.dirty = false;
+        true
     }
 
     fn bind<'a>(&self, shown: &'a Shown, scene: Scene) -> &'a wgpu::BindGroup {
