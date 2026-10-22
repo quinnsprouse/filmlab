@@ -71,8 +71,8 @@ impl Store {
         }
     }
 
-    fn reuse(&mut self, bytes: u64) -> Option<wgpu::Buffer> {
-        let fits = |b: &wgpu::Buffer| b.size() >= bytes && b.size() <= bytes + bytes / 2;
+    fn reuse(&mut self, bytes: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+        let fits = |b: &wgpu::Buffer| b.usage() == usage && b.size() >= bytes && b.size() <= bytes + bytes / 2;
         let at = self.spare.iter().enumerate().filter(|(_, b)| fits(b)).min_by_key(|(_, b)| b.size()).map(|(k, _)| k)?;
         Some(self.spare.remove(at))
     }
@@ -166,8 +166,20 @@ impl Gpu {
         Some(Arc::new(Gpu { instance, adapter, device, queue, layout, pipelines, dummies, store: Mutex::default(), mappable, stalled: AtomicBool::new(false) }))
     }
 
-    fn ensure(&self, store: &mut Store, name: &str, size: usize) {
-        if store.buffers.get(name).is_some_and(|s| s.words >= size) {
+    // why: on unified memory a buffer the CPU writes (an uploaded scene or LUT) is mapped and written where the shader
+    // reads it; it is write-combined, so it's never one the CPU reads back
+    fn usage(&self, written: bool) -> wgpu::BufferUsages {
+        let shared = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        match (self.mappable, written) {
+            (false, _) => shared,
+            (true, false) => shared | wgpu::BufferUsages::MAP_READ,
+            (true, true) => shared | wgpu::BufferUsages::MAP_WRITE,
+        }
+    }
+
+    fn ensure(&self, store: &mut Store, name: &str, size: usize, written: bool) {
+        let usage = self.usage(written);
+        if store.buffers.get(name).is_some_and(|s| s.words >= size && s.buffer.usage() == usage) {
             store.order.retain(|k| k != name);
             store.order.push(name.to_string());
             return;
@@ -177,14 +189,7 @@ impl Gpu {
         }
         store.order.retain(|k| k != name);
         let words = size.max(4);
-        let buffer = store.reuse((words * 4) as u64).unwrap_or_else(|| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (words * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST | if self.mappable { wgpu::BufferUsages::MAP_READ } else { wgpu::BufferUsages::empty() },
-                mapped_at_creation: false,
-            })
-        });
+        let buffer = store.reuse((words * 4) as u64, usage).unwrap_or_else(|| self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (words * 4) as u64, usage, mapped_at_creation: false }));
         store.buffers.insert(name.to_string(), Stored { buffer, words, holds: None });
         store.order.push(name.to_string());
         let kind = name.split(':').next().unwrap_or("");
@@ -200,13 +205,21 @@ impl Gpu {
 
     fn upload_into(&self, store: &mut Store, name: &str, block: &Block, pack: bool) {
         let len = block.words.len();
-        self.ensure(store, name, if pack { len / 3 * 4 } else { len });
+        let words = if pack { len / 3 * 4 } else { len };
+        let large = words * 4 >= STAGED;
+        let mapped = large && self.mappable;
+        self.ensure(store, name, words, mapped);
         if store.buffers.get(name).is_none_or(|t| t.holds.as_deref() == Some(block.id.as_str())) {
             return;
         }
         let data = if pack { std::borrow::Cow::Owned(packed(&block.words)) } else { std::borrow::Cow::Borrowed(bits(&block.words)) };
         let bytes: &[u8] = bytemuck::cast_slice(&data);
-        if bytes.len() < STAGED || !self.stage(store, name, bytes) {
+        let written = match (large, mapped) {
+            (true, true) => self.write_mapped(store, name, bytes),
+            (true, false) => self.stage(store, name, bytes),
+            _ => false,
+        };
+        if !written {
             let Some(target) = store.buffers.get(name) else { return };
             self.queue.write_buffer(&target.buffer, 0, bytes);
         }
@@ -215,8 +228,19 @@ impl Gpu {
         }
     }
 
-    // why: queue.write_buffer makes a staging buffer per call, and a frame's worth of fresh pages costs more than the
-    // copy; one kept staging buffer is mapped again once its last copy is done, which an upload never waits on, and a
+    fn write_mapped(&self, store: &Store, name: &str, bytes: &[u8]) -> bool {
+        let Some(target) = store.buffers.get(name).map(|t| t.buffer.clone()) else { return false };
+        let slice = target.slice(..bytes.len() as u64);
+        if self.map(&slice, wgpu::MapMode::Write).is_none() {
+            return false;
+        }
+        let written = slice.get_mapped_range_mut().map(|mut view| view.copy_from_slice(bytes)).is_ok();
+        target.unmap();
+        written
+    }
+
+    // why: on a discrete GPU, queue.write_buffer makes a staging buffer per call, and a frame's worth of fresh pages
+    // costs more than the copy; one kept staging buffer is mapped again once its last copy is done, which an upload never waits on, and a
     // new one is zeroed by the GPU (its first copy) rather than by wgpu on the CPU
     fn stage(&self, store: &mut Store, name: &str, bytes: &[u8]) -> bool {
         let size = bytes.len() as u64;
@@ -300,7 +324,7 @@ impl Gpu {
         for spec in &program.buffers {
             match &spec.upload {
                 Some(block) => self.upload_into(store, &spec.name, block, spec.pack),
-                None => self.ensure(store, &spec.name, spec.words),
+                None => self.ensure(store, &spec.name, spec.words, false),
             }
         }
         for w in &program.writes {
@@ -534,7 +558,8 @@ pub fn trim() {
                 && let Ok(store) = gpu.store.lock()
             {
                 let words: usize = store.buffers.values().map(|b| b.words).sum();
-                eprintln!("gpu trim: {} buffers, {:.0} MB kept {:?}, metal {:.0} MB", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, store.order, gpu.allocated() as f64 / 1_048_576.0);
+                let sizes: Vec<String> = store.order.iter().map(|k| format!("{k} {:.1}", store.buffers.get(k).map_or(0, |b| b.words * 4) as f64 / 1_048_576.0)).collect();
+                eprintln!("gpu trim: {} buffers, {:.0} MB kept {sizes:?}, metal {:.0} MB", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, gpu.allocated() as f64 / 1_048_576.0);
             }
         },
     );
