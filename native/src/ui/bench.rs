@@ -181,6 +181,7 @@ async fn pan(driver: &Driver, cx: &mut AsyncApp, name: &str, count: u32, step: f
         cx.background_executor().timer(Duration::from_millis(16).saturating_sub(at.elapsed())).await;
     }
     let ended = Instant::now();
+    let pieced = driver.read(cx, |a, cx| shown_window(a.develop.read(cx))).flatten();
     let settled = until(driver, cx, 60, |a, cx| {
         let d = a.develop.read(cx);
         let seen = crate::develop::plans::visible_region(d.camera, d.native, d.viewport);
@@ -205,8 +206,60 @@ async fn pan(driver: &Driver, cx: &mut AsyncApp, name: &str, count: u32, step: f
         frames as f64 / (ended - started).as_secs_f64(),
         settled.map_or(f64::NAN, ms)
     );
+    if let (Some(pieced), Some(whole)) = (pieced.filter(|p| p.pieced), driver.read(cx, |a, cx| shown_window(a.develop.read(cx))).flatten()) {
+        let (same, compared) = overlap(&pieced, &whole);
+        eprintln!("bench {:<28} joined strips match the settled window in {same} of {compared} pixels", "");
+        if let Some(dir) = std::env::var_os("FILMLAB_BENCH_SHOTS") {
+            let stem = name.replace([' ', ':', '(', ')'], "-");
+            for (shown, kind) in [(&pieced, "joined"), (&whole, "settled")] {
+                let [x, y, ..] = shown.window;
+                shown.save(&std::path::Path::new(&dir).join(format!("{stem}-{kind}-at-{x}-{y}.ppm")));
+            }
+        }
+    }
     eprintln!("bench {:<28} input to present {}", "", summary(&mut present));
     eprintln!("bench {:<28} input to sharp {}", "", summary(&mut sharp));
+}
+
+/// The zoomed frame on screen with its window in the photo's pixels at the zoom.
+struct Shown {
+    frame: std::sync::Arc<crate::develop::DisplayFrame>,
+    window: [usize; 4],
+    pieced: bool,
+}
+
+impl Shown {
+    fn save(&self, path: &std::path::Path) {
+        let f = &self.frame;
+        let mut ppm = format!("P6 {} {} 255\n", f.width, f.height).into_bytes();
+        ppm.extend(f.rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]));
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
+        let _ = std::fs::write(path, ppm);
+    }
+}
+
+fn shown_window(d: &Develop) -> Option<Shown> {
+    let plan = d.shown_plan(true)?;
+    let w = plan.view["window"].as_array()?;
+    let at = |k: usize| w.get(k).and_then(serde_json::Value::as_u64).map(|v| v as usize);
+    Some(Shown { frame: d.detail.clone()?, window: [at(0)?, at(1)?, at(2)?, at(3)?], pieced: crate::develop::pan::pieced(plan) })
+}
+
+/// Pixels where two zoomed frames overlap, and how many of them are the same.
+fn overlap(a: &Shown, b: &Shown) -> (usize, usize) {
+    let [ax, ay, aw, ah] = a.window;
+    let [bx, by, bw, bh] = b.window;
+    let (x0, x1, y0, y1) = (ax.max(bx), (ax + aw).min(bx + bw), ay.max(by), (ay + ah).min(by + bh));
+    let (mut same, mut compared) = (0, 0);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let pa = ((y - ay) * a.frame.width as usize + x - ax) * 4;
+            let pb = ((y - by) * b.frame.width as usize + x - bx) * 4;
+            compared += 1;
+            same += usize::from(a.frame.rgba.get(pa..pa + 4) == b.frame.rgba.get(pb..pb + 4));
+        }
+    }
+    (same, compared)
 }
 
 /// Zooming to 1:1 at a few places: time to the first presented frame sharp everywhere at the current edit.
