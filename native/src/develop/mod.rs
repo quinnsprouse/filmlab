@@ -320,15 +320,27 @@ impl Develop {
     }
 
     fn inputs(&self) -> Option<Inputs> {
+        if self.status != Status::Ready {
+            return None;
+        }
+        self.opened_inputs()
+    }
+
+    /// What the open photo shows, whether or not its decode has landed.
+    fn opened_inputs(&self) -> Option<Inputs> {
         let settings = self.shown_settings()?.clone();
         let film = if self.compare == Compare::Before { None } else { render_film(self.film.as_ref()) };
-        self.inputs_of(settings, film, self.overlay.clone())
+        self.framed(settings, film, self.overlay.clone())
     }
 
     fn inputs_of(&self, settings: Settings, film: Option<FilmSettings>, overlay: Option<Value>) -> Option<Inputs> {
         if self.status != Status::Ready {
             return None;
         }
+        self.framed(settings, film, overlay)
+    }
+
+    fn framed(&self, settings: Settings, film: Option<FilmSettings>, overlay: Option<Value>) -> Option<Inputs> {
         let photo_id = self.photo_id.clone()?;
         let apply_crop = self.tool != Tool::Crop;
         let [w, h] = core::frame_size_of(self.parsed_facts.as_ref()?, &settings, apply_crop);
@@ -404,10 +416,12 @@ impl Develop {
         self.prerendered.retain(|n, _| wanted.contains(n.as_str()));
         if self.ready.contains(&source_key(id, Level::Preview)) {
             self.status = Status::Ready;
-            self.sync_camera();
-            if let Some((plan, frame)) = adopt.take() {
-                self.adopt(plan, frame);
-            }
+        }
+        self.sync_camera();
+        if let Some((plan, frame)) = adopt.take() {
+            self.adopt(plan, frame);
+        }
+        if self.status == Status::Ready {
             self.pump(cx);
         }
         let facts = probed.facts.to_string();
@@ -772,7 +786,7 @@ impl Develop {
         if self.animation.is_some() {
             return;
         }
-        if let Some(inputs) = self.inputs() {
+        if let Some(inputs) = self.opened_inputs() {
             self.native = inputs.native;
             self.camera = camera_of(self.target_zoom(), inputs.native, self.viewport);
         }
@@ -985,8 +999,9 @@ impl Develop {
 
     /// Shows a neighbour's frame rendered ahead, when it was made from the same settings at the same size.
     fn adopt(&mut self, plan: Plan, frame: Arc<DisplayFrame>) {
-        let Some(inputs) = self.inputs() else { return };
-        let Some(wanted) = self.runnable(&fit_plan(&inputs, self.viewport)) else { return };
+        let Some(inputs) = self.opened_inputs() else { return };
+        let fit = fit_plan(&inputs, self.viewport);
+        let wanted = self.runnable(&fit).unwrap_or(Plan { level: Level::Preview, ..fit });
         if self.target_zoom() == Zoom::Fit && plan.look == wanted.look && plan.settings == wanted.settings && plan.view == wanted.view && plan.level == wanted.level {
             self.fit = Some(frame);
             self.shown.insert(false, Plan { revision: wanted.revision, ..plan });
@@ -1001,6 +1016,20 @@ impl Develop {
                 develop.ahead(cx);
             });
         }));
+    }
+
+    // why: going back shows the photo behind from its frame rendered ahead at once, and its preview decode (50 MB) is
+    // made again only then; the photos ahead keep theirs, so stepping on never decodes one twice
+    fn release_behind(&mut self, id: &str, cx: &mut Context<Develop>) {
+        let library = self.library.read(cx);
+        let behind = self.photo_id.as_deref().and_then(|p| library.index_of(p)).and_then(|at| at.checked_add_signed(-self.step)).and_then(|i| library.photos.get(i));
+        if behind.is_none_or(|r| r.file.id != id) {
+            return;
+        }
+        let key = source_key(id, Level::Preview);
+        if self.ready.remove(&key) {
+            self.let_go(vec![key], cx);
+        }
     }
 
     fn neighbour_inputs(&self, id: &str, cx: &Context<Develop>) -> Option<Inputs> {
@@ -1056,7 +1085,8 @@ impl Develop {
                     develop.prerendering = None;
                     if let Ok(Some(mut f)) = rendered {
                         let frame = Arc::new(DisplayFrame { width: f.width, height: f.height, rgba: f.take_rgba(), region: WHOLE, histogram: f.take_histogram() });
-                        develop.prerendered.insert(id, (plan, frame));
+                        develop.prerendered.insert(id.clone(), (plan, frame));
+                        develop.release_behind(&id, cx);
                     }
                     if develop.last_request.elapsed() >= IDLE_AFTER {
                         develop.ahead(cx);
