@@ -178,6 +178,7 @@ pub struct Develop {
     engine: Shared,
     ahead_engine: Shared,
     loading: HashSet<String>,
+    decoding: HashSet<String>,
     ready: HashSet<String>,
     shown: HashMap<bool, Plan>,
     running: Option<Running>,
@@ -186,7 +187,6 @@ pub struct Develop {
     trim: Option<Task<()>>,
     animation: Option<Animation>,
     last_request: Instant,
-    load_token: u64,
     pub applied: Option<Applied>,
     /// Fit frames of the neighbouring photos, rendered while idle so the arrow keys show them at once.
     prerendered: HashMap<String, (Plan, Arc<DisplayFrame>)>,
@@ -281,6 +281,7 @@ impl Develop {
             engine: Shared::default(),
             ahead_engine: Shared::default(),
             loading: HashSet::new(),
+            decoding: HashSet::new(),
             ready: HashSet::new(),
             shown: HashMap::new(),
             running: None,
@@ -289,7 +290,6 @@ impl Develop {
             trim: None,
             animation: None,
             last_request: Instant::now(),
-            load_token: 0,
             applied: None,
             prerendered: HashMap::new(),
             prerendering: None,
@@ -368,8 +368,6 @@ impl Develop {
         let path = record.file.path.clone();
         self.flush(cx);
         let left = self.photo_id.clone().filter(|p| p != id);
-        self.load_token += 1;
-        let token = self.load_token;
         let film = state.film();
         self.photo_id = Some(id.to_string());
         self.path = Some(path.clone());
@@ -424,38 +422,54 @@ impl Develop {
         if self.status == Status::Ready {
             self.pump(cx);
         }
-        let facts = probed.facts.to_string();
-        let preview = source_key(id, Level::Preview);
-        let decoding = self.ready.contains(&preview) || self.loading.contains(&preview);
-        let id = id.to_string();
+        let own = Decode { key: source_key(id, Level::Preview), facts: probed.facts.to_string(), path, level: Level::Preview, urgent: true };
+        let ahead = neighbours.into_iter().map(|(other, facts, path)| Decode { key: source_key(&other, Level::Preview), facts, path, level: Level::Preview, urgent: false });
+        self.decode_in_turn(std::iter::once(own).chain(ahead).collect(), cx);
+        cx.notify();
+    }
+
+    // why: one decode at a time, each on every core: the first is ready in about the time of one cold open, where side
+    // by side they all took several times that, and their working memory (300 MB for a 24 MP preview, 600 MB for the
+    // full size) isn't held at once. A decode another queue already runs is left to it, and one nobody wants any more
+    // (a photo opened meanwhile takes it out of `loading`) is skipped
+    fn decode_in_turn(&mut self, mut wanted: Vec<Decode>, cx: &mut Context<Develop>) {
+        wanted.retain(|d| !self.ready.contains(&d.key));
+        self.loading.extend(wanted.iter().map(|d| d.key.clone()));
+        let (preview, full) = (self.engines_for(Level::Preview), self.engines_for(Level::Full));
         cx.spawn(async move |this, cx| {
-            let bytes = match decoding {
-                true => None,
-                false => Some(cx.background_spawn(async move { std::fs::read(&path).map_err(|e| e.to_string()) }).await),
-            };
-            let _ = this.update(cx, |develop, cx| {
-                if develop.load_token != token {
+            for d in wanted {
+                let start = this.update(cx, |develop, _| develop.loading.contains(&d.key) && !develop.ready.contains(&d.key) && develop.decoding.insert(d.key.clone()));
+                match start {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => return,
+                }
+                let engines = if d.level == Level::Full { full.clone() } else { preview.clone() };
+                let key = d.key.clone();
+                let loaded = cx
+                    .background_spawn(async move {
+                        let started = Instant::now();
+                        let decode = || {
+                            let bytes = std::fs::read(&d.path).map_err(|e| e.to_string())?;
+                            core::decode(&d.facts, &bytes, d.level.max_edge())
+                        };
+                        let decoded = if d.urgent { crate::perf::interactive(decode) } else { crate::perf::initiated(decode) }?;
+                        if std::env::var_os("FILMLAB_TRACE").is_some() {
+                            eprintln!("decode {} {:.1} ms", d.key, started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        insert(&engines, &d.key, decoded)
+                    })
+                    .await;
+                let landed = this.update(cx, |develop, cx| {
+                    develop.decoding.remove(&key);
+                    develop.landed(key, loaded, cx);
+                });
+                if landed.is_err() {
                     return;
                 }
-                match bytes {
-                    Some(Err(e)) => {
-                        develop.status = Status::Failed;
-                        develop.error = Some(e);
-                    }
-                    read => {
-                        if let Some(Ok(bytes)) = read {
-                            develop.load_source(&id, Level::Preview, facts, Arc::new(bytes), cx);
-                        }
-                        for (other, facts, path) in neighbours {
-                            develop.preload(&other, facts, path, cx);
-                        }
-                    }
-                }
-                cx.notify();
-            });
+            }
         })
         .detach();
-        cx.notify();
     }
 
     // why: a decode can land after the photo changed; it counts whenever its source is still wanted, which the
@@ -492,58 +506,6 @@ impl Develop {
             .filter_map(|i| library.photos.get(i))
             .filter_map(|r| Some((r.file.id.clone(), r.probed.as_ref()?.facts.to_string(), r.file.path.clone())))
             .collect()
-    }
-
-    // why: arrow keys open the next photo at once when its preview is already decoded
-    fn preload(&mut self, id: &str, facts: String, path: std::path::PathBuf, cx: &mut Context<Develop>) {
-        let key = source_key(id, Level::Preview);
-        if self.loading.contains(&key) || self.ready.contains(&key) {
-            return;
-        }
-        self.loading.insert(key.clone());
-        let engines = self.engines_for(Level::Preview);
-        cx.spawn(async move |this, cx| {
-            let loaded = {
-                let key = key.clone();
-                cx.background_spawn(async move {
-                    let decoded = crate::perf::initiated(|| {
-                        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                        core::decode(&facts, &bytes, Level::Preview.max_edge())
-                    })?;
-                    insert(&engines, &key, decoded)
-                })
-                .await
-            };
-            let _ = this.update(cx, |develop, cx| develop.landed(key, loaded, cx));
-        })
-        .detach();
-    }
-
-    // why: the raw decode runs without the engine's lock, so renders of what's on screen never wait for it
-    fn load_source(&mut self, id: &str, level: Level, facts: String, bytes: Arc<Vec<u8>>, cx: &mut Context<Develop>) {
-        let key = source_key(id, level);
-        if self.loading.contains(&key) || self.ready.contains(&key) {
-            return;
-        }
-        self.loading.insert(key.clone());
-        let engines = self.engines_for(level);
-        cx.spawn(async move |this, cx| {
-            let loaded = {
-                let key = key.clone();
-                cx.background_spawn(async move {
-                    let started = Instant::now();
-                    let decode = || core::decode(&facts, &bytes, level.max_edge());
-                    let decoded = if level == Level::Preview { crate::perf::interactive(decode) } else { crate::perf::initiated(decode) }?;
-                    if std::env::var_os("FILMLAB_TRACE").is_some() {
-                        eprintln!("decode {key} {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    insert(&engines, &key, decoded)
-                })
-                .await
-            };
-            let _ = this.update(cx, |develop, cx| develop.landed(key, loaded, cx));
-        })
-        .detach();
     }
 
     fn runnable(&self, plan: &Plan) -> Option<Plan> {
@@ -887,7 +849,6 @@ impl Develop {
     /// Lets go of everything the open photo holds (decodes, caches, frames), for when Develop isn't on screen.
     pub fn unload(&mut self, cx: &mut Context<Develop>) {
         self.flush(cx);
-        self.load_token += 1;
         let keys: Vec<String> = self.ready.drain().chain(self.loading.drain()).collect();
         self.let_go(keys, cx);
         self.commands.detach();
@@ -930,8 +891,6 @@ impl Develop {
         );
     }
 
-    // why: one at a time, each on every core, so the first is ready in about the time of one cold open; side by side
-    // they all took several times that, and an arrow key or zoom right after coming back waited on all of them
     /// Decodes again what `rest` let go of, and any neighbour preview missing by then: the next photo's first, then
     /// the open photo's full-size source, then the others.
     pub fn wake(&mut self, cx: &mut Context<Develop>) {
@@ -939,37 +898,14 @@ impl Develop {
             return;
         }
         let (Some(id), Some(path), Some(facts)) = (self.photo_id.clone(), self.path.clone(), self.facts.clone()) else { return };
-        let neighbours = self.neighbours(&id, cx).into_iter().map(|(other, facts, path)| (source_key(&other, Level::Preview), facts, path, Level::Preview));
-        let mut wanted: Vec<(String, String, std::path::PathBuf, Level)> = neighbours.collect();
+        let neighbours = self.neighbours(&id, cx).into_iter().map(|(other, facts, path)| Decode { key: source_key(&other, Level::Preview), facts, path, level: Level::Preview, urgent: false });
+        let mut wanted: Vec<Decode> = neighbours.collect();
         let long = facts["width"].as_f64().unwrap_or(0.0).max(facts["height"].as_f64().unwrap_or(0.0));
         if long > plans::PREVIEW_EDGE && crate::perf::memory_bytes() >= 16 << 30 {
-            wanted.insert(wanted.len().min(1), (source_key(&id, Level::Full), facts.to_string(), path, Level::Full));
+            wanted.insert(wanted.len().min(1), Decode { key: source_key(&id, Level::Full), facts: facts.to_string(), path, level: Level::Full, urgent: false });
         }
-        wanted.retain(|(key, ..)| !self.ready.contains(key) && !self.loading.contains(key));
-        self.loading.extend(wanted.iter().map(|(key, ..)| key.clone()));
-        let (preview, full) = (self.engines_for(Level::Preview), self.engines_for(Level::Full));
-        cx.spawn(async move |this, cx| {
-            for (key, facts, path, level) in wanted {
-                // why: a photo opened meanwhile takes what it no longer needs out of `loading`
-                if !this.read_with(cx, |develop, _| develop.loading.contains(&key)).unwrap_or(false) {
-                    continue;
-                }
-                let (engines, inserted) = (if level == Level::Full { full.clone() } else { preview.clone() }, key.clone());
-                let loaded = cx
-                    .background_spawn(async move {
-                        let decoded = crate::perf::initiated(|| {
-                            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                            core::decode(&facts, &bytes, level.max_edge())
-                        })?;
-                        insert(&engines, &inserted, decoded)
-                    })
-                    .await;
-                if this.update(cx, |develop, cx| develop.landed(key, loaded, cx)).is_err() {
-                    return;
-                }
-            }
-        })
-        .detach();
+        wanted.retain(|d| !self.loading.contains(&d.key));
+        self.decode_in_turn(wanted, cx);
     }
 
     pub fn set_zoom(&mut self, zoom: Zoom, animate: bool, gesture: bool, cx: &mut Context<Develop>) {
@@ -1416,6 +1352,15 @@ pub struct Applied {
     pub before_film: Option<FilmSettings>,
     pub step: usize,
     pub photo_id: Option<String>,
+}
+
+/// A source to decode: the photo's file at a level, on the interactive pool when the photo on screen waits for it.
+struct Decode {
+    key: String,
+    facts: String,
+    path: std::path::PathBuf,
+    level: Level,
+    urgent: bool,
 }
 
 fn insert(engines: &[Shared], key: &str, decoded: core::Decoded) -> Result<(), String> {
