@@ -531,6 +531,37 @@ pub fn dark_of(c: [f32; 3]) -> f32 {
     c[0].min(c[1]).min(c[2])
 }
 
+const HAZE_EPS: f32 = 0.25;
+const HAZE_FLOOR: f32 = 1e-4;
+
+fn haze(img: &Rgb32f, sigma: f32) -> Plane {
+    let dark = img.map(dark_of);
+    let guide = dark.map(|v| (v.max(0.0) + HAZE_FLOOR).log2());
+    guided_by_fast(&guide, &dark, sigma, HAZE_EPS)
+}
+
+fn guided_by_fast(guide: &Plane, p: &Plane, sigma: f32, eps: f32) -> Plane {
+    use lightcraft_raster::resample::{Filter, resize};
+    let s = guided_fast_step(sigma);
+    let (lw, lh) = (guide.width.div_ceil(s).max(1), guide.height.div_ceil(s).max(1));
+    let down = |q: &Plane| if s <= 1 { q.clone() } else { resize(q, lw, lh, Filter::Box) };
+    let (gi, pi) = par_join(|| down(guide), || down(p));
+    let sg = sigma / s as f32;
+    let ((mi, mp), (mip, mii)) = par_join(
+        || par_join(|| gaussian(&gi, sg), || gaussian(&pi, sg)),
+        || par_join(|| gaussian(&gi.zip_map(&pi, |a, b| a * b), sg), || gaussian(&gi.map(|a| a * a), sg)),
+    );
+    let a = Plane::from_fn(gi.width, gi.height, |x, y| {
+        let (i, m) = (mi.get(x, y), mp.get(x, y));
+        (mip.get(x, y) - i * m) / ((mii.get(x, y) - i * i).max(0.0) + eps)
+    });
+    let b = Plane::from_fn(gi.width, gi.height, |x, y| mp.get(x, y) - a.get(x, y) * mi.get(x, y));
+    let (ma, mb) = par_join(|| gaussian(&a, sg), || gaussian(&b, sg));
+    let up = |c: &Plane| if s <= 1 { c.clone() } else { resize(c, guide.width, guide.height, Filter::Bilinear) };
+    let (ua, ub) = par_join(|| up(&ma), || up(&mb));
+    guided_apply(guide, &ua, &ub)
+}
+
 /// Radius of the local Moiré / colour-noise chromaticity blur, as a fraction of the long edge.
 pub const CHROMA_SIGMA: f32 = 0.004;
 
@@ -546,7 +577,7 @@ pub struct PlaneSigmas {
     pub clarity: Option<f32>,
     /// Texture / sharpening band (Gaussian).
     pub texture: Option<f32>,
-    /// Dehaze dark channel (Gaussian).
+    /// Dehaze dark channel (guided by its own log, so it keeps to its side of an edge).
     pub dark: Option<f32>,
     /// Chromaticity blur for local Moiré / colour noise (Gaussian).
     pub chroma: Option<f32>,
@@ -618,7 +649,7 @@ pub(crate) fn prepare(
                             dark_sigma.map(|sg| match sd {
                                 Some((k, d, air)) if *k == sg.to_bits() => (d.clone(), *air),
                                 _ => {
-                                    let d = timed("dehaze", || Arc::new(gaussian(&img.map(dark_of), sg)));
+                                    let d = timed("dehaze", || Arc::new(haze(&img, sg)));
                                     let air = airlight(&d);
                                     *sd = Some((sg.to_bits(), d.clone(), air));
                                     (d, air)
@@ -646,7 +677,7 @@ pub(crate) fn frame_airlight(src: &Rgb32f, info: &SourceInfo, s: &DevelopSetting
     let mut img = Rgb32f::clone(&frame_proxy(src, frame, proxy_w, proxy_h));
     white_balance(&mut img, info, s);
     let sigma = (0.02 * frame.px_per_long(proxy_w)).max(1.0) as f32;
-    airlight(&gaussian(&img.map(dark_of), sigma))
+    airlight(&haze(&img, sigma))
 }
 
 /// How many airlight proxies [`frame_proxy`] keeps (one per photo and frame being zoomed into; each ≤ 1.8 MB).
