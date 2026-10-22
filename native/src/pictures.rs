@@ -6,8 +6,8 @@ use gpui_kit::{App, RenderImage};
 
 use crate::cache;
 
-/// How many decoded thumbnails stay in memory when they are off screen.
-const KEPT: usize = 300;
+/// How many bytes of decoded thumbnails stay in memory (and as many again in the GPU's image atlas) while off screen.
+const KEPT_BYTES: usize = 64 << 20;
 
 /// A decoded thumbnail: the film render of one look, or the camera's embedded preview until that render is ready.
 #[derive(Clone)]
@@ -60,6 +60,12 @@ impl Source {
     }
 }
 
+impl Picture {
+    fn bytes(&self) -> usize {
+        self.image.as_bytes(0).map_or(0, <[u8]>::len)
+    }
+}
+
 impl Pictures {
     pub fn get(&self, id: &str) -> Option<&Picture> {
         self.kept.get(id).map(|k| &k.picture)
@@ -99,9 +105,11 @@ impl Pictures {
     }
 
     fn evict(&mut self, cx: &mut App) {
-        while self.kept.len() > KEPT {
+        let mut held: usize = self.kept.values().map(|k| k.picture.bytes()).sum();
+        while held > KEPT_BYTES {
             let Some(oldest) = self.kept.iter().filter(|(_, k)| k.seen < self.frame).min_by_key(|(_, k)| k.seen).map(|(id, _)| id.clone()) else { break };
             if let Some(gone) = self.kept.remove(&oldest) {
+                held -= gone.picture.bytes();
                 cx.drop_image(gone.picture.image, None);
             }
         }
