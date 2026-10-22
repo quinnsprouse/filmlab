@@ -163,7 +163,7 @@ pub fn normalize_wb(d: &mut DevelopSettings, info: &SourceInfo) {
 /// Self-guided filter (He et al.) on a single plane with Gaussian windows of `sigma` px.
 pub fn guided(p: &Plane, sigma: f32, eps: f32) -> Plane {
     let (ma, mb) = guided_coeffs(p, sigma, eps);
-    guided_apply(p, &ma, &mb)
+    guided_apply(p, ma, &mb)
 }
 
 /// Blurred guided-filter coefficients (mean a, mean b) of `p`; every pass row-parallel, and the
@@ -179,15 +179,14 @@ fn guided_coeffs(p: &Plane, sigma: f32, eps: f32) -> (Plane, Plane) {
 }
 
 /// `q = a·p + b` per pixel.
-fn guided_apply(p: &Plane, a: &Plane, b: &Plane) -> Plane {
-    let mut q = Plane::new(p.width, p.height);
+fn guided_apply(p: &Plane, mut a: Plane, b: &Plane) -> Plane {
     let w = p.width;
-    for_rows(&mut q.data, w, |y, row| {
-        for ((v, pv), (av, bv)) in row.iter_mut().zip(p.row(y)).zip(a.row(y).iter().zip(b.row(y))) {
-            *v = av * pv + bv;
+    for_rows(&mut a.data, w, |y, row| {
+        for ((v, pv), bv) in row.iter_mut().zip(p.row(y)).zip(b.row(y)) {
+            *v = *v * pv + bv;
         }
     });
-    q
+    a
 }
 
 /// Fast guided filter (He & Sun 2015): coefficients computed on a `s×` subsampled plane and
@@ -203,7 +202,7 @@ pub fn guided_fast(p: &Plane, sigma: f32, eps: f32) -> Plane {
     let lo = resize(p, lw, lh, Filter::Box);
     let (ma, mb) = guided_coeffs(&lo, sigma / s as f32, eps);
     let up = |c: &Plane| resize(c, p.width, p.height, Filter::Bilinear);
-    guided_apply(p, &up(&ma), &up(&mb))
+    guided_apply(p, up(&ma), &up(&mb))
 }
 
 /// Separable median (`2r+1` px along each row, then each column; clamped edges). It keeps the
@@ -559,7 +558,7 @@ fn guided_by_fast(guide: &Plane, p: &Plane, sigma: f32, eps: f32) -> Plane {
     let (ma, mb) = par_join(|| gaussian(&a, sg), || gaussian(&b, sg));
     let up = |c: &Plane| if s <= 1 { c.clone() } else { resize(c, guide.width, guide.height, Filter::Bilinear) };
     let (ua, ub) = par_join(|| up(&ma), || up(&mb));
-    guided_apply(guide, &ua, &ub)
+    guided_apply(guide, ua, &ub)
 }
 
 /// Radius of the local Moiré / colour-noise chromaticity blur, as a fraction of the long edge.

@@ -315,7 +315,7 @@ pub(crate) fn finish(
         fp.for_display(d, proof);
     }
     let trc = fp.out_trc;
-    let data = finish_with(p, &fp, false, |e| match trc {
+    let data = finish_with(p, &fp, None, false, |e| match trc {
         OutputTrc::Srgb => [enc(e[0]), enc(e[1]), enc(e[2]), 255],
         t => {
             let x = e.map(|v| enc(t.encode(lightcraft_color::transfer::srgb_to_linear(v.clamp(0.0, 1.0)))));
@@ -324,6 +324,13 @@ pub(crate) fn finish(
     });
     let (columns, rows) = made(&fp);
     Rgba8 { width: columns.len(), height: rows.len(), data }
+}
+
+pub(crate) fn capture(p: &mut Prepared, s: &DevelopSettings, frame: &Frame, info: &SourceInfo, space: OutputSpace) {
+    let (w, h) = (p.img.width, p.img.height);
+    let input = std::sync::Arc::get_mut(&mut p.img).map(|img| std::mem::take(&mut img.data));
+    let fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    finish_with(p, &fp, input, false, |_| [0u8; 4]);
 }
 
 /// [`finish`] into 16-bit display-encoded or 32-bit float linear samples (output primaries).
@@ -344,18 +351,18 @@ pub(crate) fn finish_deep(
     let trc = fp.out_trc;
     let samples = match depth {
         OutputDepth::F32Linear => {
-            let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.clamp(0.0, 1.0))));
+            let v = finish_with(p, &fp, None, true, |e| e.map(|v| srgb_to_linear(v.clamp(0.0, 1.0))));
             DeepSamples::F32(v.into_flattened())
         }
         OutputDepth::F32Hdr => {
             // the sRGB curve extended past 1 (it is unbounded), so values up to `peak` survive
             let peak = fp.peak;
-            let v = finish_with(p, &fp, true, |e| e.map(|v| srgb_to_linear(v.max(0.0)).clamp(0.0, peak)));
+            let v = finish_with(p, &fp, None, true, |e| e.map(|v| srgb_to_linear(v.max(0.0)).clamp(0.0, peak)));
             DeepSamples::F32(v.into_flattened())
         }
         _ => {
             let q = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-            let v = finish_with(p, &fp, true, |e| match trc {
+            let v = finish_with(p, &fp, None, true, |e| match trc {
                 OutputTrc::Srgb => e.map(q),
                 t => e.map(|v| q(t.encode(srgb_to_linear(v.clamp(0.0, 1.0))))),
             });
@@ -385,6 +392,7 @@ pub(crate) fn made(fp: &FinishParams) -> (std::ops::Range<usize>, std::ops::Rang
 pub(crate) fn finish_with<T: Copy + Default + Send>(
     p: &Prepared,
     fp: &FinishParams,
+    input: Option<Vec<[f32; 3]>>,
     exact: bool,
     store: impl Fn([f32; 3]) -> T + Sync + Send,
 ) -> Vec<T> {
@@ -429,10 +437,9 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     // why: the work up to the tone map (the scene colour it, or a film hook, takes) and the work after the colour
     // tools as closures, run over a row at a time, so that the colour tools take a whole row at once where no mask
     // reaches (`ColorOps::apply_row`, which vectorises); every pixel's arithmetic is as it was
-    let scene = |x: usize, y: usize, l: &[f32; MASK_SUMS]| -> [f32; 3] {
+    let scene = |x: usize, y: usize, l: &[f32; MASK_SUMS], raw: [f32; 3]| -> [f32; 3] {
         let i = y * w + x;
         let [l_exp, l_temp, l_tint, l_con, l_hl, l_sh, l_wh, l_bl, l_tex, l_clar, l_dehaze, _, _, l_sharp, l_noise, l_moire, l_defringe] = *l;
-        let raw = p.img.data[i];
         let mut c = if gain == 1.0 { raw } else { raw.map(|v| v * gain) };
         let l_pre = p.log_l.data[i];
         let l0 = l_pre + ev;
@@ -547,10 +554,10 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
         let at = crate::film_hook::Pixel { index: y * w + x, x: vx + x as f32, y: vy + y as f32, frame: [vw, vh] };
         match &film {
             Some(film) if precomputed => film.tone([0.0; 3], at),
-            Some(film) => film.tone(scene(x, y, l), at),
+            Some(film) => film.tone(scene(x, y, l, p.img.data[y * w + x]), at),
             None => {
                 // --- tone map on luminance, highlight desaturation
-                let c = scene(x, y, l);
+                let c = scene(x, y, l, p.img.data[y * w + x]);
                 let yl = luminance_2020(c);
                 let o = tone.apply(yl);
                 let mut d = if yl > 1e-9 { c.map(|v| v * o / yl) } else { [0.0; 3] };
@@ -708,11 +715,18 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     // output pixels, no per-pixel call into the hook
     if let Some(film) = film.as_ref().filter(|_| capture_only) {
         use rayon::prelude::*;
-        let at = |i: usize| {
+        let at = |i: usize, raw: [f32; 3]| {
             let (x, y) = (i % w, i / w);
-            if p.masks.is_empty() { scene(x, y, &none) } else { scene(x, y, &mask_sums(i).0) }
+            if p.masks.is_empty() { scene(x, y, &none, raw) } else { scene(x, y, &mask_sums(i).0, raw) }
         };
-        film.capture((0..w * h).into_par_iter().with_min_len(1024).map(at).collect(), w, [vx, vy], [vw, vh]);
+        let captured = match input {
+            Some(mut rgb) => {
+                rgb.par_iter_mut().enumerate().for_each(|(i, pixel)| *pixel = at(i, *pixel));
+                rgb
+            }
+            None => (0..w * h).into_par_iter().with_min_len(1024).map(|i| at(i, p.img.data[i])).collect(),
+        };
+        film.capture(captured, w, [vx, vy], [vw, vh]);
         return Vec::new();
     }
     // (Filmlab: only the part of the frame a precomputed hook holds, when it holds part: `ToneHook::part`)

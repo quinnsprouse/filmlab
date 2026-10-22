@@ -590,7 +590,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     if film.is_some() && req.overlay == Overlay::None && (kept.is_some() || (shared.is_none() && s.masks.is_empty())) {
         let hollow = Arc::new(Rgb32f { width: w, height: h, data: Vec::new() });
         let plane = Arc::new(Plane { width: w, height: h, data: Vec::new() });
-        let prep = Prepared {
+        let mut prep = Prepared {
             img: hollow,
             log_l: plane.clone(),
             base: plane,
@@ -603,7 +603,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
             px_per_long,
         };
         lap("prepare (precomputed)", &mut t);
-        return finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t);
+        return finish_rendered(&mut prep, info, req, &plan, src_img, edit, &mut t);
     }
     if stop::stopped() {
         return unwanted();
@@ -654,11 +654,13 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     lap("prepare", &mut t);
     if let (Some((a, c)), Some(sampled)) = (shared, sampled) {
         c.put(CacheEntry { src: a.clone(), geo, sampled, lin: Some((lin_key, lin)), planes });
+    } else {
+        drop(lin);
     }
     if stop::stopped() {
         return unwanted();
     }
-    finish_rendered(&prep, info, req, &plan, src_img, edit, &mut t)
+    finish_rendered(&mut prep, info, req, &plan, src_img, edit, &mut t)
 }
 
 fn unwanted() -> Rendered {
@@ -677,7 +679,7 @@ fn lap(what: &str, t: &mut Option<std::time::Instant>) {
 /// The per-pixel stage, histogram and overlays of [`render_impl`] on its prepared planes.
 #[allow(clippy::too_many_arguments)]
 fn finish_rendered(
-    prep: &Prepared,
+    prep: &mut Prepared,
     info: &SourceInfo,
     req: &RenderRequest,
     plan: &Plan<'_>,
@@ -689,7 +691,7 @@ fn finish_rendered(
     // why: Filmlab: a capture-only film hook takes the pass's scene (`ToneHook::capture`) and the render's own
     // pixels go unused, so none are made: the image keeps only the size it would have had, and no histogram
     if let Some(film) = film_hook::current().filter(|f| f.capture_only()) {
-        finish::finish(prep, s, frame, info, req.space, None, None);
+        finish::capture(prep, s, frame, info, req.space);
         film.captured_masks(prep.masks.clone());
         lap("capture", t);
         let (width, height) = match plan.keep {
