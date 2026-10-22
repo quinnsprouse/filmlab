@@ -474,6 +474,17 @@ fn shader() -> String {
     out
 }
 
+impl Gpu {
+    /// Bytes Metal holds for the process's GPU device: every buffer and texture of the film renders, the viewer and gpui.
+    pub fn allocated(&self) -> u64 {
+        let hal = unsafe { self.device.as_hal::<wgpu::hal::api::Metal>() };
+        hal.map_or(0, |d| {
+            let device: &objc2::runtime::AnyObject = d.raw_device().as_ref();
+            unsafe { objc2::msg_send![device, currentAllocatedSize] }
+        })
+    }
+}
+
 static SHARED: std::sync::OnceLock<Arc<Gpu>> = std::sync::OnceLock::new();
 
 impl Gpu {
@@ -523,7 +534,7 @@ pub fn trim() {
                 && let Ok(store) = gpu.store.lock()
             {
                 let words: usize = store.buffers.values().map(|b| b.words).sum();
-                eprintln!("gpu trim: {} buffers, {:.0} MB kept {:?}", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, store.order);
+                eprintln!("gpu trim: {} buffers, {:.0} MB kept {:?}, metal {:.0} MB", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, store.order, gpu.allocated() as f64 / 1_048_576.0);
             }
         },
     );
@@ -532,6 +543,11 @@ pub fn trim() {
 /// Drops every buffer, film textures included, for when no photo is open.
 pub fn reset() {
     release_later(|name| name.starts_with("lut:"), |_| ());
+}
+
+/// Bytes Metal holds for the process, or 0 before the GPU is open.
+pub fn allocated() -> u64 {
+    SHARED.get().map_or(0, |gpu| gpu.allocated())
 }
 
 pub fn share(gpu: &Arc<Gpu>) {

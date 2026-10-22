@@ -927,6 +927,19 @@ impl Engine {
         self.looks.remove(key);
     }
 
+    /// Bytes this engine's caches hold: decoded sources, stage caches, film scenes and whole-frame looks.
+    pub fn usage(&self) -> String {
+        let mb = |b: usize| b as f64 / 1_048_576.0;
+        let pixels = |v: &[[f32; 3]]| std::mem::size_of_val(v);
+        let cached = |c: &CachedScene| {
+            pixels(&c.scene.rgb) + c.textured.as_ref().map_or(0, |(_, t)| pixels(&t.rgb)) + c.toned.as_ref().map_or(0, |(_, t)| pixels(&t.rgb))
+        };
+        let sources: Vec<String> = self.sources.iter().map(|(k, l)| format!("{k} {:.0}", mb(l.source.image.data.len() * 12))).collect();
+        let stages: Vec<String> = self.stages.iter().map(|(k, c)| format!("{k} {:.0}", mb(c.bytes()))).collect();
+        let scenes: Vec<String> = self.scenes.iter().chain(&self.looks).map(|(k, c)| format!("{k} {:.0}", mb(cached(c)))).collect();
+        format!("sources [{}] stages [{}] scenes [{}]", sources.join(", "), stages.join(", "), scenes.join(", "))
+    }
+
     pub fn release(&mut self, key: &str) {
         self.sources.remove(key);
         self.originals.remove(key);

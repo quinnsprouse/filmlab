@@ -1075,6 +1075,13 @@ impl Develop {
             cx.background_executor().timer(TRIM_AFTER).await;
             let _ = this.update(cx, |develop, _| {
                 develop.trim = None;
+                if std::env::var_os("FILMLAB_TRACE").is_some() {
+                    for (name, shared) in [("loupe", &develop.engine), ("ahead", &develop.ahead_engine)] {
+                        if let Ok(engine) = shared.engine().try_lock() {
+                            eprintln!("engine {name}: {}", engine.usage());
+                        }
+                    }
+                }
                 crate::gpu::trim();
                 crate::perf::give_back();
             });
