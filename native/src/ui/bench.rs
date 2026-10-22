@@ -258,6 +258,9 @@ fn export_loop(driver: &Driver, cx: &mut AsyncApp, others: Vec<String>, stop: st
     }))
 }
 
+/// How far apart one-off edits are sent: further than a slider drag's edits, so each is drawn whole.
+const APART: Duration = Duration::from_millis(250);
+
 fn ms(d: Duration) -> f64 {
     (d.as_secs_f64() * 10_000.0).round() / 10.0
 }
@@ -653,7 +656,7 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
             if until(&driver, cx, 30, move |a, cx| shows(a, cx, &p)).await.is_some() {
                 edits.push(ms(t.elapsed()));
             }
-            cx.background_executor().timer(Duration::from_millis(120)).await;
+            cx.background_executor().timer(APART.saturating_sub(t.elapsed())).await;
         }
         report("edit exposure (fit)", &mut edits);
 
@@ -665,7 +668,7 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
             if until(&driver, cx, 30, move |a, cx| shows(a, cx, &p)).await.is_some() {
                 color.push(ms(t.elapsed()));
             }
-            cx.background_executor().timer(Duration::from_millis(120)).await;
+            cx.background_executor().timer(APART.saturating_sub(t.elapsed())).await;
         }
         report("edit vibrance (fit)", &mut color);
 
@@ -680,7 +683,7 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
                 if until(&driver, cx, 30, move |a, cx| shows(a, cx, &p)).await.is_some() {
                     film.push(ms(t.elapsed()));
                 }
-                cx.background_executor().timer(Duration::from_millis(120)).await;
+                cx.background_executor().timer(APART.saturating_sub(t.elapsed())).await;
             }
         }
         report("edit halation (fit)", &mut film);
@@ -704,18 +707,18 @@ pub fn start(app: &Entity<FilmlabApp>, window: AnyWindowHandle, cx: &mut App) {
         pan(&driver, cx, "pan 1:1 (6 px a frame)", 90, 6.0).await;
         pan(&driver, cx, "pan 1:1 (24 px a frame)", 45, 24.0).await;
         pan(&driver, cx, "pan 1:1 (60 px a frame)", 30, 60.0).await;
-        edit_latency(&driver, cx, "edit exposure (1:1)", true, 12, Duration::from_millis(250)).await;
+        edit_latency(&driver, cx, "edit exposure (1:1)", true, 12, APART).await;
         edit_latency(&driver, cx, "drag exposure (1:1)", true, 60, Duration::from_millis(16)).await;
 
         let others: Vec<String> = ids.iter().filter(|id| **id != photo).take(2).cloned().collect();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exporting = export_loop(&driver, cx, others, stop.clone());
         cx.background_executor().timer(Duration::from_millis(500)).await;
-        edit_latency(&driver, cx, "edit at 1:1 while exporting", true, 12, Duration::from_millis(250)).await;
+        edit_latency(&driver, cx, "edit at 1:1 while exporting", true, 12, APART).await;
         pan(&driver, cx, "pan 1:1 while exporting", 45, 12.0).await;
         driver.develop(cx, |d, cx| d.set_zoom(Zoom::Fit, false, false, cx));
         driver.settled(cx, false).await;
-        edit_latency(&driver, cx, "edit at fit while exporting", false, 12, Duration::from_millis(250)).await;
+        edit_latency(&driver, cx, "edit at fit while exporting", false, 12, APART).await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(exporting) = exporting {
             eprintln!("bench {:<28} {:>7} photos exported meanwhile", "exports", exporting.await);
