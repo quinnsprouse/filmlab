@@ -451,15 +451,12 @@ impl Develop {
                 let key = d.key.clone();
                 let loaded = cx
                     .background_spawn(async move {
-                        let started = Instant::now();
+                        let _zone = crate::profile::zone!("decode photo", key = %d.key, urgent = d.urgent);
                         let decode = || {
                             let bytes = std::fs::read(&d.path).map_err(|e| e.to_string())?;
                             core::decode(&d.facts, &bytes, d.level.max_edge())
                         };
                         let decoded = if d.urgent { crate::perf::interactive(decode) } else { crate::perf::initiated(decode) }?;
-                        if std::env::var_os("FILMLAB_TRACE").is_some() {
-                            eprintln!("decode {} {:.1} ms", d.key, started.elapsed().as_secs_f64() * 1000.0);
-                        }
                         insert(&engines, &d.key, decoded)
                     })
                     .await;
@@ -655,17 +652,11 @@ impl Develop {
         self.trim = None;
         self.idle = None;
         self.stop_prerender();
-        let started = Instant::now();
         let wish = Wish::new();
         let rendering = self.rendering(&plan, &wish, cx);
         self.running = Some(Running { plan: plan.clone(), curve_input: false, wish });
         cx.spawn(async move |this, cx| {
             let rendered = rendering.await;
-            if std::env::var_os("FILMLAB_TRACE").is_some()
-                && let Ok(Some(f)) = &rendered
-            {
-                eprintln!("render {:?} {}x{} {:.1} ms rev {} {:?} {}", plan.layer, f.width, f.height, started.elapsed().as_secs_f64() * 1000.0, plan.revision, plan.level, plan.view);
-            }
             let _ = this.update(cx, |develop, cx| {
                 develop.running = None;
                 match rendered {
@@ -716,7 +707,9 @@ impl Develop {
         }
         let settings = plan.settings.clone();
         let film = plan.film.clone();
+        let zone = crate::profile::span!("render develop", layer = ?plan.layer, level = ?plan.level, revision = plan.revision, view = %plan.view);
         cx.background_spawn(async move {
+            let _zone = zone.entered();
             // why: the lock is taken outside the render pool; a pool thread waiting on it while helping a
             // render that holds it would deadlock the pool
             engine.with(|engine| {
@@ -1082,13 +1075,6 @@ impl Develop {
             cx.background_executor().timer(TRIM_AFTER).await;
             let _ = this.update(cx, |develop, _| {
                 develop.trim = None;
-                if std::env::var_os("FILMLAB_TRACE").is_some() {
-                    for (name, shared) in [("loupe", &develop.engine), ("ahead", &develop.ahead_engine)] {
-                        if let Ok(engine) = shared.engine().try_lock() {
-                            eprintln!("engine {name}: {}", engine.usage());
-                        }
-                    }
-                }
                 crate::gpu::trim();
                 crate::perf::give_back();
             });

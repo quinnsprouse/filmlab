@@ -34,6 +34,13 @@ pub fn memory_bytes() -> u64 {
     if ok { value } else { 0 }
 }
 
+/// The process's physical footprint in bytes, what Activity Monitor shows as its memory.
+pub fn footprint() -> u64 {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, (&raw mut info).cast()) } == 0;
+    if ok { info.ri_phys_footprint } else { 0 }
+}
+
 fn all_cores() -> usize {
     let total = cores(0) + cores(1);
     if total > 0 { total } else { std::thread::available_parallelism().map_or(8, |n| n.get()) }

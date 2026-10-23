@@ -30,3 +30,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Heap profiles that the dhat feature writes on quit
+dhat-heap.json

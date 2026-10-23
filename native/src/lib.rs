@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod menu;
 pub mod perf;
 pub mod pictures;
+pub mod profile;
 pub mod settings;
 pub mod stocks;
 pub mod ui;

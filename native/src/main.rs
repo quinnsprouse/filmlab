@@ -1,5 +1,4 @@
 use filmlab::assets::{Assets, fonts};
-use mimalloc::MiMalloc;
 use filmlab::gpu::{Gpu, Runner};
 use filmlab::ui::app::{FilmlabApp, bind};
 use filmlab::ui::theme;
@@ -8,8 +7,17 @@ use gpui_kit::*;
 
 // why: the system allocator keeps freed multi-megabyte blocks (every film frame's buffers) cached for good, so the
 // app's footprint only ever grew; mimalloc returns them to the system
+#[cfg(not(any(feature = "profile", feature = "dhat")))]
 #[global_allocator]
-static ALLOCATOR: MiMalloc = MiMalloc;
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "profile", not(feature = "dhat")))]
+#[global_allocator]
+static ALLOCATOR: tracy_client::ProfiledAllocator<mimalloc::MiMalloc> = tracy_client::ProfiledAllocator::new(mimalloc::MiMalloc, 0);
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
 
 // why: mimalloc tags its pages 100 by default, the tag `footprint`, vmmap and Instruments name "IOAccelerator", so the
 // heap read as GPU memory; tag 240 (VM_MEMORY_APPLICATION_SPECIFIC_1) shows it as the app's own. A page keeps the tag
@@ -25,12 +33,8 @@ extern "C" fn tag_heap() {
 }
 
 fn main() {
-    filmlab::ui::bench::mark_launch();
-    let opening = std::time::Instant::now();
+    filmlab::profile::start();
     let gpu = Gpu::open();
-    if std::env::var_os("FILMLAB_TRACE").is_some() {
-        eprintln!("gpu open {:.1} ms", opening.elapsed().as_secs_f64() * 1000.0);
-    }
     if let Some(gpu) = &gpu {
         filmlab::gpu::share(gpu);
         // why: FILMLAB_CPU=1 keeps the film stage on the CPU, to compare against the GPU path
@@ -39,7 +43,7 @@ fn main() {
         }
     }
     // why: scripted runs (the end-to-end test, MCP test launches with FILMLAB_BACKGROUND=1) leave the user's focus alone
-    let e2e = ["FILMLAB_E2E", "FILMLAB_BACKGROUND", "FILMLAB_BENCH"].iter().any(|k| std::env::var_os(k).is_some());
+    let e2e = ["FILMLAB_E2E", "FILMLAB_BACKGROUND"].iter().any(|k| std::env::var_os(k).is_some());
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
         let _ = cx.text_system().add_fonts(fonts());
@@ -60,9 +64,8 @@ fn main() {
         };
         let gpu = gpu.clone();
         let (window, app) = gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| FilmlabApp::new(gpu, window, cx))).expect("window");
-        filmlab::ui::soak::start(&app, cx);
+        filmlab::profile::on_quit(cx);
         filmlab::ui::e2e::start(&app, window, cx);
-        filmlab::ui::bench::start(&app, window, cx);
         filmlab::mcp::start(&app, window, cx);
         if !e2e {
             cx.activate(true);

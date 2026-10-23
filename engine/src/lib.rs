@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[macro_use]
+mod profile;
 pub mod core;
 pub use lightcraft_engine::develop;
 pub mod dust;

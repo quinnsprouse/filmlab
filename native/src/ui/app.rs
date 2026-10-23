@@ -86,10 +86,6 @@ fn state_file() -> Option<PathBuf> {
 }
 
 fn remember(folder: &std::path::Path, photo: Option<&str>) {
-    // why: a scripted soak run must not replace the folder and photo the user last had open
-    if std::env::var_os("FILMLAB_SOAK").is_some() {
-        return;
-    }
     let Some(file) = state_file() else { return };
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -716,16 +712,12 @@ impl FilmlabApp {
 
     fn painter(&self, window: &Window, cx: &App) -> impl IntoElement {
         let scene = self.push_frames(window, cx);
-        let shot = super::bench::shot_of(self.develop.read(cx));
         let viewer = self.viewer.clone();
         canvas(
             |_, _, _| {},
             move |_, _, _, _| {
-                if let (Some(scene), Some(viewer)) = (scene, viewer.borrow_mut().as_mut())
-                    && viewer.draw(scene)
-                    && let Some(shot) = shot
-                {
-                    super::bench::presented(shot);
+                if let (Some(scene), Some(viewer)) = (scene, viewer.borrow_mut().as_mut()) {
+                    viewer.draw(scene);
                 }
             },
         )
@@ -736,6 +728,8 @@ impl FilmlabApp {
 
 impl Render for FilmlabApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::profile::ui_frame();
+        let _zone = crate::profile::zone!("ui render");
         self.glass.begin();
         self.library.update(cx, |l, _| l.begin_frame());
         if self.mode == Mode::Develop {

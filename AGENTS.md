@@ -8,6 +8,7 @@ Filmlab is a macOS desktop app: a GPUI interface in `native/` over the Rust engi
 - `native/scripts/e2e.sh <photo folder>` drives the real app end to end; `node native/scripts/mcp_e2e.mjs <photo folder>` exercises the MCP server against a release build, including a sweep that checks every control changes the photo.
 - `node native/scripts/mcp.mjs <tool> '<json args>'` calls one MCP tool on a running app (`FILMLAB_MCP_PORT` picks it). Verify a rendering change with `look` mode `compare`: it diffs two states of a photo, or tries controls without saving, and says what moved, where and by how much.
 - `native/scripts/bundle.sh` builds `Filmlab.app`, a zip and a DMG.
+- Profile with standard tools, not timing code: `samply record` or `xcrun xctrace record --template 'Time Profiler' --launch --` on `native/target/release/filmlab`. `cargo run --release --features profile` sends Tracy zones and frames to Tracy 0.14, and `--features dhat` writes `dhat-heap.json` when the app quits. README.md has the details.
 - `scripts/setup.sh` installs the Git hooks after `git init`.
 
 `engine/` and `native/` are separate Cargo workspaces with their own lockfiles and target folders. Run cargo inside the one you're changing; a change to `engine/` also needs `native/` to build.

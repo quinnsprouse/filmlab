@@ -151,6 +151,7 @@ fn create_unique(folder: &Path, stem: &str, extension: &str) -> Result<(PathBuf,
 
 /// Exports `job`, from `decoded` (the loupe's decode at the export's size) when given.
 pub fn export_one(engine: &mut Engine, job: &Job, choices: &Choices, folder: Option<&Path>, decoded: Option<Decoded>) -> Result<PathBuf, String> {
+    let _zone = crate::profile::zone!("export photo", stem = %job.stem, reused_decode = decoded.is_some());
     let options = choices.options();
     let bytes = std::fs::read(&job.path).map_err(|e| format!("Couldn't read the photo: {e}"))?;
     let film = serde_json::from_str::<Value>(&job.film).ok().and_then(|v| crate::film::FilmSettings::of(&v));

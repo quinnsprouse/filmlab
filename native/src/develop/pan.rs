@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use gpui_kit::{AppContext, Context};
 use rayon::prelude::*;
@@ -149,7 +148,6 @@ impl Develop {
         }) else {
             return true;
         };
-        let started = Instant::now();
         let wish = Wish::new();
         let rendering = self.rendering(&plan, &wish, cx);
         self.running = Some(Running { plan, curve_input: false, wish });
@@ -158,13 +156,16 @@ impl Develop {
             let made = match rendered {
                 Ok(Some(mut f)) if (f.width as usize, f.height as usize) == (strip.w, strip.h) => {
                     let pixels = f.take_rgba();
-                    Some(cx.background_spawn(async move { joined(&frame, was, &pixels, strip, to, full) }).await)
+                    Some(
+                        cx.background_spawn(async move {
+                            let _zone = crate::profile::zone!("pan join strip");
+                            joined(&frame, was, &pixels, strip, to, full)
+                        })
+                        .await,
+                    )
                 }
                 _ => None,
             };
-            if std::env::var_os("FILMLAB_TRACE").is_some() {
-                eprintln!("pan strip {strip:?} into {to:?} {:.1} ms joined {}", started.elapsed().as_secs_f64() * 1000.0, made.is_some());
-            }
             let _ = this.update(cx, |develop, cx| {
                 develop.running = None;
                 if let Some(made) = made

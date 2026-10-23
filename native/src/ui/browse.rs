@@ -60,15 +60,6 @@ impl State {
         -f32::from(self.scroll.offset().y)
     }
 
-    /// How far the grid can scroll down, in points.
-    pub fn scroll_range(&self) -> f32 {
-        f32::from(self.scroll.max_offset().y)
-    }
-
-    pub fn scroll_to(&self, top: f32) {
-        self.scroll.set_offset(point(px(0.), px(-top.clamp(0.0, self.scroll_range()))));
-    }
-
     fn regroup(&mut self, library: &crate::library::Library) {
         if self.grid.regroup(library, self.filter, self.sort) {
             self.order = self.grid.order();
@@ -152,16 +143,6 @@ impl FilmlabApp {
         }
         self.selected = Some(id.to_string());
         cx.notify();
-    }
-
-    /// The tiles in the grid's viewport, and how many of them show a picture.
-    pub fn viewport_pictures(&self, cx: &App) -> (usize, usize) {
-        let viewport = self.browse.scroll.bounds();
-        let library = self.library.read(cx);
-        let tiles = self.browse.tiles.borrow();
-        let visible: Vec<&String> = tiles.iter().filter(|(_, b)| b.intersects(&viewport)).map(|(id, _)| id).collect();
-        let shown = visible.iter().filter(|id| library.picture(id).is_some()).count();
-        (shown, visible.len())
     }
 
     pub fn targets(&self) -> Vec<String> {

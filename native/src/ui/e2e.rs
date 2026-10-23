@@ -1162,7 +1162,7 @@ async fn leave(run: &mut Run, cx: &mut AsyncApp, folder: &Path, stem: &str, fact
     run.check("memory: Develop unloads after a while in the library", unloaded, "");
     run.wait(cx, 30, |_, _| crate::perf::quiet_for(std::time::Duration::from_secs(3))).await;
     run.pause(cx, 1000).await;
-    let footprint = super::soak::footprint() as f64 / 1_048_576.0;
+    let footprint = crate::perf::footprint() as f64 / 1_048_576.0;
     run.check("memory: the idle footprint stays small", footprint < 600.0, format!("{footprint:.0} MB"));
 
     let state = sidecar(folder, stem, facts);

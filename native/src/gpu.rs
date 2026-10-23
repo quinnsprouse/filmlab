@@ -155,6 +155,7 @@ fn packed(words: &Words) -> Vec<u32> {
 
 impl Gpu {
     pub fn open() -> Option<Arc<Gpu>> {
+        let _zone = crate::profile::zone!("gpu open");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::METAL, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
         let limits = adapter.limits();
@@ -167,7 +168,8 @@ impl Gpu {
         // why: with unified memory a storage buffer the CPU can map is read back where the shader wrote it, without a
         // copy to a staging buffer first; a discrete GPU would reach such a buffer over the bus
         let unified = adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu;
-        let features = if unified { adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS } else { wgpu::Features::empty() };
+        let mappable = if unified { wgpu::Features::MAPPABLE_PRIMARY_BUFFERS } else { wgpu::Features::empty() };
+        let features = adapter.features() & (mappable | crate::profile::GPU_FEATURES);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("filmlab"), required_limits: required, required_features: features, ..Default::default() })).ok()?;
         let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -338,19 +340,13 @@ impl Gpu {
         if self.stalled.load(Ordering::Relaxed) {
             return None;
         }
-        let started = Instant::now();
-        let entries: Vec<&str> = program.passes.iter().map(|p| p.entry).collect();
-        let buffers: Vec<(String, usize)> = program.buffers.iter().map(|b| (b.name.clone(), b.words)).collect();
-        let traced = self.execute_inner(program);
-        if std::env::var_os("FILMLAB_GPU_TRACE").is_some() {
-            let mb = |f: &dyn Fn(&str) -> bool| buffers.iter().filter(|b| f(&b.0)).map(|b| b.1 * 4).sum::<usize>() as f64 / 1_048_576.0;
-            let failed = if traced.is_none() { " failed" } else { "" };
-            eprintln!("gpu {:.1} ms {} passes {:?}{failed} scratch {:.0} MB in {} slots, other {:.0} MB", started.elapsed().as_secs_f64() * 1000.0, entries.len(), entries.first(), mb(&|n| n.starts_with("tmp:")), buffers.iter().filter(|b| b.0.starts_with("tmp:slot")).count(), mb(&|n| !n.starts_with("tmp:")));
-            for (name, words) in buffers.iter().filter(|b| b.1 > 1_000_000) {
-                eprintln!("    {name} {:.0} MB", (words * 4) as f64 / 1_048_576.0);
-            }
-        }
-        traced
+        let _zone = crate::profile::zone!(
+            "gpu program",
+            passes = program.passes.len(),
+            first = program.passes.first().map_or("", |p| p.entry),
+            buffer_mb = program.buffers.iter().map(|b| b.words * 4).sum::<usize>() / 1_048_576
+        );
+        self.execute_inner(program)
     }
 
     fn execute_inner(&self, mut program: Program) -> Option<()> {
@@ -420,10 +416,11 @@ impl Gpu {
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.layout, entries: &entries }))
             })
             .collect::<Option<Vec<_>>>()?;
-        let profile = std::env::var_os("FILMLAB_GPU_PROFILE").is_some();
-        // why: one compute pass holds every dispatch (a serial Metal encoder orders them), instead of an encoder each
-        let mut compute = (!profile).then(|| encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()).forget_lifetime());
-        for (pass, bind) in program.passes.iter().zip(&binds) {
+        let timer = crate::profile::PassTimer::new(&self.device, &self.queue, program.passes.len());
+        // why: one compute pass holds every dispatch (a serial Metal encoder orders them), instead of an encoder each;
+        // timing passes needs one each, as Metal timestamps only a pass's start and end
+        let mut compute = timer.is_none().then(|| encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()).forget_lifetime());
+        for (k, (pass, bind)) in program.passes.iter().zip(&binds).enumerate() {
             let pipeline = self.pipelines.get(pass.entry)?;
             let groups = (pass.groups[0].max(1) as u32, pass.groups[1].max(1) as u32);
             if let Some(compute) = compute.as_mut() {
@@ -432,16 +429,10 @@ impl Gpu {
                 compute.dispatch_workgroups(groups.0, groups.1, 1);
                 continue;
             }
-            {
-                let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                compute.set_pipeline(pipeline);
-                compute.set_bind_group(0, bind, &[]);
-                compute.dispatch_workgroups(groups.0, groups.1, 1);
-            }
-            let t = std::time::Instant::now();
-            self.queue.submit([std::mem::replace(&mut encoder, self.device.create_command_encoder(&Default::default())).finish()]);
-            self.done()?;
-            eprintln!("  {:>18} {:>5}x{:<5} {:.2} ms", pass.entry, pass.groups[0], pass.groups[1], t.elapsed().as_secs_f64() * 1000.0);
+            let mut timed = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(pass.entry), timestamp_writes: timer.as_ref().map(|t| t.writes(k)) });
+            timed.set_pipeline(pipeline);
+            timed.set_bind_group(0, bind, &[]);
+            timed.dispatch_workgroups(groups.0, groups.1, 1);
         }
         drop(compute);
         let total: u64 = program.reads.iter().map(|r| (r.into.len() * 4) as u64).sum();
@@ -458,6 +449,7 @@ impl Gpu {
                 bytemuck::cast_slice_mut(read.into).copy_from_slice(&slice.get_mapped_range().ok()?);
                 buffer.unmap();
             }
+            self.report(timer, &program);
             return Some(());
         }
         if total > 0 && store.staging.as_ref().is_none_or(|(_, size)| *size < total) {
@@ -478,6 +470,7 @@ impl Gpu {
         }
         mark(store, &program);
         if total == 0 {
+            self.report(timer, &program);
             return Some(());
         }
         let out = store.staging.as_ref()?.0.clone();
@@ -493,7 +486,19 @@ impl Gpu {
             }
         }
         out.unmap();
+        self.report(timer, &program);
         Some(())
+    }
+
+    fn report(&self, timer: Option<crate::profile::PassTimer>, program: &Program) {
+        let Some(timer) = timer else { return };
+        if self.done().is_none() {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        timer.resolve(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        timer.report(program.passes.iter().map(|p| p.entry), |slice| self.map(slice, wgpu::MapMode::Read));
     }
 
     fn done(&self) -> Option<()> {
@@ -591,18 +596,7 @@ fn release_later(keep: fn(&str) -> bool, then: fn(&Gpu)) {
 // why: scratch buffers grow to the largest render (a zoomed window, an export band) and would stay that size; once
 // rendering settles they're dropped and the next render makes them again at its own size
 pub fn trim() {
-    release_later(
-        |name| !name.starts_with("tmp:") && !name.starts_with("keep:"),
-        |gpu| {
-            if std::env::var_os("FILMLAB_TRACE").is_some()
-                && let Ok(store) = gpu.store.lock()
-            {
-                let words: usize = store.buffers.values().map(|b| b.words).sum();
-                let sizes: Vec<String> = store.order.iter().map(|k| format!("{k} {:.1}", store.buffers.get(k).map_or(0, |b| b.words * 4) as f64 / 1_048_576.0)).collect();
-                eprintln!("gpu trim: {} buffers, {:.0} MB kept {sizes:?}, metal {:.0} MB", store.buffers.len(), (words * 4) as f64 / 1_048_576.0, gpu.allocated() as f64 / 1_048_576.0);
-            }
-        },
-    );
+    release_later(|name| !name.starts_with("tmp:") && !name.starts_with("keep:"), |_| ());
 }
 
 /// Drops every buffer, film textures included, for when no photo is open.

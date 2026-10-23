@@ -237,17 +237,19 @@ async fn once(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, name: &str, val
 }
 
 async fn call(hub: &Rc<Hub>, driver: &Driver, cx: &mut AsyncApp, name: &str, value: Value) -> Output {
-    let answer = match name {
-        "guide" => guide::guide(driver, cx, value),
-        "status" => surface::status(hub, driver, cx, value).await,
-        "photos" => surface::photos(hub, driver, cx, value).await,
-        "edit" => surface::edit(hub, driver, cx, value).await,
-        "look" => surface::look(hub, driver, cx, value).await,
-        "view" => surface::view(hub, driver, cx, value).await,
-        "profiles" => surface::profiles(hub, driver, cx, value).await,
-        _ => Err(format!("unknown tool {name}")),
-    };
-    answer.unwrap_or_else(Output::error)
+    let answer = crate::profile::tool(name, async {
+        match name {
+            "guide" => guide::guide(driver, cx, value),
+            "status" => surface::status(hub, driver, cx, value).await,
+            "photos" => surface::photos(hub, driver, cx, value).await,
+            "edit" => surface::edit(hub, driver, cx, value).await,
+            "look" => surface::look(hub, driver, cx, value).await,
+            "view" => surface::view(hub, driver, cx, value).await,
+            "profiles" => surface::profiles(hub, driver, cx, value).await,
+            _ => Err(format!("unknown tool {name}")),
+        }
+    });
+    answer.await.unwrap_or_else(Output::error)
 }
 
 /// One of the operations the tools route to, by name; one on several photos runs once per photo.

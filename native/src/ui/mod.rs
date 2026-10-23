@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod app;
-pub mod bench;
 pub mod browse;
 pub mod color_rail;
 pub mod controls;
@@ -20,7 +19,6 @@ pub mod quit;
 pub mod rail;
 pub mod range;
 pub mod slider;
-pub mod soak;
 pub mod theme;
 pub mod tools;
 pub mod wheels;

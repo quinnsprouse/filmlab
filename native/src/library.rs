@@ -269,6 +269,7 @@ fn finish(mut frame: core::Frame, state: &PhotoState, key: Option<&cache::Key>) 
 // thread that waited on a lock held by a render it is helping would deadlock the pool. A folder's first index is
 // what the user is waiting on, so it runs user-initiated on every core (edits, user-interactive, still come first)
 fn index_render(slot: usize, file: &PhotoFile, probed: &Probed, state: &PhotoState) -> Result<Rendered, String> {
+    let _zone = crate::profile::zone!("thumbnail index", slot);
     let bytes = std::fs::read(&file.path).map_err(|e| e.to_string())?;
     let film = render_film(state.film().as_ref());
     let mut engine = INDEX_ENGINES[slot % INDEXERS].lock().map_err(|e| e.to_string())?;
@@ -286,6 +287,7 @@ fn index_render(slot: usize, file: &PhotoFile, probed: &Probed, state: &PhotoSta
 // why: a refresh after an edit runs at utility QoS on the efficiency cores so it never slows the next edit, and
 // keeps the photo decoded because the next edit is most likely to the same photo
 fn refresh_render(path: &Path, probed: &Probed, state: &PhotoState) -> Result<Rendered, String> {
+    let _zone = crate::profile::zone!("thumbnail refresh");
     let key = cache::key(path);
     let film = render_film(state.film().as_ref());
     let mut refresher = REFRESHER.lock().map_err(|e| e.to_string())?;

@@ -16,6 +16,7 @@ lightcraft-raster = { git = "https://github.com/storytold/lightcraft", rev = "f3
 rayon = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 png = "0.18"
@@ -29,3 +30,6 @@ lightcraft-pipeline = { path = "vendor/lightcraft-pipeline" }
 lightcraft-raw = { path = "vendor/lightcraft-raw" }
 lightcraft-raster = { path = "vendor/lightcraft-raster" }
 lightcraft-codecs = { path = "vendor/lightcraft-codecs" }
+
+[features]
+profile = ["dep:tracing"]

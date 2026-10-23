@@ -564,6 +564,7 @@ impl CachedScene {
 pub struct Decoded(Loaded);
 
 pub fn decode(facts: &str, bytes: &[u8], max_edge: usize) -> Fallible<Decoded> {
+    let _zone = zone!("decode", max_edge, bytes = bytes.len());
     let f: Facts = parse(facts)?;
     let edge = if max_edge == 0 { usize::MAX } else { max_edge };
     let (image, info) = lightcraft_engine::files::load_bytes(bytes, edge).map_err(fail)?;
@@ -700,14 +701,12 @@ fn measure_ceiling(dev: &mut Developer, cached: &mut CachedScene) {
         let ceiling = match cached.ceiling {
             Some((k, ceiling)) if k == key => ceiling,
             _ => {
-                let ceiling = spent("ceiling", || dev.chain.ceiling(&cached.scene, dev.light.contrast));
+                let ceiling = spent!("film ceiling", dev.chain.ceiling(&cached.scene, dev.light.contrast));
                 cached.ceiling = Some((key, ceiling));
                 ceiling
             }
         };
-        if pipeline::profiling() {
-            eprintln!("  film halation ceiling: {ceiling:.4}");
-        }
+        note!(ceiling, "film halation ceiling");
         dev.texture = dev.texture.map(|t| t.with_ceiling(ceiling));
     }
 }
@@ -746,9 +745,9 @@ fn film_export(
     let frame = Size { w: fw, h: fh };
     let mut look = None;
     measure_ceiling(&mut dev, whole_look(req, &size_of, &render, &mut look, 0));
-    let scan = spent("export scan", || whole_scan(&dev, request, req, &size_of, &render, &mut look, 0));
+    let scan = spent!("export scan", whole_scan(&dev, request, req, &size_of, &render, &mut look, 0));
     let margin = dev.texture.map_or(0, |p| texture::margin(frame, &p));
-    let whole = spent("export capture", || capture_scene(Region::whole(fw, fh), || render(req)));
+    let whole = spent!("export capture", capture_scene(Region::whole(fw, fh), || render(req)));
     let band = |y: usize| Region { x: 0, y, w: fw, h: EXPORT_BAND.min(fh - y) };
     let part = |out: Region| {
         let scene = whole.part(out.grown(margin, frame));
@@ -760,13 +759,13 @@ fn film_export(
     // Otherwise the bands' toned rows are read back into the frame's own, without a buffer of their own and a copy
     let mut rgb = if bands { Vec::new() } else { vec![[0.0f32; 3]; fw * fh] };
     let mut image: Vec<[u8; 4]> = Vec::with_capacity(if bands { fw * fh } else { 0 });
-    let mut scene = (fh > 0).then(|| spent("band part", || part(band(0))));
-    let mut tex = scene.as_ref().map(|s| spent("band textured", || dev.band(s, band(0))));
+    let mut scene = (fh > 0).then(|| spent!("export band part", part(band(0))));
+    let mut tex = scene.as_ref().map(|s| spent!("export band textured", dev.band(s, band(0))));
     for y in (0..fh).step_by(EXPORT_BAND) {
         let out = band(y);
         let (Some(this), Some(textured)) = (scene.take(), tex.take()) else { break };
         // why: the next band is cut and sent to the GPU while the GPU textures this one
-        let next = (y + EXPORT_BAND < fh).then(|| spent("band part", || part(band(y + EXPORT_BAND))));
+        let next = (y + EXPORT_BAND < fh).then(|| spent!("export band part", part(band(y + EXPORT_BAND))));
         let mut own = Vec::new();
         let rows: &mut [[f32; 3]] = if bands {
             own = vec![[0.0f32; 3]; out.w * out.h];
@@ -774,14 +773,14 @@ fn film_export(
         } else {
             &mut rgb[y * fw..(y + out.h) * fw]
         };
-        if !spent("band finish", || dev.finish_into(&textured, &scan, rows)) && !dev.finish_into(&dev.textured_on_cpu(&this, out), &scan, rows) {
+        if !spent!("export band finish", dev.finish_into(&textured, &scan, rows)) && !dev.finish_into(&dev.textured_on_cpu(&this, out), &scan, rows) {
             return Err("the film stage failed on the CPU".into());
         }
-        tex = next.as_ref().map(|s| spent("band textured", || dev.band(s, band(y + EXPORT_BAND))));
+        tex = next.as_ref().map(|s| spent!("export band textured", dev.band(s, band(y + EXPORT_BAND))));
         scene = next;
         if bands {
             let toned = Arc::new(Toned { region: out, rgb: own, masks: whole.masks.clone(), part: true });
-            let rendered = spent("band final", || pipeline::film_hook::with_tone_hook(toned, || render(req)));
+            let rendered = spent!("export band final", pipeline::film_hook::with_tone_hook(toned, || render(req)));
             if (rendered.image.width, rendered.image.height) != (fw, out.h) {
                 return Err("an export band's final pass made the wrong rows".into());
             }
@@ -794,17 +793,7 @@ fn film_export(
         return Ok(pipeline::Rendered { image, histogram, deep: None });
     }
     let toned = Arc::new(Toned { region: Region::whole(fw, fh), rgb, masks: whole.masks.clone(), part: false });
-    Ok(spent("export final", || pipeline::film_hook::with_tone_hook(toned, || render(req))))
-}
-
-fn spent<R>(what: &str, f: impl FnOnce() -> R) -> R {
-    if !pipeline::profiling() {
-        return f();
-    }
-    let t = std::time::Instant::now();
-    let r = f();
-    eprintln!("  film {what}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-    r
+    Ok(spent!("export final", pipeline::film_hook::with_tone_hook(toned, || render(req))))
 }
 
 fn film_render(
@@ -833,12 +822,12 @@ fn film_render(
     let mut view = match job.view.filter(|c| c.key == key) {
         Some(c) => c,
         None => {
-            let scene = spent("capture", || capture_scene(region, || render(&capture, Lane::View)));
+            let scene = spent!("film capture", capture_scene(region, || render(&capture, Lane::View)));
             if stop::stopped() {
                 return Ok(stopped(None, job.look));
             }
             let fresh = CachedScene::new(key, scene);
-            spent("prefetch", || crate::gpu::prefetch(&fresh.scene));
+            spent!("film prefetch", crate::gpu::prefetch(&fresh.scene));
             fresh
         }
     };
@@ -857,12 +846,12 @@ fn film_render(
     }
     let textured_key = textured_key(request, &dev);
     let scan_key = scan_key(request, &dev);
-    let mut textured = spent("textured", || view.textured(&dev, &textured_key, out));
+    let mut textured = spent!("film textured", view.textured(&dev, &textured_key, out));
     let (scan, look) = if window.is_some() {
         let scan = whole_scan(&dev, request, req, &size_of, |r| render(r, Lane::Look), &mut look, job.look_key);
         (scan, look.ok_or("the whole-frame render is missing")?)
     } else {
-        let (scan, kept) = spent("scan", || view.scan(&dev, (&textured_key, &scan_key), textured.clone(), out, request.auto_scan));
+        let (scan, kept) = spent!("film scan", view.scan(&dev, (&textured_key, &scan_key), textured.clone(), out, request.auto_scan));
         textured = kept;
         (scan, view.look(job.look_key))
     };
@@ -870,7 +859,7 @@ fn film_render(
     let toned = match view.toned.as_ref().filter(|(k, _)| *k == toned_key) {
         Some((_, t)) => t.clone(),
         None => {
-            let t = match spent("finish", || dev.finish(&textured, &scan)) {
+            let t = match spent!("film finish", dev.finish(&textured, &scan)) {
                 Some(t) => t,
                 None => {
                     let cpu = view.on_cpu(&dev, &textured_key, out);
@@ -882,7 +871,7 @@ fn film_render(
             t
         }
     };
-    let rendered = spent("final", || pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View)));
+    let rendered = spent!("film final", pipeline::film_hook::with_tone_hook(toned, || render(&capture, Lane::View)));
     let keep = window.filter(|_| !finished_alone).map(|_| Region { x: out.x - region.x, y: out.y - region.y, w: out.w, h: out.h });
     Ok(FilmOutcome { rendered: Some(rendered), keep, view: Some(view), look: Some(look) })
 }
@@ -929,19 +918,6 @@ impl Engine {
         self.looks.remove(key);
     }
 
-    /// Bytes this engine's caches hold: decoded sources, stage caches, film scenes and whole-frame looks.
-    pub fn usage(&self) -> String {
-        let mb = |b: usize| b as f64 / 1_048_576.0;
-        let pixels = |v: &[[f32; 3]]| std::mem::size_of_val(v);
-        let cached = |c: &CachedScene| {
-            pixels(&c.scene.rgb) + c.textured.as_ref().map_or(0, |(_, t)| pixels(&t.rgb)) + c.toned.as_ref().map_or(0, |(_, t)| pixels(&t.rgb))
-        };
-        let sources: Vec<String> = self.sources.iter().map(|(k, l)| format!("{k} {:.0}", mb(l.source.image.data.len() * 12))).collect();
-        let stages: Vec<String> = self.stages.iter().map(|(k, c)| format!("{k} {:.0}", mb(c.bytes()))).collect();
-        let scenes: Vec<String> = self.scenes.iter().chain(&self.looks).map(|(k, c)| format!("{k} {:.0}", mb(cached(c)))).collect();
-        format!("sources [{}] stages [{}] scenes [{}]", sources.join(", "), stages.join(", "), scenes.join(", "))
-    }
-
     /// Drops every view's caches of a source (stage caches, film scenes, the whole-frame look) and keeps the source.
     pub fn forget_views(&mut self, key: &str) {
         let views = format!("{key}:");
@@ -978,6 +954,7 @@ impl Engine {
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
         let v: ViewRequest = parse(view)?;
         let req = v.request();
+        let _zone = zone!("render frame", zoomed = req.window.is_some(), draft = v.draft, film = v.film.is_some());
         let src = &loaded.source;
         let info = src.info_or(loaded.header.clone());
         // why: a pan's strips and the window it settles on are each a new window, so a zoomed view's stage cache keeps
@@ -1012,13 +989,13 @@ impl Engine {
         }
         let Some(mut rendered) = outcome.rendered.filter(|_| !stop::stopped()) else { return Ok(None) };
         let histogram = if v.draft { pipeline::drag_hdr_histogram } else { pipeline::hdr_histogram };
-        if let Some(h) = spent("hdr histogram", || histogram(&src.image, &info, s, &req)) {
+        if let Some(h) = spent!("hdr histogram", histogram(&src.image, &info, s, &req)) {
             rendered.histogram = h;
         }
         if stop::stopped() {
             return Ok(None);
         }
-        let (width, height, rgba) = spent("crop", || cropped(rendered.image.width, rendered.image.height, rendered.image.data, keep));
+        let (width, height, rgba) = spent!("crop", cropped(rendered.image.width, rendered.image.height, rendered.image.data, keep));
         Ok(Some(Frame { width: width as u32, height: height as u32, rgba, histogram: rendered.histogram.to_words() }))
     }
 
@@ -1035,6 +1012,7 @@ impl Engine {
     }
 
     fn export_file(&mut self, key: &str, facts: &str, state: &str, options: &str, film: &str) -> Fallible<Vec<u8>> {
+        let _zone = zone!("export file");
         let film: Option<FilmRequest> = parse(film)?;
         let loaded = self.sources.get(key).ok_or_else(|| fail(format!("{key} is not loaded")))?;
         let p = edited_photo(&parse(facts)?, parse(state)?);
@@ -1070,7 +1048,7 @@ impl Engine {
             m.software = Some("Filmlab".into());
             m
         });
-        spent("export encode", || encode_rendered(&rendered, &o, meta.as_ref()))
+        spent!("export encode", encode_rendered(&rendered, &o, meta.as_ref()))
     }
 }
 

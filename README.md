@@ -38,6 +38,27 @@ same settings. Every pixel has to match. `scripts/fixtures.sh` downloads that ra
 `native/scripts/e2e.sh <photo folder>` runs the app's built-in end-to-end script on a copy of a folder and saves
 screenshots.
 
+## Profile
+
+The release build keeps line tables, so samply and Instruments name Filmlab's own functions:
+
+```sh
+cd native && cargo build --release
+samply record ./target/release/filmlab
+xcrun xctrace record --template 'Time Profiler' --launch -- ./target/release/filmlab
+```
+
+Two cargo features add profilers. Neither is in the default or the shipped build.
+
+- `--features profile` sends zones to [Tracy](https://github.com/wolfpld/tracy) 0.14 (`brew install tracy`). Zones
+  cover decodes, develop renders, the film stages, export stages, GPU programs, present, thumbnails and MCP tool calls.
+  Each GPU pass is a GPU zone, each presented photo frame is a frame, and the heap's allocations are tracked. Run
+  `cargo run --release --features profile`, then connect Tracy to 127.0.0.1. `tracy-capture -o run.tracy` records the
+  same thing to a file. The client speaks Tracy 0.14's protocol, so update `tracing-tracy` together with the profiler.
+- `--features dhat` records the heap with [dhat](https://docs.rs/dhat) and writes `dhat-heap.json` to the working
+  folder when Filmlab quits. Open the file in the
+  [DHAT viewer](https://nnethercote.github.io/dh_view/dh_view.html) to see the peak and the stacks that allocated it.
+
 ## Package
 
 `native/scripts/bundle.sh` builds `Filmlab.app`, a zip and a DMG in `native/target-dist/bundle`. Set

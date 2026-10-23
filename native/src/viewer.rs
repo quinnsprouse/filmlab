@@ -204,6 +204,7 @@ impl Viewer {
         if self.parked || (!self.dirty && self.drawn == Some(scene)) {
             return false;
         }
+        let _zone = crate::profile::zone!("present");
         if self.target.is_none() {
             self.target = Target::new(&self.screen, &self.view);
         }
@@ -254,6 +255,7 @@ impl Viewer {
         let _ = self.screen.device.poll(wgpu::PollType::Poll);
         self.drawn = Some(scene);
         self.dirty = false;
+        crate::profile::presented();
         true
     }
 
