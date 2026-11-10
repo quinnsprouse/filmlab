@@ -14,31 +14,6 @@ const SLICE: Duration = Duration::from_millis(2);
 const STALL: Duration = Duration::from_secs(10);
 const STORAGE: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const WRITABLE: [u32; 3] = [2, 7, 9];
-const ENTRIES: [&str; 23] = [
-    "code",
-    "blurVertical",
-    "blurHorizontal",
-    "lumaPlane",
-    "reduce",
-    "boxVertical",
-    "boxHorizontal",
-    "detail",
-    "defocusVertical",
-    "defocusHorizontal",
-    "grainNoise",
-    "grainVertical",
-    "grainHorizontal",
-    "softVertical",
-    "grainApply",
-    "dust",
-    "samples",
-    "finish",
-    "halationLayers",
-    "pyramidReduce",
-    "pyramidBlur",
-    "pyramidExpand",
-    "pyramidCombine",
-];
 
 struct Stored {
     buffer: wgpu::Buffer,
@@ -185,9 +160,8 @@ impl Gpu {
         let checks = wgpu::ShaderRuntimeChecks { bounds_checks: false, force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::default() };
         let module = unsafe { device.create_shader_module_trusted(wgpu::ShaderModuleDescriptor { label: Some("film"), source: wgpu::ShaderSource::Wgsl(shader().into()) }, checks) };
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
-        let pipelines = ENTRIES
-            .iter()
-            .map(|&name| {
+        let pipelines = entry_points()
+            .map(|name| {
                 let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(name),
                     layout: Some(&pipeline_layout),
@@ -349,7 +323,12 @@ impl Gpu {
         self.execute_inner(program)
     }
 
+    fn pipeline(&self, entry: &str) -> &wgpu::ComputePipeline {
+        self.pipelines.get(entry).unwrap_or_else(|| panic!("film.wgsl has no compute entry point `{entry}`"))
+    }
+
     fn execute_inner(&self, mut program: Program) -> Option<()> {
+        let pipelines: Vec<&wgpu::ComputePipeline> = program.passes.iter().map(|p| self.pipeline(p.entry)).collect();
         let _turn = self.turns.take(crate::perf::urgent())?;
         let mut store = self.store.lock().ok()?;
         let store = &mut *store;
@@ -381,18 +360,22 @@ impl Gpu {
         // why: a copy target (the frame's LUTs side by side) that already holds these sources at these offsets is left as it is
         let mut targets: Vec<&str> = program.copies.iter().map(|c| c.to).collect();
         targets.dedup();
+        let mut filled = Vec::new();
         for to in targets {
             let copies = program.copies.iter().filter(|c| c.to == to);
             let sources: Option<Vec<String>> = copies.clone().map(|c| store.buffers.get(&c.from).and_then(|f| f.holds.as_ref()).map(|h| format!("{h}@{}", c.offset))).collect();
             let holds = sources.map(|s| s.join(","));
-            if holds.is_some() && store.buffers.get(to)?.holds == holds {
+            let target = store.buffers.get_mut(to)?;
+            let held = holds.is_some() && target.holds == holds;
+            target.holds = None;
+            filled.push((to, holds));
+            if held {
                 continue;
             }
             for c in copies {
                 let from = store.buffers.get(&c.from)?;
                 encoder.copy_buffer_to_buffer(&from.buffer, 0, &store.buffers.get(to)?.buffer, (c.offset * 4) as u64, Some((from.words * 4) as u64));
             }
-            store.buffers.get_mut(to)?.holds = holds;
         }
         for (_, name) in program.passes.iter().flat_map(|p| &p.bind).filter(|(b, _)| WRITABLE.contains(b)) {
             store.buffers.get_mut(name)?.holds = None;
@@ -420,8 +403,7 @@ impl Gpu {
         // why: one compute pass holds every dispatch (a serial Metal encoder orders them), instead of an encoder each;
         // timing passes needs one each, as Metal timestamps only a pass's start and end
         let mut compute = timer.is_none().then(|| encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()).forget_lifetime());
-        for (k, (pass, bind)) in program.passes.iter().zip(&binds).enumerate() {
-            let pipeline = self.pipelines.get(pass.entry)?;
+        for (k, ((pass, bind), pipeline)) in program.passes.iter().zip(&binds).zip(pipelines).enumerate() {
             let groups = (pass.groups[0].max(1) as u32, pass.groups[1].max(1) as u32);
             if let Some(compute) = compute.as_mut() {
                 compute.set_pipeline(pipeline);
@@ -441,7 +423,6 @@ impl Gpu {
             if pollster::block_on(scope.pop()).is_some() {
                 return None;
             }
-            mark(store, &program);
             for read in program.reads.iter_mut().filter(|r| !r.into.is_empty()) {
                 let buffer = store.buffers.get(&read.buffer)?.buffer.clone();
                 let slice = buffer.slice(..(read.into.len() * 4) as u64);
@@ -449,6 +430,7 @@ impl Gpu {
                 bytemuck::cast_slice_mut(read.into).copy_from_slice(&slice.get_mapped_range().ok()?);
                 buffer.unmap();
             }
+            mark(store, &program, filled);
             self.report(timer, &program);
             return Some(());
         }
@@ -468,8 +450,8 @@ impl Gpu {
         if pollster::block_on(scope.pop()).is_some() {
             return None;
         }
-        mark(store, &program);
         if total == 0 {
+            mark(store, &program, filled);
             self.report(timer, &program);
             return Some(());
         }
@@ -486,6 +468,7 @@ impl Gpu {
             }
         }
         out.unmap();
+        mark(store, &program, filled);
         self.report(timer, &program);
         Some(())
     }
@@ -510,12 +493,21 @@ impl Gpu {
     }
 }
 
-fn mark(store: &mut Store, program: &Program) {
+fn mark(store: &mut Store, program: &Program, filled: Vec<(&str, Option<String>)>) {
+    for (to, holds) in filled {
+        if let Some(b) = store.buffers.get_mut(to) {
+            b.holds = holds;
+        }
+    }
     for k in program.keep.iter().filter(|k| !k.need) {
         if let Some(b) = store.buffers.get_mut(k.buffer) {
             b.holds = Some(k.id.clone());
         }
     }
+}
+
+fn entry_points() -> impl Iterator<Item = &'static str> {
+    SHADER.split("@compute").skip(1).filter_map(|after| after.split_once("fn ")?.1.split_once('(').map(|(name, _)| name.trim()))
 }
 
 // why: naga can't evaluate bitcast in a const expression; each one is a
