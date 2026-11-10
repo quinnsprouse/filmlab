@@ -195,11 +195,14 @@ pub struct GrainRequest {
     pub size: f32,
     pub softness: f32,
     pub defocus: f32,
+    pub structure: Structure,
+    pub color: f32,
+    pub highlights: f32,
 }
 
 impl Default for GrainRequest {
     fn default() -> Self {
-        GrainRequest { amount: 0.0995, size: 1.0, softness: 0.05, defocus: 1.0 }
+        GrainRequest { amount: 0.0995, size: 1.0, softness: 0.05, defocus: 1.0, structure: Structure::Cine, color: 0.0, highlights: 1.0 }
     }
 }
 
@@ -256,9 +259,23 @@ impl Default for FilmRequest {
     }
 }
 
+impl GrainRequest {
+    fn params(self) -> GrainParams {
+        GrainParams { amount: self.amount, size: self.size, softness: self.softness, defocus: self.defocus, structure: self.structure, color: self.color, highlights: self.highlights, seed: 0 }
+    }
+}
+
 impl FilmRequest {
+    fn textured_grain(&self) -> Option<GrainParams> {
+        self.grain.map(|g| g.params().textured_part())
+    }
+
+    pub fn finished_grain(&self) -> Option<GrainParams> {
+        self.grain.map(GrainRequest::params).filter(|g| self.texture && g.grains_in_finish())
+    }
+
     pub fn texture_params(&self, native: Size) -> Option<TextureParams> {
-        let grain = self.grain.map(|g| GrainParams { amount: g.amount, size: g.size, softness: g.softness, defocus: g.defocus, seed: 0 });
+        let grain = self.textured_grain();
         let d = self.dust;
         let dust = d.on.then(|| DustParams { size: d.size, softness: d.softness, rows: DustParams::rows_of(native) });
         let h = self.halation;
@@ -267,7 +284,7 @@ impl FilmRequest {
     }
 
     pub fn texture_key(&self) -> String {
-        format!("{}{:?}{:?}{:?}{:?}", self.texture, self.blur, self.grain, self.dust, self.halation)
+        format!("{}{:?}{:?}{:?}{:?}", self.texture, self.blur, self.textured_grain(), self.dust, self.halation)
     }
 }
 
@@ -497,7 +514,7 @@ use rayon::prelude::*;
 
 use crate::dust::DustParams;
 use crate::halation::HalationParams;
-use crate::grain::GrainParams;
+use crate::grain::{Grain, GrainParams, Structure};
 use crate::texture::{self, Plane, Region, Size, TextureParams};
 
 pub struct Capture {
@@ -617,6 +634,7 @@ pub struct Textured {
     pub(crate) rgb: Vec<[f32; 3]>,
     pub(crate) gpu: bool,
     pub(crate) lumas: Option<((u64, u64), Vec<f32>)>,
+    pub(crate) frame: Size,
 }
 
 impl Drop for Textured {
@@ -642,6 +660,7 @@ pub struct Developer {
     pub chain: FilmChain,
     pub light: Light,
     pub texture: Option<TextureParams>,
+    pub grain: Option<GrainParams>,
 }
 
 impl Developer {
@@ -668,7 +687,7 @@ impl Developer {
             Some(p) => texture::texture(code, scene.frame, out, p),
             None => crop(&code, out),
         };
-        Textured { id: next_id(), region: out, rgb, gpu: false, lumas: None }
+        Textured { id: next_id(), region: out, rgb, gpu: false, lumas: None, frame: scene.frame }
     }
 
     fn stocks(&self) -> (u64, u64) {
@@ -691,7 +710,8 @@ impl Developer {
         if textured.gpu {
             return crate::gpu::finish(self, textured, scan);
         }
-        let rgb = textured.rgb.par_iter().map(|c| self.toned(*c, scan)).collect();
+        let mut rgb = vec![[0.0f32; 3]; textured.rgb.len()];
+        self.finish_into(textured, scan, &mut rgb);
         Some(Toned { region: textured.region, rgb, masks: None, part: false })
     }
 
@@ -703,12 +723,15 @@ impl Developer {
         if out.len() != textured.rgb.len() {
             return false;
         }
-        out.par_iter_mut().zip(textured.rgb.par_iter()).for_each(|(o, c)| *o = self.toned(*c, scan));
+        let toned = |display: [f32; 3]| self.chain.to_working(scan.linear(display));
+        let Some(g) = self.grain else {
+            out.par_iter_mut().zip(textured.rgb.par_iter()).for_each(|(o, c)| *o = toned(self.chain.display_of(*c)));
+            return true;
+        };
+        let grain = Grain::new(textured.frame, &g);
+        let fields = grain.channel_fields(textured.frame, textured.region, g.seed);
+        out.par_iter_mut().zip(textured.rgb.par_iter().zip(&fields)).for_each(|(o, (c, z))| *o = toned(grain.mix.symmetric_display(*c, *z, |c| self.chain.display_of(c))));
         true
-    }
-
-    fn toned(&self, code: [f32; 3], scan: &Scan) -> [f32; 3] {
-        self.chain.to_working(scan.linear(self.chain.display_of(code)))
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::film::{CubeLut, Developer, Scan, Scene, Textured, Toned, contrast_slope, next_id};
 use crate::dust;
-use crate::grain::{self, Field, GrainParams};
+use crate::grain::{self, Field, Grain, GrainParams};
 use crate::grain_tables::DOMAIN;
 use crate::halation;
 use crate::pyramid::Span;
@@ -31,6 +31,7 @@ const ACCUMULATE: u32 = 64;
 const LUMA: u32 = 128;
 const ADD: u32 = 256;
 const SINGLE: u32 = 512;
+const LAYERS: u32 = 1024;
 const SAMPLES: usize = 60_000;
 const GROUP: usize = 16;
 
@@ -389,8 +390,10 @@ struct Weights {
     blur: usize,
     defocus: [u32; 2],
     soft: [u32; 2],
-    kernel: [u32; 2],
-    grain: Option<(GrainParams, Field)>,
+    kernel: u32,
+    layers: u32,
+    mix: u32,
+    grain: Option<(GrainParams, Grain)>,
     halation: Option<HalationAt>,
 }
 
@@ -399,22 +402,21 @@ impl Weights {
         let Some(p) = dev.texture else { return Weights::default() };
         let data = texture::blur_weights(frame, &p);
         let mut w = Weights { blur: data.len(), data, ..Weights::default() };
-        let at = |w: &Weights| (TABLE_WORDS + w.data.len()) as u32;
         if let Some(h) = texture::halation_of(frame, &p) {
             let blur = |o: &halation::Octave, w: &mut Weights| {
-                let kernel = at(w);
+                let kernel = w.at();
                 w.data.extend(&o.kernel);
-                let down = at(w);
+                let down = w.at();
                 w.data.extend(&o.down);
-                let up = at(w);
+                let up = w.at();
                 w.data.extend(&o.up);
                 Blur { level: o.level, at: kernel, radius: (o.kernel.len() / 2) as u32, down, down_radius: (o.down.len() / 2) as u32, up }
             };
             let octaves = [blur(&h.octaves[0], &mut w), blur(&h.octaves[1], &mut w), blur(&h.octaves[2], &mut w)];
             let mask = h.mask.as_ref().map(|m| blur(m, &mut w));
-            let weights = at(&w);
+            let weights = w.at();
             w.data.extend(h.weights.as_flattened());
-            let total = at(&w);
+            let total = w.at();
             w.data.extend((0..3).map(|j| h.weights[0][j] + h.weights[1][j] + h.weights[2][j]));
             // halation::Headroom, after the totals: on, knee, span, range, most
             let r = h.headroom;
@@ -423,17 +425,39 @@ impl Weights {
         }
         let Some(g) = p.grain else { return w };
         let defocus = grain::defocus_weights(frame, &g);
-        w.defocus = [at(&w), (defocus.len() / 2) as u32];
+        w.defocus = [w.at(), (defocus.len() / 2) as u32];
         w.data.extend(defocus);
         if g.grains() {
-            let field = Field::new(frame, &g);
-            w.soft = [at(&w), (field.soft.len() / 2) as u32];
-            w.data.extend(&field.soft);
-            w.kernel = [at(&w), field.kernel.radius as u32];
-            w.data.extend(field.kernel.words());
-            w.grain = Some((g, field));
+            w.add_grain(frame, g);
         }
         w
+    }
+
+    fn finished(dev: &Developer, frame: Size) -> Weights {
+        let mut w = Weights::default();
+        if let Some(g) = dev.grain {
+            w.add_grain(frame, g);
+        }
+        w
+    }
+
+    fn at(&self) -> u32 {
+        (TABLE_WORDS + self.data.len()) as u32
+    }
+
+    fn add_grain(&mut self, frame: Size, g: GrainParams) {
+        let grain = Grain::new(frame, &g);
+        self.soft = [self.at(), (grain.shared.soft.len() / 2) as u32];
+        self.data.extend(&grain.shared.soft);
+        self.kernel = self.at();
+        self.data.extend(grain.shared.kernel.words());
+        if let Some(layers) = &grain.layers {
+            self.layers = self.at();
+            self.data.extend(layers.kernel.words());
+        }
+        self.mix = self.at();
+        self.data.extend(grain.mix.words());
+        self.grain = Some((g, grain));
     }
 }
 
@@ -695,30 +719,57 @@ fn defocus_passes<'a>(program: &mut Program, base: Frame, weights: &Weights, wid
     target
 }
 
+fn pass(program: &mut Program, entry: &'static str, frame: Frame, bind: Vec<(u32, String)>) {
+    let groups = groups(frame.dst);
+    program.passes.push(Pass { entry, params: frame.words(), bind, groups });
+}
+
+fn tables_bound() -> (u32, String) {
+    (4, "tables".to_string())
+}
+
 fn grain_passes(program: &mut Program, base: Frame, weights: &Weights, frame: Size, out: Region, code: &str, tex: &str) {
-    let Some((g, field)) = &weights.grain else { return };
-    let (m, r, rs) = (field.margin, field.kernel.radius as u32, field.soft.len() / 2);
+    if let Some((apply, fields)) = field_passes(program, base, weights, frame, out) {
+        pass(program, "grainApply", apply, vec![(6, fields), (1, code.into()), (2, tex.into()), tables_bound()]);
+    }
+}
+
+fn field_passes<'a>(program: &mut Program, base: Frame<'a>, weights: &Weights, frame: Size, out: Region) -> Option<(Frame<'a>, String)> {
+    let (g, grain) = weights.grain.as_ref()?;
+    let rs = grain.shared.soft.len() / 2;
+    let m = grain.layers.as_ref().map_or(grain.shared.margin, |l| l.margin.max(grain.shared.margin));
     let (nw, nh, vh, zw) = (out.w + 2 * m, out.h + 2 * m, out.h + 2 * rs, out.w + 2 * rs);
-    let [ox, oy] = field.origin(frame, out);
-    let kernel = [0, 0, weights.kernel[0], 0];
-    let soft = [0, 0, weights.soft[0], 0];
-    for (name, words) in [("tmp:noise", nw * nh), ("tmp:columns", nw * vh * 3), ("tmp:field", zw * vh), ("tmp:soft", zw * out.h)] {
+    let planes = if grain.layers.is_some() { 4 } else { 1 };
+    for (name, words) in [("tmp:noise", nw * nh), ("tmp:columns", nw * vh * 3), ("tmp:field", zw * vh * planes), ("tmp:soft", zw * out.h * planes)] {
         program.buffer(name, words);
     }
-    let mut pass = |entry: &'static str, frame: Frame, bind: Vec<(u32, String)>| {
-        let groups = groups(frame.dst);
-        program.passes.push(Pass { entry, params: frame.words(), bind, groups });
+    let mut field = |field: &Field, kernel: u32, seed: u32, plane: usize| {
+        let (m, r) = (field.margin, field.kernel.radius as u32);
+        let (nw, nh) = (out.w + 2 * m, out.h + 2 * m);
+        let [ox, oy] = field.origin(frame, out);
+        let aux = [0, (plane * zw * vh) as u32, kernel, 0];
+        pass(program, "grainNoise", Frame { dst: local(nw, nh), count: seed, aux: [ox as u32, oy as u32, 0, 0], ..base }, vec![(7, "tmp:noise".into()), tables_bound()]);
+        pass(program, "grainVertical", Frame { src: local(nw, nh), dst: local(nw, vh), radius: r, aux, ..base }, vec![(6, "tmp:noise".into()), (2, "tmp:columns".into()), tables_bound()]);
+        pass(program, "grainHorizontal", Frame { src: local(nw, vh), dst: local(zw, vh), radius: r, aux, ..base }, vec![(1, "tmp:columns".into()), (7, "tmp:field".into()), tables_bound()]);
     };
-    let t = || (4, "tables".to_string());
-    pass("grainNoise", Frame { dst: local(nw, nh), count: g.seed, aux: [ox as u32, oy as u32, 0, 0], ..base }, vec![(7, "tmp:noise".into()), t()]);
-    pass("grainVertical", Frame { src: local(nw, nh), dst: local(nw, vh), radius: r, aux: kernel, ..base }, vec![(6, "tmp:noise".into()), (2, "tmp:columns".into()), t()]);
-    pass("grainHorizontal", Frame { src: local(nw, vh), dst: local(zw, vh), radius: r, aux: kernel, ..base }, vec![(1, "tmp:columns".into()), (7, "tmp:field".into()), t()]);
+    field(&grain.shared, weights.kernel, g.seed, 0);
+    if let Some(layers) = &grain.layers {
+        for (k, seed) in Grain::layer_seeds(g.seed).into_iter().enumerate() {
+            field(layers, weights.layers, seed, k + 1);
+        }
+    }
     let smooth = if rs > 0 { "tmp:soft" } else { "tmp:field" };
     if rs > 0 {
-        pass("softVertical", Frame { src: local(zw, vh), dst: local(zw, out.h), radius: rs as u32, aux: soft, ..base }, vec![(6, "tmp:field".into()), (7, "tmp:soft".into()), t()]);
+        for plane in 0..planes {
+            let aux = [(plane * zw * vh) as u32, (plane * zw * out.h) as u32, weights.soft[0], 0];
+            let soft = Frame { src: local(zw, vh), dst: local(zw, out.h), radius: rs as u32, aux, ..base };
+            pass(program, "softVertical", soft, vec![(6, "tmp:field".into()), (7, "tmp:soft".into()), tables_bound()]);
+        }
     }
-    let apply = Frame { src: local(zw, out.h), dst: local(out.w, out.h), radius: rs as u32, aux: soft, scale: g.scale(), ..base };
-    pass("grainApply", apply, vec![(6, smooth.into()), (1, code.into()), (2, tex.into()), t()]);
+    let flags = if grain.layers.is_some() { LAYERS } else { 0 };
+    let aux = [0, 0, weights.soft[0], weights.mix];
+    let apply = Frame { flags, src: local(zw, out.h), dst: local(out.w, out.h), radius: rs as u32, count: (zw * out.h) as u32, aux, scale: g.scale(), ..base };
+    Some((apply, smooth.to_string()))
 }
 
 fn region_words(r: Region) -> [u32; 4] {
@@ -806,10 +857,11 @@ fn texture_run(dev: &Developer, scene: &Scene, out: Region, lumas: bool, weights
         program.buffer(&tex, out.w * out.h * 3);
     }
     let mut samples = vec![0.0f32; if lumas { sample_count(out) } else { 0 }];
+    let done = |samples: Vec<f32>| (Textured { id, region: out, rgb: Vec::new(), gpu: true, lumas: None, frame: scene.frame }, lumas.then_some(samples));
     if reuse {
         texture_passes(&mut program, dev, &plan, &code, &tex, &[], weights, keep);
         sample_pass(&mut program, dev, &tex, &luts, out, &mut samples);
-        return program.run().then(|| (Textured { id, region: out, rgb: Vec::new(), gpu: true, lumas: None }, lumas.then_some(samples)));
+        return program.run().then(|| done(samples));
     }
     let scene_buffer = program.upload(scene_name(scene), &scene.rgb[..], false);
     program.buffer(&code, region.w * region.h * 3);
@@ -834,7 +886,7 @@ fn texture_run(dev: &Developer, scene: &Scene, out: Region, lumas: bool, weights
     if lumas {
         sample_pass(&mut program, dev, &tex, &luts, out, &mut samples);
     }
-    program.run().then(|| (Textured { id, region: out, rgb: Vec::new(), gpu: true, lumas: None }, lumas.then_some(samples)))
+    program.run().then(|| done(samples))
 }
 
 pub fn lumas(dev: &Developer, textured: &Textured) -> Option<Vec<f32>> {
@@ -864,17 +916,21 @@ pub fn finish_into(dev: &Developer, textured: &Textured, scan: &Scan, out: &mut 
     if !textured.gpu || out.len() != r.w * r.h {
         return false;
     }
+    let weights = Weights::finished(dev, textured.frame);
     let mut program = Program::default();
-    tables(&mut program, dev, Some(scan), &[]);
+    tables(&mut program, dev, Some(scan), &weights.data);
     let luts = luts(&mut program, dev);
     program.buffer("tmp:toned", r.w * r.h * 3);
-    let frame = Frame { flags: 0, radius: 0, count: 0, src: r, dst: r, bounds: [0; 4], taps: [0; 4], aux: [0; 4], scale: 0.0, dev };
-    program.passes.push(Pass {
-        entry: "finish",
-        params: frame.words(),
-        bind: vec![(1, format!("tex:{}", textured.id)), (3, luts), (4, "tables".into()), (2, "tmp:toned".into())],
-        groups: groups(r),
-    });
+    let base = Frame { flags: 0, radius: 0, count: 0, src: r, dst: r, bounds: [0; 4], taps: [0; 4], aux: [0; 4], scale: 0.0, dev };
+    let mut bind = vec![(1, format!("tex:{}", textured.id)), (3, luts), tables_bound(), (2, "tmp:toned".into())];
+    let (entry, frame) = match field_passes(&mut program, base, &weights, textured.frame, r) {
+        Some((grained, fields)) => {
+            bind.push((6, fields));
+            ("finishGrain", grained)
+        }
+        None => ("finish", base),
+    };
+    pass(&mut program, entry, frame, bind);
     program.reads.push(Read { buffer: "tmp:toned".into(), into: out.as_flattened_mut() });
     program.run()
 }

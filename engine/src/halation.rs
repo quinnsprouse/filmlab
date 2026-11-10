@@ -196,7 +196,7 @@ impl Halation {
             return None;
         }
         let (amount, hue, sat) = (f64::from(p.amount), f64::from(p.hue), f64::from(p.sat));
-        let s0 = SIGMA0 * (f64::from(p.radius) / 4.0) * (frame.h as f64 / 1600.0);
+        let s0 = SIGMA0 * (f64::from(p.radius) / 4.0) * (frame.short_edge() as f64 / 1600.0);
         let per_layer: [[f64; 3]; 3] = std::array::from_fn(|j| layer_weights(amount, std::array::from_fn(|k| layer_share(j, k, hue, sat))));
         let weights = std::array::from_fn(|k| std::array::from_fn(|j| per_layer[j][k] as f32));
         let octaves = std::array::from_fn(|k| Octave::of(s0 * f64::from(1u32 << k), KERNEL_TRUNCATE));

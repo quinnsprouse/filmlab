@@ -18,7 +18,7 @@ use super::slider::ParamSlider;
 use super::wheels::{GradingWheels, Tint, Wheel};
 use super::{icon, theme};
 use crate::develop::Develop;
-use crate::film::{FilmSettings, GAUGES};
+use crate::film::{FilmSettings, GAUGES, Gauge, Structure};
 use crate::menu::Entry;
 use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
@@ -239,7 +239,7 @@ fn needs_stock() -> AnyElement {
 // why: Film Look Creator's own halation controls, as FilmVision's PowerGrade sets them
 fn halation_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let h = film.halation;
-    let stock = crate::film::Halation::stock(film.gauge().unwrap_or(crate::film::Gauge::G65));
+    let stock = crate::film::Halation::stock(film.gauge().unwrap_or_default());
     let edit = |develop: &Entity<Develop>, film: &FilmSettings, key: &'static str, label: String, change: Box<dyn Fn(&mut crate::film::Halation)>| {
         let mut next = film.clone();
         change(&mut next.halation);
@@ -280,7 +280,9 @@ fn halation_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<
 
 fn grain_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Develop>) -> Rows {
     let g = film.grain;
-    let fallback = crate::film::Gauge::G65.grain();
+    let stills = g.structure == Structure::Stills;
+    let reset = Gauge::default();
+    let (fallback, fallback_blur) = if stills { (reset.grain(), reset.blur()) } else { (reset.cine_grain(), reset.cine_blur()) };
     let gauge = film.gauge();
     let mut options: Vec<(SharedString, bool)> = GAUGES.iter().map(|g| (SharedString::from(g.label()), Some(*g) == gauge)).collect();
     if gauge.is_none() {
@@ -299,6 +301,25 @@ fn grain_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Dev
         .label("Gauge")
         .into_any_element(),
     ];
+    let (d, f) = (develop.clone(), film.clone());
+    rows.push(
+        Segmented::new("grain-structure", vec![("Stills".into(), stills), ("Cine".into(), !stills)], move |i, _, cx| {
+            let structure = if i == 0 { Structure::Stills } else { Structure::Cine };
+            if structure == f.grain.structure {
+                return;
+            }
+            let mut next = f.clone();
+            match f.grain_gauge() {
+                Some(gauge) if structure == Structure::Stills => (next.grain, next.blur) = (gauge.grain(), gauge.blur()),
+                Some(gauge) => (next.grain, next.blur) = (gauge.cine_grain(), gauge.cine_blur()),
+                None => next.grain.structure = structure,
+            }
+            let label = format!("Grain structure {}", if i == 0 { "stills" } else { "cine" });
+            d.update(cx, |d, cx| d.edit_film(next, &label, "film.grain.structure", cx));
+        })
+        .label("Structure")
+        .into_any_element(),
+    );
     let slider = |id: &'static str, label: &'static str, value: f64, min: f64, max: f64, step: f64, reset: f64, apply: fn(&mut FilmSettings, f64)| {
         let (d, f) = (develop.clone(), film.clone());
         ParamSlider::new(id, label, value, min, max)
@@ -315,8 +336,12 @@ fn grain_rows(film: &FilmSettings, marks: &HashSet<String>, develop: &Entity<Dev
     rows.push(slider("film.grain.amount", "Amount", (g.amount * 1000.0).round() / 10.0, 0.0, 100.0, 0.5, fallback.amount * 100.0, |f, v| f.grain.amount = v / 100.0));
     rows.push(slider("film.grain.size", "Size", g.size, 0.0, 4.0, 0.1, fallback.size, |f, v| f.grain.size = v));
     rows.push(slider("film.grain.softness", "Softness", (g.softness * 100.0).round(), 0.0, 100.0, 1.0, fallback.softness * 100.0, |f, v| f.grain.softness = v / 100.0));
+    if stills {
+        rows.push(slider("film.grain.color", "Color", (g.color * 100.0).round(), 0.0, 100.0, 1.0, fallback.color * 100.0, |f, v| f.grain.color = v / 100.0));
+        rows.push(slider("film.grain.highlights", "Highlights", (g.highlights * 100.0).round(), 0.0, 100.0, 1.0, fallback.highlights * 100.0, |f, v| f.grain.highlights = v / 100.0));
+    }
     rows.push(slider("film.grain.defocus", "Defocus", ((1.0 - g.defocus) * 100.0).round(), 0.0, 50.0, 1.0, (1.0 - fallback.defocus) * 100.0, |f, v| f.grain.defocus = 1.0 - v / 100.0));
-    rows.push(slider("film.blur", "Film blur", (film.blur * 1000.0).round() / 10.0, 0.0, 20.0, 0.5, 5.0, |f, v| f.blur = v / 100.0));
+    rows.push(slider("film.blur", "Film blur", (film.blur * 1000.0).round() / 10.0, 0.0, 20.0, 0.5, fallback_blur * 100.0, |f, v| f.blur = v / 100.0));
     rows
 }
 

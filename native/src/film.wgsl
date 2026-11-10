@@ -48,6 +48,7 @@ const coefficientsFlag = 4u;
 const candidateFlag = 8u;
 const highlightsFlag = 16u;
 const lumaFlag = 128u;
+const layersFlag = 1024u;
 
 const log2At = 0u;
 const exp2At = 4097u;
@@ -92,7 +93,6 @@ const kneeStart = bitcast<f32>(0x3f428f5cu);
 const kneeSteps = 320u;
 const tailStart = bitcast<f32>(0x3f8a3d71u);
 const tailEnd = 2.0;
-const grainOffset = bitcast<f32>(0x3ddb22d1u);
 const flattenAmount = bitcast<f32>(0x3b72bb74u);
 const flattenNorm = bitcast<f32>(0x3f7d1a22u);
 const minusTwoLn2 = bitcast<f32>(0xbfb17218u);
@@ -540,15 +540,18 @@ fn samples(@builtin(global_invocation_id) id: vec3u) {
   dst1[id.x] = luma(d);
 }
 
+fn toned(d: vec3f) -> vec3f {
+  let lin = vec3f(scanLinear(d.x), scanLinear(d.y), scanLinear(d.z));
+  return vec3f(row(params.rec[0], lin), row(params.rec[1], lin), row(params.rec[2], lin));
+}
+
 @compute @workgroup_size(16, 16)
 fn finish(@builtin(global_invocation_id) id: vec3u) {
   if (outside(id)) {
     return;
   }
   let i = id.y * params.dst.z + id.x;
-  let d = display(read3(i));
-  let lin = vec3f(scanLinear(d.x), scanLinear(d.y), scanLinear(d.z));
-  write3(i, vec3f(row(params.rec[0], lin), row(params.rec[1], lin), row(params.rec[2], lin)));
+  write3(i, toned(display(read3(i))));
 }
 
 fn forward(v: f32) -> f32 {
@@ -668,7 +671,7 @@ fn grainHorizontal(@builtin(global_invocation_id) id: vec3u) {
     let c = read3(id.y * params.src.z + id.x + t);
     sum = vec3f(add(sum.x, mul(tables[at + t], c.x)), add(sum.y, mul(tables[at + 2u * taps + t], c.y)), add(sum.z, mul(tables[at + 4u * taps + t], c.z)));
   }
-  dst1[id.y * params.dst.z + id.x] = flatten(add(add(add(0.0, sum.x), sum.y), sum.z));
+  dst1[params.aux.y + id.y * params.dst.z + id.x] = flatten(add(add(add(0.0, sum.x), sum.y), sum.z));
 }
 
 @compute @workgroup_size(16, 16)
@@ -679,9 +682,44 @@ fn softVertical(@builtin(global_invocation_id) id: vec3u) {
   let taps = 2u * params.radius + 1u;
   var sum = 0.0;
   for (var t = 0u; t < taps; t++) {
-    sum = add(sum, mul(tables[params.aux.z + t], src1[(id.y + t) * params.src.z + id.x]));
+    sum = add(sum, mul(tables[params.aux.z + t], src1[params.aux.x + (id.y + t) * params.src.z + id.x]));
   }
-  dst1[id.y * params.dst.z + id.x] = sum;
+  dst1[params.aux.y + id.y * params.dst.z + id.x] = sum;
+}
+
+fn grainField(plane: u32, id: vec3u) -> f32 {
+  let at = plane * params.count + id.y * params.src.z + id.x;
+  if (params.radius == 0u) {
+    return src1[at];
+  }
+  let taps = 2u * params.radius + 1u;
+  var z = 0.0;
+  for (var t = 0u; t < taps; t++) {
+    z = add(z, mul(tables[params.aux.z + t], src1[at + t]));
+  }
+  return z;
+}
+
+fn grainy(v: f32, z: f32, a: f32) -> f32 {
+  let gain = add(1.0, mul(a, sub(z, tables[params.aux.w])));
+  return inverse(mul(forward(v), gain));
+}
+
+fn channelFields(id: vec3u) -> vec3f {
+  let at = params.aux.w;
+  let z0 = mul(tables[at + 2u], grainField(0u, id));
+  if ((params.flags & layersFlag) == 0u) {
+    return vec3f(z0);
+  }
+  let layer = tables[at + 3u];
+  return vec3f(add(z0, mul(layer, grainField(1u, id))), add(z0, mul(layer, grainField(2u, id))), add(z0, mul(layer, grainField(3u, id))));
+}
+
+fn grained(c: vec3f, z: vec3f) -> vec3f {
+  let at = params.aux.w;
+  let fade = add(1.0, mul(sub(tables[at + 1u], 1.0), clamp(mul(sub(luma(c), tables[at + 4u]), tables[at + 5u]), 0.0, 1.0)));
+  let a = mul(params.slope.y, fade);
+  return clamp(vec3f(grainy(c.x, z.x, a), grainy(c.y, z.y, a), grainy(c.z, z.z, a)), vec3f(0.0), vec3f(1.0));
 }
 
 @compute @workgroup_size(16, 16)
@@ -689,19 +727,22 @@ fn grainApply(@builtin(global_invocation_id) id: vec3u) {
   if (outside(id)) {
     return;
   }
-  var z = src1[id.y * params.src.z + id.x];
-  if (params.radius > 0u) {
-    let taps = 2u * params.radius + 1u;
-    z = 0.0;
-    for (var t = 0u; t < taps; t++) {
-      z = add(z, mul(tables[params.aux.z + t], src1[id.y * params.src.z + id.x + t]));
-    }
+  let i = id.y * params.dst.z + id.x;
+  write3(i, grained(read3(i), channelFields(id)));
+}
+
+@compute @workgroup_size(16, 16)
+fn finishGrain(@builtin(global_invocation_id) id: vec3u) {
+  if (outside(id)) {
+    return;
   }
   let i = id.y * params.dst.z + id.x;
   let c = read3(i);
-  let gain = add(1.0, mul(params.slope.y, sub(z, grainOffset)));
-  let out = vec3f(inverse(mul(forward(c.x), gain)), inverse(mul(forward(c.y), gain)), inverse(mul(forward(c.z), gain)));
-  write3(i, clamp(out, vec3f(0.0), vec3f(1.0)));
+  let z = channelFields(id);
+  let plain = display(c);
+  let up = display(grained(c, z));
+  let down = display(grained(c, -z));
+  write3(i, toned(vec3f(add(plain.x, mul(sub(up.x, down.x), 0.5)), add(plain.y, mul(sub(up.y, down.y), 0.5)), add(plain.z, mul(sub(up.z, down.z), 0.5)))));
 }
 
 // Film Look Creator halation (engine/src/halation.rs): DaVinci Wide Gamut layers in a measured transfer domain,

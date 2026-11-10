@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
-use crate::film::{fast_exp2, fast_log2};
+use crate::film::{exp2_table, fast_exp2, fast_log2, log2_table};
 use crate::grain_tables::{DOMAIN, SPECTRUM, SPECTRUM_SIZES};
-use crate::texture::{Region, Size};
+use crate::texture::{Region, Size, luma};
 
 // why: measured from Resolve renders of FilmVision's grain (scratchpad flc/grain): noise strength per unit of
 // grainAmount, the field's mean offset, its sub-Gaussian marginal, and the softness and defocus blur scales
@@ -12,8 +13,8 @@ pub(crate) const AMPLITUDE: f32 = 0.3405;
 pub(crate) const OFFSET: f32 = 0.107;
 pub(crate) const FLATTEN: f32 = 0.003_703_8;
 pub(crate) const FLATTEN_NORM: f32 = 0.988_68;
-const SOFT_PER_HEIGHT: f32 = 0.00463;
-const DEFOCUS_PER_HEIGHT: f32 = 0.00297;
+const SOFT_PER_SHORT_EDGE: f32 = 0.00463;
+const DEFOCUS_PER_SHORT_EDGE: f32 = 0.00297;
 pub(crate) const DOMAIN_STEPS: f32 = 5000.0;
 pub(crate) const DOMAIN_TOP: f32 = 1.25;
 pub(crate) const MINUS_TWO_LN2: f32 = -1.386_294_4;
@@ -22,6 +23,25 @@ const SPECTRUM_STEP: f64 = 5.0;
 const ENERGY_LEFT: f64 = 1e-4;
 const MAX_RADIUS: usize = 64;
 const RANK: usize = 3;
+const KERNELS_KEPT: usize = 8;
+// why: fitted to the luma spectra of 35 mm Portra 400, Gold 200 and CineStill 800T scans with each scan's pixel
+// aperture allowed for (.scratch/film-study/grain/fit.py): a dye cloud and a clump as (peak power, sigma in cycles per
+// frame short edge) at size 1, a 36x24 mm frame. The layers' own grain is coarser, and stills amounts are the grain's
+// strength sampled at 4000 px on the short edge
+const CLOUDS: [(f64, f64); 2] = [(1.0, 1083.27), (0.4401, 123.99)];
+const LAYER_STRETCH: f64 = 2.5;
+const REFERENCE: f64 = 4000.0;
+const ALIASES: i32 = 24;
+const FADE_FROM: f32 = 0.42;
+const FADE_RATE: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Structure {
+    #[default]
+    Cine,
+    Stills,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GrainParams {
@@ -29,6 +49,9 @@ pub struct GrainParams {
     pub size: f32,
     pub softness: f32,
     pub defocus: f32,
+    pub structure: Structure,
+    pub color: f32,
+    pub highlights: f32,
     pub seed: u32,
 }
 
@@ -39,6 +62,17 @@ impl GrainParams {
 
     pub(crate) fn grains(&self) -> bool {
         self.amount > 0.0
+    }
+
+    pub(crate) fn grains_in_finish(&self) -> bool {
+        self.structure == Structure::Stills && self.grains()
+    }
+
+    pub(crate) fn textured_part(self) -> GrainParams {
+        match self.structure {
+            Structure::Cine => GrainParams { color: 0.0, highlights: 1.0, ..self },
+            Structure::Stills => GrainParams { amount: 0.0, size: 0.0, softness: 0.0, color: 0.0, highlights: 1.0, ..self },
+        }
     }
 }
 
@@ -73,12 +107,12 @@ fn gaussian(sigma: f64, radius: usize) -> Vec<f32> {
 }
 
 pub(crate) fn defocus_weights(frame: Size, p: &GrainParams) -> Vec<f32> {
-    let sigma = f64::from(DEFOCUS_PER_HEIGHT * frame.h as f32 * (1.0 - p.defocus).max(0.0));
+    let sigma = f64::from(DEFOCUS_PER_SHORT_EDGE * frame.short_edge() as f32 * (1.0 - p.defocus).max(0.0));
     if sigma < 0.05 { Vec::new() } else { gaussian(sigma, (6.0 * sigma + 0.5) as usize) }
 }
 
 pub(crate) fn soft_weights(frame: Size, p: &GrainParams) -> Vec<f32> {
-    let sigma = f64::from(SOFT_PER_HEIGHT * frame.h as f32 * p.softness.max(0.0).powf(1.5));
+    let sigma = f64::from(SOFT_PER_SHORT_EDGE * frame.short_edge() as f32 * p.softness.max(0.0).powf(1.5));
     if sigma <= 0.12 { Vec::new() } else { gaussian(sigma, (4.5 * sigma).ceil() as usize + 1) }
 }
 
@@ -125,9 +159,47 @@ pub(crate) fn flatten(z: f32) -> f32 {
     (z - FLATTEN * (z * z * z)) / FLATTEN_NORM
 }
 
-pub(crate) fn grained(c: [f32; 3], z: f32, scale: f32) -> [f32; 3] {
-    let gain = 1.0 + scale * (z - OFFSET);
-    c.map(|v| inverse(forward(v) * gain).clamp(0.0, 1.0))
+#[derive(Clone, Copy)]
+pub(crate) struct Mix {
+    scale: f32,
+    offset: f32,
+    highlights: f32,
+    shared: f32,
+    layer: f32,
+}
+
+impl Mix {
+    fn new(frame: Size, p: &GrainParams) -> Mix {
+        let (offset, highlights, shared, layer) = match p.structure {
+            Structure::Cine => (OFFSET, 1.0, 1.0, 0.0),
+            Structure::Stills => {
+                let color = p.color.clamp(0.0, 1.0);
+                let (shared, layer) = (sampled(frame.short_edge(), p.size, 1.0), sampled(frame.short_edge(), p.size, LAYER_STRETCH));
+                (0.0, p.highlights, shared * (1.0 - color * color).sqrt(), layer * color)
+            }
+        };
+        Mix { scale: p.scale(), offset, highlights, shared, layer }
+    }
+
+    fn channels(&self, shared: f32, layers: Option<[f32; 3]>) -> [f32; 3] {
+        let z0 = self.shared * shared;
+        layers.map_or([z0; 3], |l| l.map(|zl| z0 + self.layer * zl))
+    }
+
+    pub(crate) fn grained(&self, c: [f32; 3], z: [f32; 3]) -> [f32; 3] {
+        let fade = 1.0 + (self.highlights - 1.0) * ((luma(c) - FADE_FROM) * FADE_RATE).clamp(0.0, 1.0);
+        let a = self.scale * fade;
+        [0, 1, 2].map(|k| inverse(forward(c[k]) * (1.0 + a * (z[k] - self.offset))).clamp(0.0, 1.0))
+    }
+
+    pub(crate) fn symmetric_display(&self, c: [f32; 3], z: [f32; 3], display: impl Fn([f32; 3]) -> [f32; 3]) -> [f32; 3] {
+        let (plain, up, down) = (display(c), display(self.grained(c, z)), display(self.grained(c, z.map(|v| -v))));
+        [0, 1, 2].map(|k| plain[k] + (up[k] - down[k]) * 0.5)
+    }
+
+    pub(crate) fn words(&self) -> [f32; 6] {
+        [self.offset, self.highlights, self.shared, self.layer, FADE_FROM, FADE_RATE]
+    }
 }
 
 pub struct Kernel {
@@ -202,16 +274,20 @@ fn eigen(mut a: Vec<f64>, n: usize) -> (Vec<f64>, Vec<f64>) {
     ((0..n).map(|i| a[i * n + i]).collect(), v)
 }
 
-// why: the grain's spectrum is FilmVision's, folded for point sampling at this height; the 2-D kernel is its
-// inverse transform, split into three separable pairs (singular values 1 : 0.12 : 0.01)
-fn build(height: usize, size: f32) -> Kernel {
-    let h = height as f64;
-    let n = if height >= 1400 { 512 } else { 256 };
+fn grid(length: usize) -> usize {
+    if length >= 1400 { 512 } else { 256 }
+}
+
+// why: the cine grain's spectrum is FilmVision's, folded for point sampling at this short edge (singular values of its
+// kernel 1 : 0.12 : 0.01)
+fn cine_spectrum(length: usize, size: f32) -> Vec<f64> {
+    let h = length as f64;
+    let n = grid(length);
     let half = n / 2;
     let row = spectrum_row(f64::from(size));
     let top = (row.len() - 1) as f64 * SPECTRUM_STEP;
     let fold = ((top / h + 0.5) as isize).min(6);
-    let quarter: Vec<f64> = (0..=half)
+    (0..=half)
         .into_par_iter()
         .flat_map_iter(|b| (0..=half).map(move |a| (a, b)))
         .map(|(a, b)| {
@@ -224,7 +300,55 @@ fn build(height: usize, size: f32) -> Kernel {
             }
             s
         })
-        .collect();
+        .collect()
+}
+
+fn sinc2(f: f64) -> f64 {
+    if f == 0.0 {
+        return 1.0;
+    }
+    let x = std::f64::consts::PI * f;
+    (x.sin() / x).powi(2)
+}
+
+fn cloud_axes(n: usize, length: f64, size: f32, stretch: f64) -> Vec<(f64, Vec<f64>)> {
+    CLOUDS
+        .iter()
+        .map(|&(power, sigma)| {
+            let width = sigma / (f64::from(size) * stretch);
+            let axis = (0..=n / 2)
+                .map(|u| {
+                    (-ALIASES..=ALIASES)
+                        .map(|m| {
+                            let f = u as f64 / n as f64 + f64::from(m);
+                            (-0.5 * (f * length / width).powi(2)).exp() * sinc2(f)
+                        })
+                        .sum()
+                })
+                .collect();
+            (power, axis)
+        })
+        .collect()
+}
+
+fn stills_spectrum(length: usize, size: f32, stretch: f64) -> Vec<f64> {
+    let n = grid(length);
+    let axes = cloud_axes(n, length as f64, size, stretch);
+    (0..=n / 2).flat_map(|b| (0..=n / 2).map(move |a| (a, b))).map(|(a, b)| axes.iter().map(|(power, axis)| power * axis[a] * axis[b]).sum()).collect()
+}
+
+fn variance(length: f64, size: f32, stretch: f64) -> f64 {
+    let n = 256;
+    let mean = |axis: &[f64]| (axis[0] + axis[n / 2] + 2.0 * axis[1..n / 2].iter().sum::<f64>()) / n as f64;
+    length * length * cloud_axes(n, length, size, stretch).iter().map(|(power, axis)| power * mean(axis).powi(2)).sum::<f64>()
+}
+
+fn sampled(length: usize, size: f32, stretch: f64) -> f32 {
+    (variance(length as f64, size, stretch) / variance(REFERENCE, size, stretch)).sqrt() as f32
+}
+
+fn build(n: usize, quarter: &[f64]) -> Kernel {
+    let half = n / 2;
     let fold_index = |u: usize| u.min(n - u);
     let at = |u: usize, v: usize| quarter[fold_index(v) * (half + 1) + fold_index(u)];
     let mean = (0..n).flat_map(|v| (0..n).map(move |u| (u, v))).map(|(u, v)| at(u, v)).sum::<f64>() / (n * n) as f64;
@@ -281,23 +405,57 @@ fn build(height: usize, size: f32) -> Kernel {
     Kernel { radius, a: [0, 1, 2].map(|k| scaled(&pairs[k].0)), b: [0, 1, 2].map(|k| scaled(&pairs[k].1)) }
 }
 
-type Kernels = Mutex<Vec<((usize, u32), Arc<Kernel>)>>;
+type Kernels = Mutex<Vec<((Structure, usize, u32, bool), Arc<Kernel>)>>;
 
-pub(crate) fn kernel(height: usize, size: f32) -> Arc<Kernel> {
+fn kernel(structure: Structure, length: usize, size: f32, layer: bool) -> Arc<Kernel> {
     static CACHE: OnceLock<Kernels> = OnceLock::new();
-    let key = (height, size.to_bits());
+    let key = (structure, length, size.to_bits(), layer);
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
     if let Some(found) = cache.lock().ok().and_then(|c| c.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())) {
         return found;
     }
-    let built = Arc::new(build(height, size));
+    let spectrum = match structure {
+        Structure::Cine => cine_spectrum(length, size),
+        Structure::Stills => stills_spectrum(length, size, if layer { LAYER_STRETCH } else { 1.0 }),
+    };
+    let built = Arc::new(build(grid(length), &spectrum));
     if let Ok(mut c) = cache.lock() {
         c.push((key, built.clone()));
-        if c.len() > 4 {
+        if c.len() > KERNELS_KEPT {
             c.remove(0);
         }
     }
     built
+}
+
+pub(crate) struct Grain {
+    pub(crate) shared: Field,
+    pub(crate) layers: Option<Field>,
+    pub(crate) mix: Mix,
+}
+
+impl Grain {
+    pub(crate) fn new(frame: Size, p: &GrainParams) -> Grain {
+        let field = |layer: bool| {
+            let kernel = kernel(p.structure, frame.short_edge(), p.size, layer);
+            let soft = soft_weights(frame, p);
+            Field { margin: kernel.radius + soft.len() / 2, soft, kernel }
+        };
+        let mix = Mix::new(frame, p);
+        Grain { shared: field(false), layers: (mix.layer > 0.0).then(|| field(true)), mix }
+    }
+
+    pub(crate) fn layer_seeds(seed: u32) -> [u32; 3] {
+        [1, 2, 3].map(|k| seed.wrapping_add(k))
+    }
+
+    pub(crate) fn channel_fields(&self, frame: Size, out: Region, seed: u32) -> Vec<[f32; 3]> {
+        let tables = Tables { log2: log2_table(), exp2: exp2_table(), cos: cos_table() };
+        let shared = self.shared.render(frame, out, seed, &tables);
+        let Some(layers) = &self.layers else { return shared.par_iter().map(|z| self.mix.channels(*z, None)).collect() };
+        let [r, g, b] = Grain::layer_seeds(seed).map(|seed| layers.render(frame, out, seed, &tables));
+        (0..shared.len()).into_par_iter().map(|i| self.mix.channels(shared[i], Some([r[i], g[i], b[i]]))).collect()
+    }
 }
 
 pub(crate) struct Field {
@@ -307,25 +465,19 @@ pub(crate) struct Field {
 }
 
 impl Field {
-    pub(crate) fn new(frame: Size, p: &GrainParams) -> Field {
-        let kernel = kernel(frame.h, p.size);
-        let soft = soft_weights(frame, p);
-        Field { margin: kernel.radius + soft.len() / 2, soft, kernel }
-    }
-
     pub(crate) fn origin(&self, frame: Size, out: Region) -> [i32; 2] {
         let m = self.margin as i32;
         [out.x as i32 - m - (frame.w / 2) as i32, out.y as i32 - m - (frame.h / 2) as i32]
     }
 
-    pub(crate) fn render(&self, frame: Size, out: Region, p: &GrainParams, tables: &Tables) -> Vec<f32> {
+    pub(crate) fn render(&self, frame: Size, out: Region, seed: u32, tables: &Tables) -> Vec<f32> {
         let (m, rs) = (self.margin, self.soft.len() / 2);
         let (nw, nh) = (out.w + 2 * m, out.h + 2 * m);
         let [ox, oy] = self.origin(frame, out);
         let mut noise = vec![0.0f32; nw * nh];
         noise.par_chunks_mut(nw).enumerate().for_each(|(j, row)| {
             for (i, v) in row.iter_mut().enumerate() {
-                *v = tables.white(ox + i as i32, oy + j as i32, p.seed);
+                *v = tables.white(ox + i as i32, oy + j as i32, seed);
             }
         });
         let vh = out.h + 2 * rs;

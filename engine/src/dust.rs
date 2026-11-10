@@ -16,10 +16,10 @@ pub struct DustParams {
 }
 
 impl DustParams {
-    // why: FilmVision lays its dust plate on a canvas 1200 texels wide and as tall as the frame's aspect,
-    // and that height picks one of ten plates, so it comes from the full-size frame, not the preview
+    // why: FilmVision lays its dust plate on a canvas 1200 texels across the frame's long edge and as deep as the
+    // frame's aspect, and that depth picks one of ten plates, so it comes from the full-size frame, not the preview
     pub fn rows_of(native: Size) -> usize {
-        COLUMNS * native.h / native.w.max(1)
+        COLUMNS * native.short_edge() / native.w.max(native.h).max(1)
     }
 }
 
@@ -90,9 +90,19 @@ fn span(taps: &[Tap], from: usize, to: usize) -> std::ops::Range<usize> {
     taps.partition_point(|t| t.hi < from)..taps.partition_point(|t| t.lo <= to)
 }
 
+pub fn strength(frame: Size, region: Region, p: &DustParams) -> Vec<(usize, f32)> {
+    if frame.w >= frame.h {
+        return landscape(frame, region, p);
+    }
+    let turned = Region { x: region.y, y: region.x, w: region.h, h: region.w };
+    let mut out: Vec<(usize, f32)> = landscape(Size { w: frame.h, h: frame.w }, turned, p).into_iter().map(|(k, s)| ((k % region.h) * region.w + k / region.h, s)).collect();
+    out.sort_unstable_by_key(|(k, _)| *k);
+    out
+}
+
 // why: FilmVision's specks are a fixed plate of texels, thresholded and blurred by softness, zoomed by size
 // about the canvas centre, then the canvas is resized bilinearly to the frame (scratchpad flc/dust)
-pub fn strength(frame: Size, region: Region, p: &DustParams) -> Vec<(usize, f32)> {
+fn landscape(frame: Size, region: Region, p: &DustParams) -> Vec<(usize, f32)> {
     let rows = p.rows;
     let size = if p.size <= 0.0 { 1.0 } else { p.size };
     let texels = if rows == 0 { Vec::new() } else { survivors(p) };

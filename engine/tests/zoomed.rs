@@ -64,3 +64,31 @@ fn a_zoomed_film_window_finished_alone_matches_the_window_cut_from_its_margin() 
         assert!(alone.rgba == cut.rgba, "window {window:?}: the pixels differ");
     }
 }
+
+#[test]
+fn a_zoomed_window_has_the_stills_grain_the_whole_frame_has_there() {
+    let (raw, facts, settings) = photo();
+    let settings = settings.to_string();
+    let mut engine = Engine::new();
+    engine.load("photo", &facts, &raw, EDGE).unwrap();
+    engine.load_lut("identity", IDENTITY_CUBE).unwrap();
+    let fit = engine.render("photo", &settings, &json!({"maxW": EDGE, "maxH": EDGE, "stages": "loupe-zoom"}).to_string()).unwrap();
+    let (w, h) = (fit.width as usize, fit.height as usize);
+    let windows = [[420, 300, 520, 360], [0, 0, 400, 300], [w - 300, h - 250, 300, 250]];
+    let mut away_from_the_whole = |amount: f64| {
+        let grain = json!({"structure": "stills", "amount": amount, "size": 1.0, "softness": 0.3, "defocus": 0.9, "color": 0.9, "highlights": 0.44});
+        let view = |window: [usize; 4]| json!({"maxW": EDGE, "maxH": EDGE, "stages": "loupe-zoom", "window": window, "film": {"negative": "identity", "print": "identity", "grain": grain}}).to_string();
+        let whole = engine.render("photo", &settings, &view([0, 0, w, h])).unwrap();
+        let differences: Vec<i32> = windows
+            .iter()
+            .flat_map(|&[x, y, ww, wh]| {
+                let part = engine.render("photo", &settings, &view([x, y, ww, wh])).unwrap();
+                let cut: Vec<u8> = (y..y + wh).flat_map(|row| whole.rgba[(row * w + x) * 4..(row * w + x + ww) * 4].to_vec()).collect();
+                part.rgba.iter().zip(&cut).map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs()).collect::<Vec<_>>()
+            })
+            .collect();
+        (differences.iter().copied().max().unwrap_or(0), differences.iter().filter(|d| **d != 0).count())
+    };
+    let (plain, grained) = (away_from_the_whole(0.0), away_from_the_whole(0.6));
+    assert!(grained.0 <= plain.0.max(1) && grained.1 as f64 <= plain.1 as f64 * 1.05 + 100.0, "windows differ from the whole frame by (largest, values) {grained:?} with stills grain, {plain:?} without");
+}

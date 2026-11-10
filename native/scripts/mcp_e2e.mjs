@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const binary = path.resolve(here, "../target/release/filmlab");
@@ -1046,6 +1047,16 @@ await check("agent/fit", async () => {
   return `exposure ${r.json.set["light.exposure"]} for p50 ${r.json.p50}; like ${like.json.set["light.exposure"]}; temp ${warm.json.set["wb.temp"]} ${warm.json.status} cast_b ${warm.json.cast_b} (analyze ${cast.b})`;
 });
 
+await check("edit/new-film-gauge", async () => {
+  const before = (await tool("get_edit", { photo: photoE })).json?.film;
+  assert(before === undefined || before === "off", `${photoE} already has film ${JSON.stringify(before)}`);
+  await tool("set_film", { photo: photoE, negative: "Negative/Vision3 250D" });
+  const film = (await tool("get_edit", { photo: photoE })).json?.film;
+  assert(film?.gauge === 35, `new film ${JSON.stringify(film)}, want gauge 35`);
+  await tool("history", { photo: photoE, action: "undo" });
+  return `new film: gauge ${film.gauge}`;
+});
+
 await check("agent/paste", async () => {
   const profiles = (await tool("profiles", { action: "list" })).text;
   await tool("set_controls", { photo: photoE, values: { "color.saturation": 30, "effects.clarity": 20 } });
@@ -1709,6 +1720,36 @@ await check("verify/every-control", async () => {
   return `${controls.length - quiet.length} of ${controls.length} controls change the photo`;
 });
 
+const FILM_GRAIN = { color: 0.9, highlights: 1, size: 2.5, softness: 0.5, defocus: 0.7, amount: 0.3, structure: "cine" };
+await check("verify/film-grain", async () => {
+  assert(first, "no photo");
+  await call("edit", { photo: first, film: { gauge: 35, grain: { amount: 0.6 } } });
+  const dead = [];
+  const seen = [];
+  for (const [field, value] of Object.entries(FILM_GRAIN)) {
+    await call("edit", { photo: first, film: { grain: { [field]: value } } });
+    const r = await call("look", { mode: "compare", photo: first, region: [0, 0, 1, 1], edge: 1500, image: "none" });
+    const summary = r.json?.summary ?? r.text.slice(0, 80);
+    if (/^(identical|no visible change)$/.test(summary)) dead.push(`grain.${field}`);
+    seen.push(`${field} ${summary}`);
+  }
+  assert(!dead.length, `film grain fields with no effect: ${dead.join(", ")}`);
+  return seen.join("; ");
+});
+
+await check("edit/cine-grain-has-no-colour", async () => {
+  assert(first, "no photo");
+  await call("edit", { photo: first, film: { gauge: 35 } });
+  const becoming = await call("edit", { photo: first, film: { grain: { structure: "cine", highlights: 0.5 } } }, { allowError: true });
+  assert(becoming.isError && /belong to stills/.test(becoming.text), `highlights while turning cine: ${becoming.text}`);
+  await call("edit", { photo: first, film: { grain: { structure: "cine", amount: 0.3 } } });
+  const refused = await call("edit", { photo: first, film: { grain: { color: 0.5 } } }, { allowError: true });
+  assert(refused.isError && /belong to stills/.test(refused.text), `color on cine: ${refused.text}`);
+  const film = (await tool("get_edit", { photo: first })).json?.film;
+  assert(film?.grain?.structure === "cine" && film.grain.color === undefined && film.grain.highlights === undefined, `cine summary ${JSON.stringify(film?.grain)}`);
+  return `refused: ${refused.text.slice(0, 80)}`;
+});
+
 await check("curve/lightroom-sidecar", async () => {
   const folder = path.join(runDir, "sidecar");
   fs.mkdirSync(folder, { recursive: true });
@@ -1753,6 +1794,97 @@ await check("folders/same-name", async () => {
   assert(/"light":\{"exposure":1(\.0+)?,/.test(fs.readFileSync(path.join(a, "SHOWN.xmp"), "utf8")), "the old folder's open photo wasn't saved before the switch");
   assert(!fs.existsSync(path.join(b, "SHOWN.xmp")), "the old photo's edit was written into the new folder");
   return "each folder's photo read and edited as its own";
+});
+
+function pngRows(buf) {
+  assert(buf.subarray(1, 4).toString() === "PNG", "not a PNG");
+  const idat = [];
+  let header;
+  for (let at = 8; at < buf.length; ) {
+    const len = buf.readUInt32BE(at);
+    const type = buf.subarray(at + 4, at + 8).toString();
+    const data = buf.subarray(at + 8, at + 8 + len);
+    if (type === "IHDR") header = { w: data.readUInt32BE(0), h: data.readUInt32BE(4), depth: data[8], color: data[9] };
+    if (type === "IDAT") idat.push(data);
+    at += 12 + len;
+  }
+  const { w, h, depth, color } = header;
+  const channels = { 2: 3, 6: 4 }[color];
+  assert(depth === 8 && channels, `PNG depth ${depth} colour type ${color}`);
+  const stride = w * channels;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  let prev = Buffer.alloc(stride);
+  let flat = 0;
+  let sum = 0;
+  for (let y = 0; y < h; y++) {
+    const filter = raw[y * (stride + 1)];
+    const row = Buffer.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+    let lo = 255;
+    let hi = 0;
+    for (let i = 0; i < stride; i++) {
+      const a = i >= channels ? row[i - channels] : 0;
+      const b = prev[i];
+      const c = i >= channels ? prev[i - channels] : 0;
+      const p = a + b - c;
+      const paeth = Math.abs(p - a) <= Math.abs(p - b) && Math.abs(p - a) <= Math.abs(p - c) ? a : Math.abs(p - b) <= Math.abs(p - c) ? b : c;
+      const predicted = [0, a, b, (a + b) >> 1, paeth][filter];
+      const v = (row[i] + predicted) & 255;
+      row[i] = v;
+      if (i % channels < 3) {
+        lo = Math.min(lo, v);
+        hi = Math.max(hi, v);
+        sum += v;
+      }
+    }
+    flat += hi <= 12 && hi - lo <= 12;
+    prev = row;
+  }
+  return { w, h, flat, mean: sum / (w * h * 3) };
+}
+
+await check("export/full-size-right-after-heavy-edits", async () => {
+  await tool("open_folder", { path: photos });
+  let portrait;
+  for (const id of photoIds) {
+    const { w, h } = jpegSize((await call("look", { mode: "preview", photo: id, edge: 64 })).images[0]);
+    if (h > w) {
+      portrait = id;
+      break;
+    }
+  }
+  assert(portrait, "no portrait photo in the fixtures");
+  await call("edit", { photo: portrait, film: { gauge: 35, grain: { structure: "stills", color: 0.3, highlights: 0.5 } } });
+  const heavy = [
+    { values: { "detail.sharpenAmount": 0, "effects.texture": -18, "effects.clarity": -8 }, film: { blur: 0.07, grain: { size: 1.6, amount: 0.17, softness: 0.12 }, halation: { on: true, amount: 0.9, radius: 6 } } },
+    { values: { "detail.sharpenAmount": 0, "effects.texture": -30, "effects.clarity": -12 }, film: { blur: 0.1, grain: { size: 2.2, amount: 0.2, softness: 0.2 }, halation: { on: true, amount: 0.9, radius: 6 } } },
+  ];
+  const folder = path.join(runDir, "heavy");
+  const means = [];
+  const LIBRARY_LETS_GO_OF_THE_GPU_AFTER = 5000;
+  const ROUNDS = 16;
+  let took = 1200;
+  let editing = 100;
+  for (let k = 0; k < ROUNDS; k++) {
+    const into = Math.round((took * (((7 * k) % ROUNDS) + 0.5)) / ROUNDS);
+    await call("view", { args: { mode: "library" } });
+    await wait(Math.max(0, LIBRARY_LETS_GO_OF_THE_GPU_AFTER - editing - into));
+    const edited = Date.now();
+    const answer = await call("edit", { photo: portrait, ...heavy[k % 2] });
+    editing = Date.now() - edited;
+    const started = Date.now();
+    await call("photos", { action: "export", args: { ids: [portrait], format: "png", folder, name: `heavy${k}` } });
+    took = Date.now() - started;
+    const file = path.join(folder, fs.readdirSync(folder).find((f) => f.startsWith(`heavy${k}`)));
+    const { w, h, flat, mean } = pngRows(fs.readFileSync(file));
+    fs.rmSync(file);
+    assert(h > w, `export ${k} is ${w}x${h}, not portrait`);
+    assert(flat === 0, `export ${k} has ${flat} flat black rows of ${h}`);
+    const moved = answer.json?.delta?.p50 ?? 0;
+    assert(k < 2 || Math.abs(moved) < 0.3, `edit ${k} measured p50 moving ${moved}, as a black frame does`);
+    means[k % 2] ??= mean;
+    assert(Math.abs(mean - means[k % 2]) < 0.05, `export ${k} mean ${mean.toFixed(2)}, the same edit's first export ${means[k % 2].toFixed(2)}`);
+  }
+  return `${ROUNDS} full-size exports of ${portrait}, each straight after a heavy edit: no black rows, means ${means.map((m) => m.toFixed(2)).join(" / ")}`;
 });
 
 console.log("\n# token report (tokens ~ bytes/4)");

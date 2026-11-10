@@ -26,8 +26,9 @@ read status state) and never runs it twice.";
 
 const FILM: &str = "\
 FilmVision film: edit film {negative, print} (ids below; negative null turns the film off). Default pairing: Vision3 250D \
-with Print SA1 Kodak 2393. gauge 16/35/65/120 sets FilmVision's grain, halation radius and blur for that format (65 fine, \
-16 heavy), a jump rather than a slide. More fields: guide schema film. Expose and balance first, then judge the film; \
+with Print SA1 Kodak 2393. gauge 16/35/65/120 sets the grain, halation radius and blur for that format (120 fine, \
+16 heavy; new film starts at 35), a jump rather than a slide. Gauges use stills grain (fine, coloured, measured from 35 mm scans); grain \
+structure cine is FilmVision's coarser video grain, which photos edited before stills grain keep. More fields: guide schema film. Expose and balance first, then judge the film; \
 light contrast/whites/blacks act as FilmVision's contrast and scan levels.";
 
 const CURVES: &str = "\
@@ -82,7 +83,7 @@ const SCHEMAS: &[(&str, &str)] = &[
     ("profiles", "list {}; apply {photo?, id or name, amount?: 0-200 (100)}; save {photo?, name, groups?: [group]} and delete {id or name} only when the user asks"),
     ("edit.actions", "command {name, params} (guide schema command.<prefix>); undo, redo; go_to {step}; snapshot.save|restore|delete {name}"),
     ("edit.paste", "paste: {from? (default the open photo), groups?: [look | all | film, profile, treatment, whiteBalance, light, toneCurve, color, colorMixer, colorGrading, effects, vignette, grain, detail, optics, geometry, crop, masks, spots, redEye, lensBlur, calibration], amount?: 1-200 (film's stocks switch at 50), match?: [exposure, wb]}; photo: the targets"),
-    ("film", "{negative?, print?, utility? (ids from guide film; null turns it off), gauge?: 16|35|65|120, halation?: {on, amount 0-2, hue 0-1, sat 0-1, radius 1-10, highlights_only}, grain?: {amount 0-1, size 0-4, softness 0-1, defocus 0.5-1}, blur?: 0-0.2, dust?: {on, size 1.2-4, softness 0-0.5}}"),
+    ("film", "{negative?, print?, utility? (ids from guide film; null turns it off), gauge?: 16|35|65|120, halation?: {on, amount 0-2, hue 0-1, sat 0-1, radius 1-10, highlights_only}, grain?: {structure: stills|cine, amount 0-1, size 0-4 (stills 1 = a 36x24 mm frame), softness 0-1, defocus 0.5-1, color 0-1 (stills only: how independent the dye layers' grain is; 0 monochrome), highlights 0-1 (stills only: how much grain survives toward white; 1 as much as in the mid tones' law)}, blur?: 0-0.2, dust?: {on, size 1.2-4, softness 0-0.5}}"),
     ("look", "args: {quality?: 30-95 (JPEG), values?: {control: value} and curve? (compare: tried on top of to, saving nothing), detail?: bool (compare: every statistic)}; edge: image long edge (preview 768, sheets fit the count, compare 512); analyze image \"curve\" with scopes [\"curve\"] draws the curve, from a ghost"),
 ];
 

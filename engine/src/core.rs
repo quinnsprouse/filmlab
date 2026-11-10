@@ -740,7 +740,7 @@ fn film_export(
 ) -> Fallible<pipeline::Rendered> {
     let Some(request) = job.film else { return Ok(render(req)) };
     let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(render(req)) };
-    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native), grain: request.finished_grain() };
     let (fw, fh) = size_of(req);
     let frame = Size { w: fw, h: fh };
     let mut look = None;
@@ -805,7 +805,7 @@ fn film_render(
     let plain = |job: FilmJob<'_>| FilmOutcome { rendered: Some(render(req, Lane::View)), keep: None, view: job.view, look: job.look };
     let Some(request) = job.film else { return Ok(plain(job)) };
     let Some(chain) = FilmChain::new(job.luts, request)? else { return Ok(plain(job)) };
-    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native) };
+    let mut dev = Developer { chain, light: job.light, texture: request.texture_params(job.native), grain: request.finished_grain() };
     let (fw, fh) = size_of(req);
     let frame = Size { w: fw, h: fh };
     let window = req.window.map(|w| w.clamped(fw, fh));

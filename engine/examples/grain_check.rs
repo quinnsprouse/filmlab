@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use filmlab_engine::grain::GrainParams;
+use filmlab_engine::grain::{GrainParams, Structure};
 use filmlab_engine::texture::{Plane, Region, Size, TextureParams, margin, texture};
 
 const GAUGES: [(&str, f32, f32, f32, f32); 4] = [("16", 0.25, 2.5, 0.25, 0.85), ("35", 0.1495, 2.0, 0.05, 0.9), ("65", 0.0995, 1.0, 0.05, 1.0), ("120", 0.065, 0.6, 0.02, 1.0)];
@@ -10,7 +10,7 @@ fn read(path: &str) -> Vec<f32> {
 }
 
 fn grain(amount: f32, size: f32, softness: f32, defocus: f32) -> TextureParams {
-    TextureParams { film_blur: 0.0, grain: Some(GrainParams { amount, size, softness, defocus, seed: 0 }), dust: None, halation: None }
+    TextureParams { film_blur: 0.0, grain: Some(GrainParams { amount, size, softness, defocus, structure: Structure::Cine, color: 0.0, highlights: 1.0, seed: 0 }), dust: None, halation: None }
 }
 
 fn window_identical(rgb: &[[f32; 3]], frame: Size, p: &TextureParams, whole: &[[f32; 3]]) -> bool {

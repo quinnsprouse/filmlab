@@ -3,12 +3,12 @@ use rayon::prelude::*;
 use crate::dust::{self, DustParams};
 use crate::halation::{self, Halation, HalationParams};
 use crate::film::{exp2_table, fast_exp2, fast_log2, log2_table};
-use crate::grain::{self, Field, GrainParams};
+use crate::grain::{self, Grain, GrainParams};
 use crate::texture_tables::{BASE, BEND2, BEND3, CHROMA, GAIN_HIGH, GAIN_LOW, KNEE, KNEE_TAIL, TONE};
 
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 const EPS: f32 = 0.01;
-const BLUR_PER_HEIGHT: f32 = 0.0099;
+const BLUR_PER_SHORT_EDGE: f32 = 0.0099;
 pub(crate) const DECODE_CUT: f32 = 0.081;
 pub(crate) const ENCODE_CUT: f32 = 0.018;
 pub(crate) const SLOPE_709: f32 = 4.5;
@@ -57,6 +57,12 @@ impl Region {
 pub struct Size {
     pub w: usize,
     pub h: usize,
+}
+
+impl Size {
+    pub fn short_edge(self) -> usize {
+        self.w.min(self.h)
+    }
 }
 
 pub struct Plane<T> {
@@ -264,7 +270,7 @@ fn tone(q: f32, d: f32) -> f32 {
     }
 }
 
-fn luma(c: [f32; 3]) -> f32 {
+pub(crate) fn luma(c: [f32; 3]) -> f32 {
     LUMA[0] * c[0] + LUMA[1] * c[1] + LUMA[2] * c[2]
 }
 
@@ -322,7 +328,7 @@ fn desaturate(lin: [f32; 3]) -> [f32; 3] {
 }
 
 pub(crate) fn blur_weights(frame: Size, p: &TextureParams) -> Vec<f32> {
-    if p.film_blur <= 0.0 { Vec::new() } else { gaussian_weights(BLUR_PER_HEIGHT * frame.h as f32 * p.film_blur) }
+    if p.film_blur <= 0.0 { Vec::new() } else { gaussian_weights(BLUR_PER_SHORT_EDGE * frame.short_edge() as f32 * p.film_blur) }
 }
 
 fn gaussian_weights(sigma: f32) -> Vec<f32> {
@@ -333,7 +339,7 @@ fn gaussian_weights(sigma: f32) -> Vec<f32> {
 }
 
 pub(crate) fn blur_radius(frame: Size, p: &TextureParams) -> usize {
-    if p.film_blur <= 0.0 { 0 } else { (4.0 * BLUR_PER_HEIGHT * frame.h as f32 * p.film_blur + 0.5) as usize }
+    if p.film_blur <= 0.0 { 0 } else { (4.0 * BLUR_PER_SHORT_EDGE * frame.short_edge() as f32 * p.film_blur + 0.5) as usize }
 }
 
 fn film_blur(plane: Plane<[f32; 3]>, frame: Size, p: &TextureParams) -> Plane<[f32; 3]> {
@@ -381,10 +387,9 @@ pub fn texture(input: Plane<[f32; 3]>, frame: Size, out: Region, p: &TexturePara
     if !g.grains() {
         return focused;
     }
-    let tables = grain::Tables { log2: log2_table(), exp2: exp2_table(), cos: grain::cos_table() };
-    let field = Field::new(frame, &g).render(frame, out, &g, &tables);
-    let scale = g.scale();
-    focused.par_iter().zip(field.par_iter()).map(|(c, z)| grain::grained(*c, *z, scale)).collect()
+    let grain = Grain::new(frame, &g);
+    let fields = grain.channel_fields(frame, out, g.seed);
+    focused.par_iter().zip(&fields).map(|(c, z)| grain.mix.grained(*c, *z)).collect()
 }
 
 // why: FilmVision's grain node defocuses the image itself, a Gaussian blur in the grain's own domain

@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use super::app::strip;
 use super::look::State;
 use super::{Answer, Output, args, effect, look};
-use crate::film::{Dust, FilmSettings, GAUGES, Gauge, Halation, STOCK_DUST};
+use crate::film::{Dust, FilmSettings, GAUGES, Gauge, Halation, STOCK_DUST, Structure};
 use crate::mcp::session::{Edit, Held, Hub, NO_PHOTO, control_values};
 use crate::settings::Settings;
 use crate::stocks::{DEFAULT_NEGATIVE, DEFAULT_PRINT, Stock, StockKind};
@@ -130,14 +130,6 @@ fn white_balance(facts: &Value, settings: &Value) -> Option<Wb> {
     Some(Wb { mode: v["mode"].as_str()?.to_string(), temp: v["temp"].as_f64()?, tint: v["tint"].as_f64()?, kelvin: v["kelvin"].as_bool()? })
 }
 
-fn grain_gauge(f: &FilmSettings) -> Option<Gauge> {
-    let close = |a: f64, b: f64| (a - b).abs() < 1e-4;
-    GAUGES.into_iter().find(|g| {
-        let grain = g.grain();
-        close(grain.amount, f.grain.amount) && close(grain.size, f.grain.size) && close(grain.softness, f.grain.softness) && close(grain.defocus, f.grain.defocus) && close(g.blur(), f.blur)
-    })
-}
-
 fn gauge_mm(g: Gauge) -> u32 {
     g.label().parse().unwrap_or(65)
 }
@@ -146,8 +138,8 @@ fn gauge_mm(g: Gauge) -> u32 {
 /// differ from FilmVision's stock.
 fn film_summary(film: Option<&FilmSettings>) -> Value {
     let Some(f) = film.filter(|f| f.is_on()).map(FilmSettings::normalized) else { return json!("off") };
-    let gauge = grain_gauge(&f);
-    let stock = Halation::stock(gauge.unwrap_or(Gauge::G65));
+    let gauge = f.grain_gauge();
+    let stock = Halation::stock(gauge.unwrap_or_default());
     let h = f.halation;
     let differs = |a: Option<f64>, b: Option<f64>| a.zip(b).is_some_and(|(a, b)| (a - b).abs() > 1e-4);
     let halation = if !h.enabled() {
@@ -166,7 +158,20 @@ fn film_summary(film: Option<&FilmSettings>) -> Value {
         d if !d.on => json!(false),
         d => json!({"on": d.on, "size": num(d.size, 3), "softness": num(d.softness, 3)}),
     };
-    let grain = gauge.is_none().then(|| json!({"amount": num(f.grain.amount, 4), "size": num(f.grain.size, 3), "softness": num(f.grain.softness, 3), "defocus": num(f.grain.defocus, 3)}));
+    let g = f.grain;
+    let stills = g.structure == Structure::Stills;
+    let grain = match gauge {
+        None => {
+            let mut custom = json!({"structure": g.structure, "amount": num(g.amount, 4), "size": num(g.size, 3), "softness": num(g.softness, 3), "defocus": num(g.defocus, 3)});
+            if stills {
+                custom["color"] = num(g.color, 3);
+                custom["highlights"] = num(g.highlights, 3);
+            }
+            custom
+        }
+        Some(_) if !stills => json!({"structure": g.structure}),
+        Some(_) => Value::Null,
+    };
     strip(json!({
         "negative": f.negative,
         "print": f.print,
@@ -424,10 +429,13 @@ struct HalationArgs {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct GrainArgs {
+    structure: Option<Structure>,
     amount: Option<f64>,
     size: Option<f64>,
     softness: Option<f64>,
     defocus: Option<f64>,
+    color: Option<f64>,
+    highlights: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -577,7 +585,7 @@ pub fn film_change(value: &Value, film: Option<&FilmSettings>, stocks: &[Stock])
         changed.push("gauge");
     }
     if let Some(h) = p.halation {
-        let stock = Halation::stock(grain_gauge(&f).unwrap_or(Gauge::G65));
+        let stock = Halation::stock(f.grain_gauge().unwrap_or_default());
         f.halation.on = Some(h.on.unwrap_or(f.halation.enabled()));
         f.halation.hue = f.halation.hue.or(stock.hue);
         f.halation.sat = f.halation.sat.or(stock.sat);
@@ -597,6 +605,12 @@ pub fn film_change(value: &Value, film: Option<&FilmSettings>, stocks: &[Stock])
         changed.push("halation");
     }
     if let Some(g) = p.grain {
+        if let Some(v) = g.structure {
+            f.grain.structure = v;
+        }
+        if f.grain.structure == Structure::Cine && (g.color.is_some() || g.highlights.is_some()) {
+            return Err("grain.color and grain.highlights belong to stills grain; this film's grain structure is cine (give grain.structure \"stills\" to use them)".into());
+        }
         if let Some(v) = g.amount {
             f.grain.amount = fit("grain.amount", v, 0.0, 1.0);
         }
@@ -608,6 +622,12 @@ pub fn film_change(value: &Value, film: Option<&FilmSettings>, stocks: &[Stock])
         }
         if let Some(v) = g.defocus {
             f.grain.defocus = fit("grain.defocus", v, 0.5, 1.0);
+        }
+        if let Some(v) = g.color {
+            f.grain.color = fit("grain.color", v, 0.0, 1.0);
+        }
+        if let Some(v) = g.highlights {
+            f.grain.highlights = fit("grain.highlights", v, 0.0, 1.0);
         }
         changed.push("grain");
     }
